@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+knowledge_base/index/
+knowledge_base/processed/
+
+.env
+.venv/
+venv/
