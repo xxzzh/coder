@@ -17,27 +17,29 @@ echo  Local Knowledge Base Agent
 echo ================================================
 echo.
 echo  1. First-time setup / configure API
-echo  2. Open raw materials folder
-echo  3. Strict rebuild index
-echo  4. Incremental update index
-echo  5. Health check
-echo  6. Ask a question
-echo  7. List indexed sources
-echo  8. Run OCR test materials evaluation
-echo  9. Generate OCR test materials
+echo  2. Start Web UI
+echo  3. Open raw materials folder
+echo  4. Strict rebuild index
+echo  5. Incremental update index
+echo  6. Health check
+echo  7. Ask a question
+echo  8. List indexed sources
+echo  9. Run OCR test materials evaluation
+echo 10. Generate OCR test materials
 echo  0. Exit
 echo.
 set /p "CHOICE=Choose an option: "
 
 if "%CHOICE%"=="1" goto setup
-if "%CHOICE%"=="2" goto open_raw
-if "%CHOICE%"=="3" goto rebuild_strict
-if "%CHOICE%"=="4" goto update
-if "%CHOICE%"=="5" goto verify
-if "%CHOICE%"=="6" goto ask
-if "%CHOICE%"=="7" goto sources
-if "%CHOICE%"=="8" goto ocr_eval
-if "%CHOICE%"=="9" goto ocr_generate
+if "%CHOICE%"=="2" goto web
+if "%CHOICE%"=="3" goto open_raw
+if "%CHOICE%"=="4" goto rebuild_strict
+if "%CHOICE%"=="5" goto update
+if "%CHOICE%"=="6" goto verify
+if "%CHOICE%"=="7" goto ask
+if "%CHOICE%"=="8" goto sources
+if "%CHOICE%"=="9" goto ocr_eval
+if "%CHOICE%"=="10" goto ocr_generate
 if "%CHOICE%"=="0" goto end
 
 echo.
@@ -47,6 +49,16 @@ goto menu
 
 :setup
 call "%RUNNER%" setup
+echo.
+pause
+goto menu
+
+:web
+echo.
+echo Starting Web UI at http://127.0.0.1:8765/
+echo Close this window or press Ctrl+C to stop the Web UI.
+echo.
+call "%RUNNER%" web --open
 echo.
 pause
 goto menu

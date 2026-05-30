@@ -7,12 +7,14 @@ set "QUERY=%ROOT%scripts\query_knowledge_base.py"
 set "MANAGE=%ROOT%scripts\manage_knowledge_base.py"
 set "SETUP=%ROOT%scripts\setup_agent.py"
 set "HEALTH=%ROOT%scripts\healthcheck_agent.py"
+set "WEB=%ROOT%scripts\web_agent.py"
 set "PYTHONUTF8=1"
 
 if "%~1"=="" goto usage
 if /I "%~1"=="setup" goto setup
 if /I "%~1"=="verify" goto verify
 if /I "%~1"=="healthcheck" goto verify
+if /I "%~1"=="web" goto web
 if /I "%~1"=="ingest" goto ingest
 if /I "%~1"=="update" goto update
 if /I "%~1"=="ask" goto ask
@@ -26,6 +28,7 @@ echo Please enter a question or command.
 echo.
 echo Examples:
 echo   .\run-agent.bat setup
+echo   .\run-agent.bat web
 echo   .\run-agent.bat verify
 echo   .\run-agent.bat "your question"
 echo   .\run-agent.bat ingest
@@ -43,6 +46,11 @@ exit /b %ERRORLEVEL%
 
 :verify
 python "%HEALTH%"
+exit /b %ERRORLEVEL%
+
+:web
+shift
+python "%WEB%" %*
 exit /b %ERRORLEVEL%
 
 :ingest
