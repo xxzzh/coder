@@ -1,183 +1,222 @@
 # Local Knowledge Base Agent
 
-一个本地知识库 Agent MVP，用于把本地文档导入 SQLite FTS5 索引，并通过命令行查询。当前已完成四个阶段：本地知识库检索、本地答不了时可选择联网搜索、本地语义检索与准确性增强，以及更方便的命令行入口。
+一个可本地运行的知识库问答 Agent。用户把原始资料放入 `knowledge_base/raw`，运行索引更新命令后，就可以通过命令行直接提问。
 
-## 当前能力
+当前定位：可交付试用的本地 RAG 工具。它已经具备安装配置、健康检查、多格式资料导入、语义分块、混合检索、缓存、增量索引和降级兜底能力；但它不是带权限管理、Web 控制台和分布式向量数据库的生产级平台。
 
-- 从 `knowledge_base/raw` 读取本地知识库文件。
-- 支持 `.md`、`.docx`、`.pdf`、`.xlsx`。
-- 提取文本并写入 SQLite FTS5 索引。
-- 通过 `run-agent.bat` 查询知识库。
-- 输出结构化 JSON，包含 `answer`、`source_type`、`sources`、`need_web_search`、`web_search_used`。
-- 直接运行 `.\run-agent.bat "问题"` 时，优先查本地；本地答不了会自动联网搜索，并标识 `source_type: "web_search"`。
-- 兼容 `ask` 命令；如需只查本地，可使用 `ask "问题" --no-web`。
-- 输出内容会清洗为自然语言文本，避免 Markdown 标题、列表符号和换行残留。
-- 联网搜索结果中的中文内容会尽量转成简体中文。
-- 使用本地 hash n-gram embedding 做语义检索，不依赖外部 API。
-- 对候选 chunk 进行 rerank，综合语义分、关键词分和 FTS 分。
-- 输出引用片段 `citations`、索引更新时间 `index_updated_at` 和 `embedding_model`。
-- 导入时检测重复文件，输出 `duplicates` 和 `duplicate_files`。
-- 提供 `sources` 和 `rebuild` 命令，便于查看来源与重建索引。
+## 支持格式
 
-## 目录结构
+- Markdown: `.md`
+- Word: `.docx`
+- PDF: `.pdf`
+- Excel: `.xlsx`
+
+资料可以按类型放入子目录，也可以放在 `knowledge_base/raw` 的任意递归子目录中：
 
 ```text
-.
-├── knowledge_base/
-│   └── raw/                 # 原始知识库文件
-├── scripts/
-│   ├── ingest_knowledge_base.py
-│   ├── query_knowledge_base.py
-│   └── manage_knowledge_base.py
-├── run-agent.bat            # Windows 命令入口
-├── install_kb_phase1.py     # 示例知识库生成脚本
-├── 阶段验证命令.md           # 分阶段验证命令
-└── 分阶段开发与推送流程.md    # 协作与推送流程
-```
-
-运行导入后会生成：
-
-```text
-knowledge_base/index/        # SQLite 索引，已被 .gitignore 排除
-knowledge_base/processed/    # 提取后的中间文件，已被 .gitignore 排除
+knowledge_base/raw/
+  markdown/
+  word/
+  pdf/
+  excel/
 ```
 
 ## 快速开始
 
-在 Windows PowerShell 或 CMD 中运行：
+普通用户推荐直接双击：
 
 ```bat
-.\run-agent.bat ingest
+start.bat
 ```
 
-直接输入问题。系统会优先查询本地知识库；本地没有足够依据时，会自动联网搜索并标识 `source_type: "web_search"`：
+菜单会提供初始化、打开资料目录、严格建库、健康检查、提问、查看来源和 OCR 测试。
+
+首次使用：
 
 ```bat
-.\run-agent.bat "加强针有什么作用？"
+.\run-agent.bat setup
 ```
 
-查看当前索引来源：
+安装配置会询问是否有大模型 API：
+
+- 如果有 API key，会写入 `.env`，后续答案会在本地检索证据基础上调用 API 做受控总结。
+- 如果没有 API key，会保持纯本地命令行回答，不影响索引、检索和引用输出。
+
+检查环境：
 
 ```bat
-.\run-agent.bat sources
+.\run-agent.bat verify
 ```
 
-删除生成索引并重新导入：
+更新索引：
+
+```bat
+.\run-agent.bat update
+```
+
+提问：
+
+```bat
+.\run-agent.bat "What is Ohm's law?"
+```
+
+兼容旧式 ask 命令：
+
+```bat
+.\run-agent.bat ask "加强针有什么作用？"
+```
+
+只使用本地知识库、不联网：
+
+```bat
+.\run-agent.bat ask "加强针有什么作用？" --no-web
+```
+
+彻底重建索引：
 
 ```bat
 .\run-agent.bat rebuild
 ```
 
-本地答不了时自动联网：
+查看索引来源：
 
 ```bat
-.\run-agent.bat "量子纠缠如何用于加密？"
+.\run-agent.bat sources
 ```
 
-兼容旧的 `ask` 命令，默认也会自动联网：
+## 命令说明
+
+| 命令 | 作用 |
+|---|---|
+| `setup` | 交互式初始化，创建 `.env`，可选择配置 API |
+| `verify` / `healthcheck` | 检查 Python、SQLite FTS5、raw 文件、索引、API 配置 |
+| `update` | 增量更新知识库，只处理新增、修改、删除的资料 |
+| `rebuild` | 清理生成索引并从 raw 目录重新导入 |
+| `sources` | 列出当前索引中的资料来源 |
+| 直接输入问题 | 查询本地知识库；本地不足时默认允许联网兜底 |
+| `ask "问题" --no-web` | 只查本地知识库 |
+
+## API 配置
+
+`.env` 示例：
+
+```env
+LKA_USE_API=true
+LKA_API_PROVIDER=openai-compatible
+LKA_API_BASE_URL=https://api.openai.com/v1
+LKA_API_KEY=your_api_key_here
+LKA_API_MODEL=gpt-4o-mini
+LKA_API_TIMEOUT_SECONDS=20
+```
+
+不使用 API：
+
+```env
+LKA_USE_API=false
+```
+
+API 只用于“基于已召回引用的答案总结”。检索、索引、缓存和引用都在本地完成。没有 API 时，系统会返回本地抽取式答案。
+
+临时禁用 API：
 
 ```bat
-.\run-agent.bat ask "量子纠缠如何用于加密？"
+python scripts\query_knowledge_base.py "What is ACID?" --no-api
 ```
 
-如需只查本地、不联网：
+## 当前检索技术
+
+- SQLite FTS5 全文检索
+- 本地 hash n-gram embedding
+- 语义分块
+- FTS + semantic cosine + keyword score 混合 rerank
+- 热门 Query 缓存
+- raw 文件变化检测和异步增量更新
+- 索引不可用时 FAQ 兜底
+
+当前没有接入独立向量数据库。对于小中型本地资料库，SQLite + 本地 embedding 更轻量；当 chunk 数量达到几万以上时，可以再迁移到 Qdrant、Milvus、Chroma 或 FAISS。
+
+## 依赖
+
+核心功能只依赖 Python 标准库。
+
+可选增强依赖列在 `requirements.txt`：
 
 ```bat
-.\run-agent.bat ask "量子纠缠如何用于加密？" --no-web
+python -m pip install -r requirements.txt
 ```
 
-## 示例输出
+这些依赖用于改善 PDF 抽取和中文繁简转换；没有安装时系统会走内置轻量逻辑。
 
-本地知识库命中时：
+## 扫描件、图片表格和复杂版式
 
-```json
-{
-  "answer": "根据本地知识库，影响光合作用速率的因素包括光照强度、二氧化碳浓度、温度和水分条件。",
-  "source_type": "knowledge_base",
-  "sources": [
-    {
-      "file": "photosynthesis_carbon_cycle.md",
-      "file_path": "markdown/photosynthesis_carbon_cycle.md",
-      "file_type": "md",
-      "chunk_id": "doc_0002_0001",
-      "excerpt": "影响光合作用速率的因素包括光照强度、二氧化碳浓度、温度和水分条件。"
-    }
-  ],
-  "need_web_search": false,
-  "web_search_used": false
-}
+为了避免资料内容被静默漏掉，导入流程会生成抽取质量报告：
+
+```text
+knowledge_base/processed/extraction_report.jsonl
 ```
 
-本地知识库答不了且未启用联网时：
+`verify` 会统计报告中的问题：
 
-```json
-{
-  "answer": "本地知识库没有找到足够依据。",
-  "source_type": "none",
-  "sources": [],
-  "need_web_search": true,
-  "web_search_used": false,
-  "message": "本地知识库没有足够依据。如需联网搜索，请追加 --web 参数。"
-}
+```bat
+.\run-agent.bat verify
 ```
 
-## 分阶段计划
+报告字段含义：
 
-### 第一阶段：本地知识库 MVP
+- `warnings`: 抽取过程中的风险，例如 PDF 似乎包含图片、DOCX 内嵌图片、XLSX 有图表/绘图。
+- `requires_review`: 该文件可能存在未完整抽取的内容，需要人工处理或安装 OCR 后重建索引。
+- `method`: 实际使用的抽取方法，例如 `pdfplumber`、`pypdf_or_pypdf2`、`ocr_tesseract`。
 
-已完成：
+扫描 PDF 和图片表格需要 OCR 引擎。推荐安装：
 
-- 新建 `knowledge_base/raw`
-- 支持 `.md`、`.docx`、`.pdf`、`.xlsx`
-- 提取文本
-- 用 SQLite FTS5 建索引
-- Agent 查询知识库
-- 输出 `answer`、`source_type`、`sources`
+1. Python 可选依赖：
 
-### 第二阶段：增加“答不了就询问联网”
+```bat
+python -m pip install -r requirements.txt
+```
 
-已完成：
+2. Tesseract OCR，并确保 `tesseract.exe` 在 PATH 中。
 
-- 增加 `need_web_search`
-- 增加 `--web` 参数
-- 不加 `--web` 时只提示，不联网
-- 加 `--web` 时联网搜索并标识 `source_type = web_search`
+3. `pdftoppm`。如果安装了 TeX Live、Poppler 或 Xpdf，通常会提供该命令。
 
-### 第三阶段：增强准确性
+安装 OCR 后重新构建：
 
-已完成：
+```bat
+.\run-agent.bat rebuild
+.\run-agent.bat verify
+```
 
-- 加 embedding 语义检索
-- 加 chunk rerank
-- 加引用片段
-- 加重复文件检测
-- 加索引更新时间
+如果希望“发现可能漏抽就不要入库”，使用严格重建：
 
-### 第四阶段：做成更方便的使用方式
+```bat
+.\run-agent.bat rebuild-strict
+```
 
-已完成：
+当 `verify` 中 `extraction_report.requires_review` 为 `0` 时，说明当前导入没有发现明显的未抽取风险。若大于 `0`，不要把该索引当作完整知识库使用；应先处理报告中的文件。
 
-- `.\run-agent.bat ingest`
-- `.\run-agent.bat "问题"`
-- `.\run-agent.bat ask "问题"`
-- `.\run-agent.bat ask "问题" --no-web`
-- `.\run-agent.bat sources`
-- `.\run-agent.bat rebuild`
+## 交付给别人使用
 
-## 验证命令
+对方只需要：
 
-完整验证流程见：
+1. 安装 Python 3.10 或更高版本。
+2. 解压/拉取本项目。
+3. 双击 `start.bat`。
+4. 选择 `1` 完成初始化。
+5. 选择 `2` 打开资料目录，把资料放进 `knowledge_base/raw`。
+6. 选择 `3` 严格构建索引。
+7. 选择 `5` 健康检查，看到 `"ok": true` 后即可使用。
+8. 选择 `6` 输入问题。
 
-[阶段验证命令.md](./阶段验证命令.md)
+如果资料更新了，只需要再次运行：
 
-## 依赖说明
+```bat
+.\run-agent.bat update
+```
 
-当前实现主要使用 Python 标准库：
+或者直接提问，系统会检测 raw 文件变化并异步触发更新。
 
-- `sqlite3`
-- `zipfile`
-- `xml.etree.ElementTree`
-- `html.parser`
-- `urllib`
+## 限制
 
-PDF 提取会优先尝试 `pypdf` 或 `PyPDF2`，如果未安装，会回退到内置的简单 PDF 文本提取逻辑。
+- 当前没有 Web UI、用户权限、多租户隔离和监控面板。
+- 当前没有独立向量数据库，超大规模知识库需要升级检索后端。
+- API 总结只基于本地召回引用，不会替代资料质量和索引质量。

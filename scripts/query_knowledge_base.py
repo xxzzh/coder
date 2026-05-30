@@ -6,13 +6,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+from datetime import datetime, timezone
 import hashlib
 from html import unescape
 from html.parser import HTMLParser
 import json
 import math
+import os
 import re
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -21,9 +24,16 @@ from urllib.request import Request, urlopen
 
 
 DB_PATH = Path("knowledge_base/index/knowledge.db")
+RAW_DIR = Path("knowledge_base/raw")
+PROCESSED_DIR = Path("knowledge_base/processed")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENV_PATH = PROJECT_ROOT / ".env"
 WEB_TIMEOUT_SECONDS = 8
 EMBEDDING_DIMS = 384
 LOCAL_SCORE_THRESHOLD = 0.16
+HOT_QUERY_THRESHOLD = 2
+CACHE_TTL_SECONDS = 3600
+DEFAULT_API_TIMEOUT_SECONDS = 20
 STOP_WORDS = {
     "什么",
     "哪些",
@@ -265,6 +275,171 @@ def get_metadata(conn: sqlite3.Connection) -> dict[str, str]:
     except sqlite3.OperationalError:
         return {}
     return {row["key"]: row["value"] for row in rows}
+
+
+def source_fingerprint(raw_dir: Path = RAW_DIR) -> str:
+    supported = {".md", ".docx", ".pdf", ".xlsx"}
+    items: list[str] = []
+    if not raw_dir.exists():
+        return ""
+    for path in sorted(raw_dir.rglob("*")):
+        if path.is_file() and path.suffix.lower() in supported:
+            rel_path = str(path.relative_to(raw_dir)).replace("\\", "/")
+            stat = path.stat()
+            items.append(f"{rel_path}:{stat.st_size}:{int(stat.st_mtime)}")
+    return hashlib.sha256("\n".join(items).encode("utf-8")).hexdigest()
+
+
+def trigger_async_update(db_path: Path = DB_PATH, raw_dir: Path = RAW_DIR, processed_dir: Path = PROCESSED_DIR) -> bool:
+    if not db_path.exists():
+        return False
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        metadata = get_metadata(conn)
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    fingerprint = source_fingerprint(raw_dir)
+    if metadata.get("source_fingerprint") == fingerprint:
+        return False
+
+    script = Path(__file__).resolve().with_name("ingest_knowledge_base.py")
+    command = [
+        sys.executable,
+        str(script),
+        str(raw_dir),
+        "--db",
+        str(db_path),
+        "--processed",
+        str(processed_dir),
+    ]
+    subprocess.Popen(
+        command,
+        cwd=str(Path(__file__).resolve().parents[1]),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return True
+
+
+def load_env_file(path: Path = ENV_PATH) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def runtime_config() -> dict[str, str]:
+    config = load_env_file()
+    for key in (
+        "LKA_USE_API",
+        "LKA_API_PROVIDER",
+        "LKA_API_BASE_URL",
+        "LKA_API_KEY",
+        "LKA_API_MODEL",
+        "LKA_API_TIMEOUT_SECONDS",
+    ):
+        if os.environ.get(key):
+            config[key] = os.environ[key]
+    return config
+
+
+def api_enabled(config: dict[str, str]) -> bool:
+    return config.get("LKA_USE_API", "false").lower() == "true" and bool(config.get("LKA_API_KEY"))
+
+
+def api_cache_variant(config: dict[str, str], allow_api: bool) -> str:
+    if not allow_api or not api_enabled(config):
+        return "local"
+    provider = config.get("LKA_API_PROVIDER", "openai-compatible")
+    base_url = config.get("LKA_API_BASE_URL", "")
+    model = config.get("LKA_API_MODEL", "")
+    return f"api:{provider}:{base_url}:{model}"
+
+
+def cache_key(question: str, limit: int, use_web: bool, variant: str = "local") -> str:
+    normalized = re.sub(r"\s+", " ", question.strip().lower())
+    return hashlib.sha256(f"{normalized}|{limit}|{int(use_web)}|{variant}".encode("utf-8")).hexdigest()
+
+
+def cache_get(
+    conn: sqlite3.Connection,
+    question: str,
+    limit: int,
+    use_web: bool,
+    index_version: str,
+    variant: str = "local",
+) -> dict[str, Any] | None:
+    key = cache_key(question, limit, use_web, variant)
+    try:
+        row = conn.execute("SELECT * FROM query_cache WHERE cache_key = ?", (key,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row or row["index_version"] != index_version:
+        return None
+
+    updated_at = datetime.fromisoformat(row["updated_at"])
+    if (datetime.now(timezone.utc) - updated_at).total_seconds() > CACHE_TTL_SECONDS:
+        return None
+
+    hit_count = int(row["hit_count"] or 0) + 1
+    conn.execute(
+        "UPDATE query_cache SET hit_count = ?, updated_at = ? WHERE cache_key = ?",
+        (hit_count, datetime.now(timezone.utc).isoformat(timespec="seconds"), key),
+    )
+    conn.commit()
+    if hit_count < HOT_QUERY_THRESHOLD:
+        return None
+
+    result = json.loads(row["answer_json"])
+    result["cache_hit"] = True
+    result["cache_hit_count"] = hit_count
+    return result
+
+
+def cache_put(
+    conn: sqlite3.Connection,
+    question: str,
+    limit: int,
+    use_web: bool,
+    index_version: str,
+    result: dict[str, Any],
+    variant: str = "local",
+) -> None:
+    key = cache_key(question, limit, use_web, variant)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    cached = {key: value for key, value in result.items() if key not in {"cache_hit", "cache_hit_count"}}
+    try:
+        existing = conn.execute("SELECT hit_count FROM query_cache WHERE cache_key = ?", (key,)).fetchone()
+        hit_count = int(existing["hit_count"]) + 1 if existing else 1
+        conn.execute(
+            """
+            INSERT INTO query_cache(cache_key, question, answer_json, hit_count, index_version, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                answer_json = excluded.answer_json,
+                hit_count = excluded.hit_count,
+                index_version = excluded.index_version,
+                updated_at = excluded.updated_at
+            """,
+            (key, question, json.dumps(cached, ensure_ascii=False), hit_count, index_version, now, now),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        return
 
 
 def fts_candidates(conn: sqlite3.Connection, question: str, limit: int) -> list[dict[str, Any]]:
@@ -663,6 +838,143 @@ def web_search_error(answer: str) -> dict[str, Any]:
     }
 
 
+def synthesize_with_api(question: str, result: dict[str, Any], config: dict[str, str]) -> dict[str, Any]:
+    if not api_enabled(config) or result.get("source_type") != "knowledge_base":
+        result["answer_mode"] = "extractive_local"
+        result["api_used"] = False
+        return result
+
+    sources = result.get("sources") or []
+    citations = [
+        {
+            "source_id": source.get("source_id"),
+            "file": source.get("file"),
+            "quote": source.get("citation") or source.get("excerpt"),
+        }
+        for source in sources[:5]
+    ]
+    if not citations:
+        result["answer_mode"] = "extractive_local"
+        result["api_used"] = False
+        return result
+
+    base_url = config.get("LKA_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    model = config.get("LKA_API_MODEL", "gpt-4o-mini")
+    timeout = int(config.get("LKA_API_TIMEOUT_SECONDS", str(DEFAULT_API_TIMEOUT_SECONDS)) or DEFAULT_API_TIMEOUT_SECONDS)
+    payload = {
+        "model": model,
+        "temperature": 0.1,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a local knowledge base assistant. Answer only from the supplied citations. "
+                    "If the citations are insufficient, say the local knowledge base does not contain enough evidence. "
+                    "Keep the answer concise and cite source ids like [1]."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps({"question": question, "citations": citations}, ensure_ascii=False),
+            },
+        ],
+    }
+    request = Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {config.get('LKA_API_KEY', '')}",
+            "Content-Type": "application/json",
+            "User-Agent": "local-knowledge-agent/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8", errors="ignore"))
+        answer = data["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        result["answer_mode"] = "extractive_local"
+        result["api_used"] = False
+        result["api_error"] = human_text(str(exc), max_len=240)
+        return result
+
+    if answer:
+        result["answer"] = answer
+        result["answer_mode"] = "api_grounded_summary"
+        result["api_used"] = True
+        result["api_provider"] = config.get("LKA_API_PROVIDER", "openai-compatible")
+        result["api_model"] = model
+    return result
+
+
+def faq_fallback(question: str, limit: int = 3) -> dict[str, Any]:
+    faq_path = PROCESSED_DIR / "faq.jsonl"
+    if not faq_path.exists():
+        return {
+            "answer": "本地索引暂不可用，FAQ 兜底也没有可用条目。",
+            "source_type": "faq_fallback",
+            "sources": [],
+            "citations": [],
+            "need_web_search": True,
+            "web_search_used": False,
+        }
+
+    terms = candidate_terms(question)
+    scored: list[tuple[int, dict[str, Any]]] = []
+    with faq_path.open("r", encoding="utf-8") as faq_in:
+        for line in faq_in:
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            text = f"{item.get('question', '')}\n{item.get('answer', '')}"
+            score = sentence_score(text, terms)
+            if score > 0:
+                scored.append((score, item))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top_score = scored[0][0] if scored else 0
+    items = [item for score, item in scored[:limit] if score >= max(2, top_score * 0.5)]
+    if not items:
+        return {
+            "answer": "本地索引暂不可用，FAQ 兜底没有命中足够依据。",
+            "source_type": "faq_fallback",
+            "sources": [],
+            "citations": [],
+            "need_web_search": True,
+            "web_search_used": False,
+        }
+
+    sources: list[dict[str, Any]] = []
+    citations: list[dict[str, Any]] = []
+    for index, item in enumerate(items, start=1):
+        quote = human_text(item.get("answer", ""), max_len=360)
+        source = {
+            "source_id": index,
+            "file": item.get("file"),
+            "file_path": item.get("file_path"),
+            "file_type": item.get("file_type"),
+            "chunk_id": item.get("chunk_id"),
+            "excerpt": quote,
+            "citation": quote,
+        }
+        sources.append(source)
+        citations.append({"source_id": index, "file": item.get("file"), "chunk_id": item.get("chunk_id"), "quote": quote})
+
+    return {
+        "answer": "本地索引暂不可用，已使用 FAQ 兜底：" + "；".join(
+            trim_terminal_punctuation(source["citation"]) for source in sources
+        ) + "。",
+        "source_type": "faq_fallback",
+        "sources": sources,
+        "citations": citations,
+        "need_web_search": False,
+        "web_search_used": False,
+    }
+
+
 def no_local_answer(use_web: bool, question: str, answer: str, metadata: dict[str, str] | None = None) -> dict[str, Any]:
     if use_web:
         return web_search(question)
@@ -680,13 +992,55 @@ def no_local_answer(use_web: bool, question: str, answer: str, metadata: dict[st
     }
 
 
-def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False) -> dict[str, Any]:
+def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, allow_api: bool = True) -> dict[str, Any]:
+    config = runtime_config()
+    cache_variant = api_cache_variant(config, allow_api)
     if not db_path.exists():
+        result = faq_fallback(question, limit)
+        if result.get("sources"):
+            result["degraded"] = True
+            result["degrade_reason"] = "local_index_missing"
+            return result
         return no_local_answer(use_web, question, "本地知识库索引不存在，请先运行 ingest。")
 
-    rows, metadata = search(db_path, question, limit)
+    refresh_scheduled = trigger_async_update(db_path)
+    cache_conn: sqlite3.Connection | None = None
+    metadata: dict[str, str] = {}
+    try:
+        cache_conn = sqlite3.connect(db_path)
+        cache_conn.row_factory = sqlite3.Row
+        metadata = get_metadata(cache_conn)
+        index_version = metadata.get("indexed_at", "")
+        cached = cache_get(cache_conn, question, limit, use_web, index_version, cache_variant)
+        if cached is not None:
+            cached["async_update_scheduled"] = refresh_scheduled
+            cache_conn.close()
+            return cached
+    except sqlite3.DatabaseError:
+        if cache_conn is not None:
+            cache_conn.close()
+        result = faq_fallback(question, limit)
+        result["degraded"] = True
+        result["degrade_reason"] = "local_index_unavailable"
+        return result
+
+    try:
+        rows, metadata = search(db_path, question, limit)
+    except sqlite3.DatabaseError:
+        if cache_conn is not None:
+            cache_conn.close()
+        result = faq_fallback(question, limit)
+        result["degraded"] = True
+        result["degrade_reason"] = "local_index_unavailable"
+        return result
+
     if not rows or rows[0].get("rerank_score", 0.0) < LOCAL_SCORE_THRESHOLD:
-        return no_local_answer(use_web, question, "本地知识库没有找到足够依据。", metadata)
+        result = no_local_answer(use_web, question, "本地知识库没有找到足够依据。", metadata)
+        result["async_update_scheduled"] = refresh_scheduled
+        if cache_conn is not None:
+            cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)
+            cache_conn.close()
+        return result
     min_source_score = max(LOCAL_SCORE_THRESHOLD, rows[0]["rerank_score"] * 0.75)
     rows = [row for row in rows if row["rerank_score"] >= min_source_score]
 
@@ -717,7 +1071,7 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False) -
             }
         )
 
-    return {
+    result = {
         "answer": human_text(build_answer(question, sources)),
         "source_type": "knowledge_base",
         "sources": sources,
@@ -726,7 +1080,20 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False) -
         "web_search_used": False,
         "index_updated_at": metadata.get("indexed_at"),
         "embedding_model": metadata.get("embedding_model"),
+        "chunk_strategy": metadata.get("chunk_strategy"),
+        "retrieval_mode": "hybrid_fts_semantic_keyword",
+        "async_update_scheduled": refresh_scheduled,
+        "cache_hit": False,
     }
+    if allow_api:
+        result = synthesize_with_api(question, result, config)
+    else:
+        result["answer_mode"] = "extractive_local"
+        result["api_used"] = False
+    if cache_conn is not None:
+        cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)
+        cache_conn.close()
+    return result
 
 
 def main() -> None:
@@ -737,9 +1104,10 @@ def main() -> None:
     parser.add_argument("--db", default=str(DB_PATH))
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--web", action="store_true", help="本地知识库答不了时允许联网搜索。")
+    parser.add_argument("--no-api", action="store_true", help="Do not use configured answer synthesis API.")
     args = parser.parse_args()
 
-    result = query(Path(args.db), args.question, args.limit, args.web)
+    result = query(Path(args.db), args.question, args.limit, args.web, allow_api=not args.no_api)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

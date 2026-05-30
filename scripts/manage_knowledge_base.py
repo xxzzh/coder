@@ -58,6 +58,7 @@ def sources(db_path: Path = DB_PATH) -> dict[str, Any]:
         "indexed": True,
         "index_updated_at": meta.get("indexed_at"),
         "embedding_model": meta.get("embedding_model"),
+        "chunk_strategy": meta.get("chunk_strategy"),
         "documents": len(items),
         "indexed_documents": len([item for item in items if not item.get("duplicate_of")]),
         "duplicates": len(duplicate_items),
@@ -73,6 +74,8 @@ def safe_remove_generated(db_path: Path, processed_dir: Path) -> None:
         db_path,
         processed_dir / "documents.jsonl",
         processed_dir / "chunks.jsonl",
+        processed_dir / "faq.jsonl",
+        processed_dir / "extraction_report.jsonl",
     ]
     allowed_roots = [
         (Path.cwd() / "knowledge_base" / "index").resolve(),
@@ -86,10 +89,25 @@ def safe_remove_generated(db_path: Path, processed_dir: Path) -> None:
             resolved.unlink()
 
 
-def rebuild(raw_dir: Path = RAW_DIR, db_path: Path = DB_PATH, processed_dir: Path = PROCESSED_DIR) -> dict[str, Any]:
+def rebuild(
+    raw_dir: Path = RAW_DIR,
+    db_path: Path = DB_PATH,
+    processed_dir: Path = PROCESSED_DIR,
+    strict_extraction: bool = False,
+) -> dict[str, Any]:
     safe_remove_generated(db_path, processed_dir)
-    result = ingest(raw_dir, db_path, processed_dir)
+    result = ingest(raw_dir, db_path, processed_dir, reset=True, strict_extraction=strict_extraction)
     return {"rebuilt": True, **result}
+
+
+def update(
+    raw_dir: Path = RAW_DIR,
+    db_path: Path = DB_PATH,
+    processed_dir: Path = PROCESSED_DIR,
+    strict_extraction: bool = False,
+) -> dict[str, Any]:
+    result = ingest(raw_dir, db_path, processed_dir, reset=False, strict_extraction=strict_extraction)
+    return {"updated": True, **result}
 
 
 def main() -> None:
@@ -106,12 +124,21 @@ def main() -> None:
     rebuild_parser.add_argument("raw_dir", nargs="?", default=str(RAW_DIR))
     rebuild_parser.add_argument("--db", default=str(DB_PATH))
     rebuild_parser.add_argument("--processed", default=str(PROCESSED_DIR))
+    rebuild_parser.add_argument("--strict-extraction", action="store_true")
+
+    update_parser = subparsers.add_parser("update", help="增量更新 raw 目录中变化的知识文件。")
+    update_parser.add_argument("raw_dir", nargs="?", default=str(RAW_DIR))
+    update_parser.add_argument("--db", default=str(DB_PATH))
+    update_parser.add_argument("--processed", default=str(PROCESSED_DIR))
+    update_parser.add_argument("--strict-extraction", action="store_true")
 
     args = parser.parse_args()
     if args.command == "sources":
         output = sources(Path(args.db))
     elif args.command == "rebuild":
-        output = rebuild(Path(args.raw_dir), Path(args.db), Path(args.processed))
+        output = rebuild(Path(args.raw_dir), Path(args.db), Path(args.processed), args.strict_extraction)
+    elif args.command == "update":
+        output = update(Path(args.raw_dir), Path(args.db), Path(args.processed), args.strict_extraction)
     else:
         parser.error(f"Unknown command: {args.command}")
     print(json.dumps(output, ensure_ascii=False, indent=2))
