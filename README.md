@@ -1,6 +1,6 @@
 # Local Knowledge Base Agent
 
-一个本地知识库 Agent MVP，用于把本地文档导入 SQLite FTS5 索引，并通过命令行查询。当前已完成第一阶段和第二阶段：本地知识库检索，以及本地答不了时可选择联网搜索。
+一个本地知识库 Agent MVP，用于把本地文档导入 SQLite FTS5 索引，并通过命令行查询。当前已完成第一阶段、第二阶段和第三阶段：本地知识库检索、本地答不了时可选择联网搜索，以及本地语义检索与准确性增强。
 
 ## 当前能力
 
@@ -13,6 +13,10 @@
 - 加 `--web` 时允许联网搜索，并标识 `source_type: "web_search"`。
 - 输出内容会清洗为自然语言文本，避免 Markdown 标题、列表符号和换行残留。
 - 联网搜索结果中的中文内容会尽量转成简体中文。
+- 使用本地 hash n-gram embedding 做语义检索，不依赖外部 API。
+- 对候选 chunk 进行 rerank，综合语义分、关键词分和 FTS 分。
+- 输出引用片段 `citations`、索引更新时间 `index_updated_at` 和 `embedding_model`。
+- 导入时检测重复文件，输出 `duplicates` 和 `duplicate_files`。
 
 ## 目录结构
 
@@ -120,7 +124,7 @@ knowledge_base/processed/    # 提取后的中间文件，已被 .gitignore 排�
 
 ### 第三阶段：增强准确性
 
-待实现：
+已完成：
 
 - 加 embedding 语义检索
 - 加 chunk rerank

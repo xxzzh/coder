@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Import local documents and build a SQLite FTS5 knowledge-base index."""
+"""Import local documents and build a SQLite FTS5 + local embedding index."""
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import hashlib
 import json
+import math
 import re
 import sqlite3
 import zipfile
@@ -17,6 +20,7 @@ from xml.etree import ElementTree as ET
 SUPPORTED = {".md", ".docx", ".pdf", ".xlsx"}
 DB_PATH = Path("knowledge_base/index/knowledge.db")
 PROCESSED_DIR = Path("knowledge_base/processed")
+EMBEDDING_DIMS = 384
 
 
 def read_plain_text(path: Path) -> str:
@@ -210,14 +214,53 @@ def searchable_text(text: str) -> str:
     return f"{text}\n{' '.join(chinese_terms)}"
 
 
+def content_hash(text: str) -> str:
+    normalized = re.sub(r"\s+", "", text).lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def embedding_terms(text: str) -> list[str]:
+    terms: list[str] = []
+    lowered = text.lower()
+    terms.extend(re.findall(r"[a-z0-9_]{2,}", lowered))
+    for block in re.findall(r"[\u4e00-\u9fff]+", text):
+        for size in (2, 3, 4):
+            if len(block) < size:
+                continue
+            terms.extend(block[index : index + size] for index in range(len(block) - size + 1))
+    return terms
+
+
+def local_embedding(text: str, dims: int = EMBEDDING_DIMS) -> list[list[float]]:
+    vector: dict[int, float] = {}
+    for term in embedding_terms(text):
+        digest = hashlib.blake2b(term.encode("utf-8"), digest_size=8).digest()
+        value = int.from_bytes(digest, "big")
+        index = value % dims
+        sign = 1.0 if (value >> 8) & 1 else -1.0
+        weight = 1.0 + min(len(term), 8) / 8.0
+        vector[index] = vector.get(index, 0.0) + sign * weight
+
+    norm = math.sqrt(sum(value * value for value in vector.values()))
+    if not norm:
+        return []
+    return [[index, round(value / norm, 6)] for index, value in sorted(vector.items()) if abs(value) > 1e-9]
+
+
 def init_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.executescript(
         """
+        DROP TABLE IF EXISTS metadata;
         DROP TABLE IF EXISTS documents;
         DROP TABLE IF EXISTS chunks;
         DROP TABLE IF EXISTS chunks_fts;
+
+        CREATE TABLE metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
 
         CREATE TABLE documents (
             doc_id TEXT PRIMARY KEY,
@@ -226,6 +269,9 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             file_type TEXT NOT NULL,
             file_size INTEGER NOT NULL,
             modified_at TEXT NOT NULL,
+            indexed_at TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            duplicate_of TEXT,
             text TEXT NOT NULL
         );
 
@@ -234,6 +280,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             doc_id TEXT NOT NULL,
             chunk_index INTEGER NOT NULL,
             text TEXT NOT NULL,
+            embedding TEXT NOT NULL,
             FOREIGN KEY(doc_id) REFERENCES documents(doc_id)
         );
 
@@ -252,13 +299,21 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def ingest(raw_dir: Path, db_path: Path = DB_PATH, processed_dir: Path = PROCESSED_DIR) -> dict[str, int]:
+def ingest(raw_dir: Path, db_path: Path = DB_PATH, processed_dir: Path = PROCESSED_DIR) -> dict[str, Any]:
     raw_dir.mkdir(parents=True, exist_ok=True)
     processed_dir.mkdir(parents=True, exist_ok=True)
     conn = init_db(db_path)
+    indexed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute("INSERT INTO metadata VALUES (?, ?)", ("indexed_at", indexed_at))
+    conn.execute("INSERT INTO metadata VALUES (?, ?)", ("embedding_model", f"local-hash-ngram-{EMBEDDING_DIMS}d"))
+
     doc_count = 0
+    indexed_doc_count = 0
     chunk_count = 0
     skipped_count = 0
+    duplicate_count = 0
+    seen_hashes: dict[str, str] = {}
+    duplicate_files: list[dict[str, str]] = []
 
     with (processed_dir / "documents.jsonl").open("w", encoding="utf-8") as docs_out, (
         processed_dir / "chunks.jsonl"
@@ -282,7 +337,15 @@ def ingest(raw_dir: Path, db_path: Path = DB_PATH, processed_dir: Path = PROCESS
             rel_path = str(path.relative_to(raw_dir)).replace("\\", "/")
             file_type = path.suffix.lower().lstrip(".")
             stat = path.stat()
-            modified_at = f"{stat.st_mtime:.6f}"
+            modified_at = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds")
+            hash_value = content_hash(text)
+            duplicate_of = seen_hashes.get(hash_value)
+            if duplicate_of:
+                duplicate_count += 1
+                duplicate_files.append({"file_path": rel_path, "duplicate_of": duplicate_of})
+            else:
+                seen_hashes[hash_value] = rel_path
+                indexed_doc_count += 1
 
             doc_record = {
                 "doc_id": doc_id,
@@ -291,10 +354,13 @@ def ingest(raw_dir: Path, db_path: Path = DB_PATH, processed_dir: Path = PROCESS
                 "file_type": file_type,
                 "file_size": stat.st_size,
                 "modified_at": modified_at,
+                "indexed_at": indexed_at,
+                "content_hash": hash_value,
+                "duplicate_of": duplicate_of,
                 "text": text,
             }
             conn.execute(
-                "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     doc_id,
                     path.name,
@@ -302,15 +368,22 @@ def ingest(raw_dir: Path, db_path: Path = DB_PATH, processed_dir: Path = PROCESS
                     file_type,
                     stat.st_size,
                     modified_at,
+                    indexed_at,
+                    hash_value,
+                    duplicate_of,
                     text,
                 ),
             )
             docs_out.write(json.dumps(doc_record, ensure_ascii=False) + "\n")
 
+            if duplicate_of:
+                continue
+
             for index, chunk in enumerate(chunk_text(text), start=1):
                 chunk_count += 1
                 chunk_id = f"{doc_id}_{index:04d}"
-                conn.execute("INSERT INTO chunks VALUES (?, ?, ?, ?)", (chunk_id, doc_id, index, chunk))
+                embedding = json.dumps(local_embedding(chunk), separators=(",", ":"))
+                conn.execute("INSERT INTO chunks VALUES (?, ?, ?, ?, ?)", (chunk_id, doc_id, index, chunk, embedding))
                 conn.execute(
                     "INSERT INTO chunks_fts VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (chunk_id, doc_id, path.name, rel_path, file_type, chunk, searchable_text(chunk)),
@@ -324,6 +397,7 @@ def ingest(raw_dir: Path, db_path: Path = DB_PATH, processed_dir: Path = PROCESS
                             "file_name": path.name,
                             "file_path": rel_path,
                             "file_type": file_type,
+                            "embedding_model": f"local-hash-ngram-{EMBEDDING_DIMS}d",
                             "text": chunk,
                         },
                         ensure_ascii=False,
@@ -333,11 +407,20 @@ def ingest(raw_dir: Path, db_path: Path = DB_PATH, processed_dir: Path = PROCESS
 
     conn.commit()
     conn.close()
-    return {"documents": doc_count, "chunks": chunk_count, "skipped": skipped_count}
+    return {
+        "documents": doc_count,
+        "indexed_documents": indexed_doc_count,
+        "chunks": chunk_count,
+        "skipped": skipped_count,
+        "duplicates": duplicate_count,
+        "duplicate_files": duplicate_files,
+        "indexed_at": indexed_at,
+        "embedding_model": f"local-hash-ngram-{EMBEDDING_DIMS}d",
+    }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Import local documents and build a SQLite FTS5 index.")
+    parser = argparse.ArgumentParser(description="Import local documents and build a SQLite FTS5 + embedding index.")
     parser.add_argument("raw_dir", nargs="?", default="knowledge_base/raw")
     parser.add_argument("--db", default=str(DB_PATH))
     parser.add_argument("--processed", default=str(PROCESSED_DIR))
