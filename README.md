@@ -27,10 +27,12 @@
 │   └── raw/                 # 原始知识库文件
 ├── scripts/
 │   ├── ingest_knowledge_base.py
-│   └── query_knowledge_base.py
+│   ├── query_knowledge_base.py
+│   └── manage_knowledge_base.py
 ├── run-agent.bat            # Windows 命令入口
 ├── install_kb_phase1.py     # 示例知识库生成脚本
-└── 阶段验证命令.md           # 分阶段验证命令
+├── 阶段验证命令.md           # 分阶段验证命令
+└── 分阶段开发与推送流程.md    # 协作与推送流程
 ```
 
 运行导入后会生成：
