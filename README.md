@@ -1,6 +1,6 @@
 # Local Knowledge Base Agent
 
-一个本地知识库 Agent MVP，用于把本地文档导入 SQLite FTS5 索引，并通过命令行查询。当前已完成第一阶段、第二阶段和第三阶段：本地知识库检索、本地答不了时可选择联网搜索，以及本地语义检索与准确性增强。
+一个本地知识库 Agent MVP，用于把本地文档导入 SQLite FTS5 索引，并通过命令行查询。当前已完成四个阶段：本地知识库检索、本地答不了时可选择联网搜索、本地语义检索与准确性增强，以及更方便的命令行入口。
 
 ## 当前能力
 
@@ -9,14 +9,15 @@
 - 提取文本并写入 SQLite FTS5 索引。
 - 通过 `run-agent.bat` 查询知识库。
 - 输出结构化 JSON，包含 `answer`、`source_type`、`sources`、`need_web_search`、`web_search_used`。
-- 本地知识库答不了时，不加 `--web` 只提示是否需要联网。
-- 加 `--web` 时允许联网搜索，并标识 `source_type: "web_search"`。
+- 直接运行 `.\run-agent.bat "问题"` 时，优先查本地；本地答不了会自动联网搜索，并标识 `source_type: "web_search"`。
+- 兼容 `ask` 命令；如需只查本地，可使用 `ask "问题" --no-web`。
 - 输出内容会清洗为自然语言文本，避免 Markdown 标题、列表符号和换行残留。
 - 联网搜索结果中的中文内容会尽量转成简体中文。
 - 使用本地 hash n-gram embedding 做语义检索，不依赖外部 API。
 - 对候选 chunk 进行 rerank，综合语义分、关键词分和 FTS 分。
 - 输出引用片段 `citations`、索引更新时间 `index_updated_at` 和 `embedding_model`。
 - 导入时检测重复文件，输出 `duplicates` 和 `duplicate_files`。
+- 提供 `sources` 和 `rebuild` 命令，便于查看来源与重建索引。
 
 ## 目录结构
 
@@ -47,22 +48,40 @@ knowledge_base/processed/    # 提取后的中间文件，已被 .gitignore 排�
 .\run-agent.bat ingest
 ```
 
-查询本地知识库：
+直接输入问题。系统会优先查询本地知识库；本地没有足够依据时，会自动联网搜索并标识 `source_type: "web_search"`：
 
 ```bat
-.\run-agent.bat ask "加强针有什么作用？"
+.\run-agent.bat "加强针有什么作用？"
 ```
 
-本地答不了时只提示，不联网：
+查看当前索引来源：
+
+```bat
+.\run-agent.bat sources
+```
+
+删除生成索引并重新导入：
+
+```bat
+.\run-agent.bat rebuild
+```
+
+本地答不了时自动联网：
+
+```bat
+.\run-agent.bat "量子纠缠如何用于加密？"
+```
+
+兼容旧的 `ask` 命令，默认也会自动联网：
 
 ```bat
 .\run-agent.bat ask "量子纠缠如何用于加密？"
 ```
 
-允许联网搜索：
+如需只查本地、不联网：
 
 ```bat
-.\run-agent.bat ask "量子纠缠如何用于加密？" --web
+.\run-agent.bat ask "量子纠缠如何用于加密？" --no-web
 ```
 
 ## 示例输出
@@ -134,11 +153,12 @@ knowledge_base/processed/    # 提取后的中间文件，已被 .gitignore 排�
 
 ### 第四阶段：做成更方便的使用方式
 
-待实现：
+已完成：
 
 - `.\run-agent.bat ingest`
+- `.\run-agent.bat "问题"`
 - `.\run-agent.bat ask "问题"`
-- `.\run-agent.bat ask "问题" --web`
+- `.\run-agent.bat ask "问题" --no-web`
 - `.\run-agent.bat sources`
 - `.\run-agent.bat rebuild`
 
