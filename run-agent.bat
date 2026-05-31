@@ -8,6 +8,8 @@ set "MANAGE=%ROOT%scripts\manage_knowledge_base.py"
 set "SETUP=%ROOT%scripts\setup_agent.py"
 set "HEALTH=%ROOT%scripts\healthcheck_agent.py"
 set "WEB=%ROOT%scripts\web_agent.py"
+set "TRANSLATION_SETUP=%ROOT%scripts\install_translation_model.py"
+set "API_SETUP=%ROOT%scripts\configure_api.py"
 set "PYTHONUTF8=1"
 
 if "%~1"=="" goto usage
@@ -15,6 +17,8 @@ if /I "%~1"=="setup" goto setup
 if /I "%~1"=="verify" goto verify
 if /I "%~1"=="healthcheck" goto verify
 if /I "%~1"=="web" goto web
+if /I "%~1"=="translation-setup" goto translation_setup
+if /I "%~1"=="api-setup" goto api_setup
 if /I "%~1"=="ingest" goto ingest
 if /I "%~1"=="update" goto update
 if /I "%~1"=="ask" goto ask
@@ -29,6 +33,8 @@ echo.
 echo Examples:
 echo   .\run-agent.bat setup
 echo   .\run-agent.bat web
+echo   .\run-agent.bat translation-setup
+echo   .\run-agent.bat api-setup
 echo   .\run-agent.bat verify
 echo   .\run-agent.bat "your question"
 echo   .\run-agent.bat ingest
@@ -51,6 +57,14 @@ exit /b %ERRORLEVEL%
 :web
 shift
 python "%WEB%" %*
+exit /b %ERRORLEVEL%
+
+:translation_setup
+python "%TRANSLATION_SETUP%"
+exit /b %ERRORLEVEL%
+
+:api_setup
+python "%API_SETUP%"
 exit /b %ERRORLEVEL%
 
 :ingest

@@ -10,6 +10,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from api_providers import read_env as read_api_env
+from configure_api import main as configure_api
+
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
@@ -87,22 +90,10 @@ def main() -> int:
         "LKA_API_TIMEOUT_SECONDS": "20",
     }
     if use_api:
-        provider = ask_value("API provider 名称", "openai-compatible")
-        base_url = ask_value("API base URL", "https://api.openai.com/v1")
-        model = ask_value("模型名称", "gpt-4o-mini")
-        api_key = ask_value("API key")
-        if api_key:
-            values.update(
-                {
-                    "LKA_USE_API": "true",
-                    "LKA_API_PROVIDER": provider,
-                    "LKA_API_BASE_URL": base_url.rstrip("/"),
-                    "LKA_API_KEY": api_key,
-                    "LKA_API_MODEL": model,
-                }
-            )
+        if configure_api() == 0:
+            values = read_api_env()
         else:
-            print("未输入 API key，将保持纯本地命令行回答模式。")
+            print("API 配置未完成，将保持纯本地回答模式。")
 
     write_env(values)
     print(f"配置已写入: {ENV_PATH}")

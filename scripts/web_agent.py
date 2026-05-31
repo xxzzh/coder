@@ -18,6 +18,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from api_providers import (  # noqa: E402
+    default_base_url,
+    discover_models,
+    infer_provider,
+    provider_options,
+    read_env as read_api_env,
+    validate_chat_model,
+    write_env as write_api_env,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / "scripts"
@@ -31,9 +40,11 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from healthcheck_agent import (  # noqa: E402
     SUPPORTED,
+    api_backend_allowed,
     db_stats,
     extraction_report_stats,
     load_env,
+    offline_translation_status,
     optional_extractors,
     sqlite_has_fts5,
 )
@@ -78,12 +89,64 @@ def health_payload() -> dict[str, Any]:
         "raw_counts": raw_counts,
         "index": stats,
         "optional_extractors": extractors,
+        "offline_translation": offline_translation_status(),
         "extraction_report": extraction,
         "api_configured": env.get("LKA_USE_API", "false").lower() == "true" and bool(env.get("LKA_API_KEY")),
+        "api_backend_usable": api_backend_allowed(env),
         "api_provider": env.get("LKA_API_PROVIDER", "none"),
         "scale_warning": chunks >= 50000,
         "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def api_config_payload() -> dict[str, Any]:
+    env = read_api_env()
+    provider = infer_provider(
+        env.get("LKA_API_BASE_URL", ""),
+        env.get("LKA_API_KEY", ""),
+        env.get("LKA_API_PROVIDER", ""),
+    )
+    configured = env.get("LKA_USE_API", "false").lower() == "true" and bool(env.get("LKA_API_KEY"))
+    return {
+        "configured": configured,
+        "usable": configured and api_backend_allowed(env),
+        "provider": provider,
+        "base_url": env.get("LKA_API_BASE_URL", ""),
+        "model": env.get("LKA_API_MODEL", ""),
+        "providers": provider_options(),
+    }
+
+
+def api_key_from_payload(payload: dict[str, Any]) -> str:
+    api_key = str(payload.get("api_key", "")).strip()
+    if api_key:
+        return api_key
+    return read_api_env().get("LKA_API_KEY", "")
+
+
+def save_api_config(payload: dict[str, Any]) -> dict[str, Any]:
+    provider = str(payload.get("provider", "openai-compatible")).strip()
+    base_url = str(payload.get("base_url", "")).strip() or default_base_url(provider)
+    api_key = api_key_from_payload(payload)
+    model = str(payload.get("model", "")).strip()
+    if not api_key or not model:
+        raise ValueError("API key 和模型不能为空。")
+    validation = validate_chat_model(provider, base_url, api_key, model)
+    if not validation.get("ok"):
+        raise ValueError(f"模型调用验证失败：{validation.get('error')}")
+    env = read_api_env()
+    env.update(
+        {
+            "LKA_USE_API": "true",
+            "LKA_API_PROVIDER": provider,
+            "LKA_API_BASE_URL": base_url.rstrip("/"),
+            "LKA_API_KEY": api_key,
+            "LKA_API_MODEL": model,
+            "LKA_API_TIMEOUT_SECONDS": env.get("LKA_API_TIMEOUT_SECONDS", "20"),
+        }
+    )
+    write_api_env(env)
+    return {"ok": True, "provider": provider, "base_url": base_url.rstrip("/"), "model": model}
 
 
 def run_ocr_eval() -> dict[str, Any]:
@@ -249,6 +312,15 @@ def page_html() -> str:
       background: #fff;
       color: var(--text);
     }
+    input, select {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 7px 9px;
+      background: #fff;
+      color: var(--text);
+    }
     .row {
       display: flex;
       align-items: center;
@@ -389,6 +461,18 @@ def page_html() -> str:
         </div>
       </div>
       <div class="panel">
+        <h2>API 精炼</h2>
+        <div class="stack">
+          <select id="apiProvider" onchange="providerChanged()"></select>
+          <input id="apiBaseUrl" placeholder="API base URL">
+          <input id="apiKey" type="password" placeholder="API key">
+          <button onclick="discoverApiModels()">读取可用模型</button>
+          <select id="apiModel"><option value="">请先读取模型</option></select>
+          <button class="primary" onclick="saveApiConfig()">保存并验证</button>
+          <div id="apiConfigMeta" class="muted"></div>
+        </div>
+      </div>
+      <div class="panel">
         <h2>运行日志</h2>
         <div id="log" class="log">Web UI 已启动。</div>
       </div>
@@ -412,6 +496,64 @@ def page_html() -> str:
       if (!response.ok) throw new Error(data.error || response.statusText);
       return data;
     }
+    let apiProviders = [];
+    async function loadApiConfig() {
+      try {
+        const data = await api('/api/api-config');
+        apiProviders = data.providers || [];
+        $('apiProvider').innerHTML = apiProviders.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
+        $('apiProvider').value = data.provider || 'openai-compatible';
+        $('apiBaseUrl').value = data.base_url || providerBaseUrl();
+        $('apiConfigMeta').textContent = data.usable ? `当前模型：${data.model || '-'}` : (data.configured ? '已有配置不可用于应用后端，请重新配置有效 API key' : '未配置可用 API');
+        if (data.model) $('apiModel').innerHTML = `<option value="${escapeHtml(data.model)}">${escapeHtml(data.model)}</option>`;
+      } catch (error) {
+        $('apiConfigMeta').textContent = `加载失败：${error.message}`;
+      }
+    }
+    function providerBaseUrl() {
+      return (apiProviders.find((item) => item.id === $('apiProvider').value) || {}).base_url || '';
+    }
+    function providerChanged() {
+      $('apiBaseUrl').value = providerBaseUrl();
+      $('apiModel').innerHTML = '<option value="">请先读取模型</option>';
+    }
+    async function discoverApiModels() {
+      setBusy(true);
+      $('apiConfigMeta').textContent = '正在读取可用模型...';
+      try {
+        const data = await api('/api/api-models', {method: 'POST', body: JSON.stringify({
+          provider: $('apiProvider').value,
+          base_url: $('apiBaseUrl').value,
+          api_key: $('apiKey').value
+        })});
+        $('apiModel').innerHTML = (data.models || []).map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join('');
+        $('apiConfigMeta').textContent = data.warning || `已读取 ${(data.models || []).length} 个模型`;
+      } catch (error) {
+        $('apiConfigMeta').textContent = `读取失败：${error.message}`;
+      } finally {
+        setBusy(false);
+      }
+    }
+    async function saveApiConfig() {
+      setBusy(true);
+      $('apiConfigMeta').textContent = '正在验证模型调用...';
+      try {
+        const data = await api('/api/api-save', {method: 'POST', body: JSON.stringify({
+          provider: $('apiProvider').value,
+          base_url: $('apiBaseUrl').value,
+          api_key: $('apiKey').value,
+          model: $('apiModel').value
+        })});
+        $('apiKey').value = '';
+        $('apiConfigMeta').textContent = `已启用：${data.provider} · ${data.model}`;
+        log('API 配置已保存', {provider: data.provider, model: data.model});
+        loadHealth();
+      } catch (error) {
+        $('apiConfigMeta').textContent = `保存失败：${error.message}`;
+      } finally {
+        setBusy(false);
+      }
+    }
     function setBadge(ok, text) {
       const badge = $('readyBadge');
       badge.className = `status ${ok ? 'ok' : 'bad'}`;
@@ -429,7 +571,8 @@ def page_html() -> str:
           `索引时间：${data.index?.indexed_at || '未建立'}`,
           `分块：${data.index?.chunk_strategy || '-'}`,
           `OCR：${data.optional_extractors?.ocr_ready ? '可用' : '不可用'}`,
-          `API：${data.api_configured ? data.api_provider : '未配置'}`
+          `离线英译中：${data.offline_translation?.en_to_zh_ready ? '可用' : '不可用'}`,
+          `API：${data.api_configured ? (data.api_backend_usable ? data.api_provider : '当前配置不可用于应用后端') : '未配置'}`
         ];
         if (data.scale_warning) lines.push('规模提示：chunk 已超过 50000，建议评估独立向量库。');
         if ((data.extraction_report?.requires_review ?? 0) > 0) lines.push('存在待复核抽取结果，请先处理后再交付使用。');
@@ -483,7 +626,7 @@ def page_html() -> str:
               $('answer').textContent = data.message;
               $('askMeta').textContent = data.elapsed_seconds ? `已等待 ${data.elapsed_seconds} 秒` : '';
             } else if (eventName === 'meta') {
-              $('askMeta').textContent = `${data.source_type || '-'}${data.cache_hit ? ' · cache' : ''}${data.api_used ? ' · api' : ''}`;
+              $('askMeta').textContent = `${data.source_type || '-'}${data.web_search_provider ? ` · ${data.web_search_provider}` : ''}${data.cache_hit ? ' · cache' : ''}${data.api_used ? ' · api' : ''}`;
             } else if (eventName === 'sources') {
               renderSources(data.sources || []);
             } else if (eventName === 'answer-start') {
@@ -579,6 +722,7 @@ def page_html() -> str:
     });
     loadHealth();
     loadSources();
+    loadApiConfig();
   </script>
 </body>
 </html>
@@ -599,6 +743,8 @@ class AgentHandler(BaseHTTPRequestHandler):
             self.send_json(health_payload())
         elif parsed.path == "/api/sources":
             self.send_json(kb_sources(DB_PATH))
+        elif parsed.path == "/api/api-config":
+            self.send_json(api_config_payload())
         elif parsed.path == "/api/query":
             params = parse_qs(parsed.query)
             question = params.get("question", [""])[0].strip()
@@ -646,6 +792,19 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "summary": compact_ingest_result(result), "result": result})
             elif parsed.path == "/api/ocr-eval":
                 self.send_json(run_ocr_eval())
+            elif parsed.path == "/api/api-models":
+                payload = self.read_json()
+                provider = str(payload.get("provider", "openai-compatible")).strip()
+                base_url = str(payload.get("base_url", "")).strip() or default_base_url(provider)
+                api_key = api_key_from_payload(payload)
+                if not api_key:
+                    raise ValueError("请输入 API key。")
+                result = discover_models(provider, base_url, api_key)
+                if not result.get("ok"):
+                    raise ValueError(str(result.get("error", "没有找到可用模型。")))
+                self.send_json(result)
+            elif parsed.path == "/api/api-save":
+                self.send_json(save_api_config(self.read_json()))
             else:
                 self.send_error_json("Not found", HTTPStatus.NOT_FOUND)
         except Exception as exc:  # noqa: BLE001
@@ -708,7 +867,12 @@ class AgentHandler(BaseHTTPRequestHandler):
                 error_box["error"] = exc
 
         started_at = time.monotonic()
-        self.send_stream_event("status", {"message": "正在检索本地索引并整理引用..."})
+        initial_status = (
+            "正在检索本地索引和联网资料，并准备整合引用..."
+            if use_web
+            else "正在检索本地索引并整理引用..."
+        )
+        self.send_stream_event("status", {"message": initial_status})
         worker = threading.Thread(target=run_query, daemon=True)
         worker.start()
         while worker.is_alive():
@@ -729,6 +893,21 @@ class AgentHandler(BaseHTTPRequestHandler):
 
         result = result_box["result"]
         sources = result.get("sources", [])
+        sys.stderr.write(
+            "query "
+            + json.dumps(
+                {
+                    "question": question,
+                    "source_type": result.get("source_type"),
+                    "web_search_provider": result.get("web_search_provider"),
+                    "web_search_reason": result.get("web_search_reason"),
+                    "sources": len(sources),
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        sys.stderr.flush()
         self.send_stream_event(
             "status",
             {
@@ -740,6 +919,8 @@ class AgentHandler(BaseHTTPRequestHandler):
             "meta",
             {
                 "source_type": result.get("source_type"),
+                "web_search_provider": result.get("web_search_provider"),
+                "web_search_reason": result.get("web_search_reason"),
                 "cache_hit": result.get("cache_hit", False),
                 "api_used": result.get("api_used", False),
             },

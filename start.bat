@@ -26,6 +26,8 @@ echo  7. Ask a question
 echo  8. List indexed sources
 echo  9. Run OCR test materials evaluation
 echo 10. Generate OCR test materials
+echo 11. Install offline English-to-Chinese translation model
+echo 12. Configure answer refinement API
 echo  0. Exit
 echo.
 set /p "CHOICE=Choose an option: "
@@ -40,6 +42,8 @@ if "%CHOICE%"=="7" goto ask
 if "%CHOICE%"=="8" goto sources
 if "%CHOICE%"=="9" goto ocr_eval
 if "%CHOICE%"=="10" goto ocr_generate
+if "%CHOICE%"=="11" goto translation_setup
+if "%CHOICE%"=="12" goto api_setup
 if "%CHOICE%"=="0" goto end
 
 echo.
@@ -66,7 +70,7 @@ goto menu
 :open_raw
 start "" "%RAW%"
 echo.
-echo Put .md, .docx, .pdf, and .xlsx files in this folder, then run option 3 or 4.
+echo Put .md, .docx, .pdf, and .xlsx files in this folder, then run option 5 for an incremental update or option 4 for a strict rebuild.
 echo.
 pause
 goto menu
@@ -131,6 +135,18 @@ if not exist "%OCR_GEN%" (
   goto menu
 )
 python "%OCR_GEN%"
+echo.
+pause
+goto menu
+
+:translation_setup
+call "%RUNNER%" translation-setup
+echo.
+pause
+goto menu
+
+:api_setup
+call "%RUNNER%" api-setup
 echo.
 pause
 goto menu

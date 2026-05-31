@@ -10,6 +10,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from api_providers import infer_provider, token_plan_rejected
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RAW_DIR = ROOT / "knowledge_base" / "raw"
@@ -40,6 +42,12 @@ def load_env(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         values[key.strip()] = value.strip().strip('"').strip("'")
     return values
+
+
+def api_backend_allowed(env: dict[str, str]) -> bool:
+    base_url = env.get("LKA_API_BASE_URL", "").lower()
+    api_key = env.get("LKA_API_KEY", "").lower()
+    return not token_plan_rejected(base_url, api_key)
 
 
 def db_stats() -> dict[str, object]:
@@ -103,6 +111,17 @@ def optional_extractors() -> dict[str, object]:
     }
 
 
+def offline_translation_status() -> dict[str, object]:
+    try:
+        from argostranslate import translate  # type: ignore
+    except ImportError:
+        return {"package_installed": False, "en_to_zh_ready": False}
+    installed = translate.get_installed_languages()
+    english = next((language for language in installed if language.code == "en"), None)
+    ready = bool(english and any(item.to_lang.code == "zh" for item in english.translations_from))
+    return {"package_installed": True, "en_to_zh_ready": ready}
+
+
 def extraction_report_stats() -> dict[str, object]:
     if not EXTRACTION_REPORT.exists():
         return {"exists": False}
@@ -155,9 +174,15 @@ def main() -> int:
         "raw_counts": counts,
         "index": stats,
         "optional_extractors": optional_extractors(),
+        "offline_translation": offline_translation_status(),
         "extraction_report": extraction_report_stats(),
         "api_configured": env.get("LKA_USE_API", "false").lower() == "true" and bool(env.get("LKA_API_KEY")),
-        "api_provider": env.get("LKA_API_PROVIDER", "none"),
+        "api_backend_usable": api_backend_allowed(env),
+        "api_provider": infer_provider(
+            env.get("LKA_API_BASE_URL", ""),
+            env.get("LKA_API_KEY", ""),
+            env.get("LKA_API_PROVIDER", ""),
+        ),
     }
     ok = (
         checks["sqlite_fts5"]
