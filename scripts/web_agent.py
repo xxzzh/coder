@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from http import HTTPStatus
@@ -442,12 +443,14 @@ def page_html() -> str:
       const question = $('question').value.trim();
       if (!question) return;
       setBusy(true);
-      $('answer').textContent = '查询中...';
+      $('answer').className = 'answer muted';
+      $('answer').textContent = '正在准备查询...';
       $('sources').textContent = '';
       $('askMeta').textContent = '';
       try {
-        const data = await api('/api/query', {
+        const response = await fetch('/api/query-stream', {
           method: 'POST',
+          headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
             question,
             use_web: $('allowWeb').checked,
@@ -455,11 +458,49 @@ def page_html() -> str:
             limit: 5
           })
         });
-        $('answer').className = 'answer';
-        $('answer').textContent = data.answer || '没有返回答案';
-        $('askMeta').textContent = `${data.source_type || '-'}${data.cache_hit ? ' · cache' : ''}${data.api_used ? ' · api' : ''}`;
-        renderSources(data.sources || []);
-        log('查询完成', {source_type: data.source_type, sources: (data.sources || []).length});
+        if (!response.ok || !response.body) {
+          const data = await response.json();
+          throw new Error(data.error || response.statusText);
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let streamedAnswer = '';
+        while (true) {
+          const {value, done} = await reader.read();
+          buffer += decoder.decode(value || new Uint8Array(), {stream: !done});
+          const blocks = buffer.split('\\n\\n');
+          buffer = blocks.pop() || '';
+          blocks.forEach((block) => {
+            if (!block.trim()) return;
+            const lines = block.split('\\n');
+            const eventName = (lines.find((line) => line.startsWith('event: ')) || 'event: message').slice(7);
+            const dataLine = lines.find((line) => line.startsWith('data: '));
+            if (!dataLine) return;
+            const data = JSON.parse(dataLine.slice(6));
+            if (eventName === 'status') {
+              $('answer').className = 'answer muted';
+              $('answer').textContent = data.message;
+              $('askMeta').textContent = data.elapsed_seconds ? `已等待 ${data.elapsed_seconds} 秒` : '';
+            } else if (eventName === 'meta') {
+              $('askMeta').textContent = `${data.source_type || '-'}${data.cache_hit ? ' · cache' : ''}${data.api_used ? ' · api' : ''}`;
+            } else if (eventName === 'sources') {
+              renderSources(data.sources || []);
+            } else if (eventName === 'answer-start') {
+              streamedAnswer = '';
+              $('answer').className = 'answer';
+              $('answer').textContent = '';
+            } else if (eventName === 'answer-delta') {
+              streamedAnswer += data.text || '';
+              $('answer').textContent = streamedAnswer;
+            } else if (eventName === 'error') {
+              throw new Error(data.error || '查询失败');
+            } else if (eventName === 'done') {
+              log('查询完成', {source_type: data.source_type, sources: data.sources_count});
+            }
+          });
+          if (done) break;
+        }
       } catch (error) {
         $('answer').className = 'answer muted';
         $('answer').textContent = `查询失败：${error.message}`;
@@ -579,7 +620,10 @@ class AgentHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
-            if parsed.path == "/api/query":
+            if parsed.path == "/api/query-stream":
+                payload = self.read_json()
+                self.stream_query(payload)
+            elif parsed.path == "/api/query":
                 payload = self.read_json()
                 question = str(payload.get("question", "")).strip()
                 if not question:
@@ -632,6 +676,88 @@ class AgentHandler(BaseHTTPRequestHandler):
 
     def send_error_json(self, message: str, status: HTTPStatus) -> None:
         self.send_json({"ok": False, "error": message}, status)
+
+    def send_stream_event(self, event: str, data: dict[str, Any]) -> None:
+        payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        self.wfile.write(f"event: {event}\ndata: {payload}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    def stream_query(self, payload: dict[str, Any]) -> None:
+        question = str(payload.get("question", "")).strip()
+        if not question:
+            self.send_error_json("Missing question", HTTPStatus.BAD_REQUEST)
+            return
+
+        limit = int(payload.get("limit", 5) or 5)
+        use_web = bool(payload.get("use_web", False))
+        allow_api = bool(payload.get("allow_api", True))
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        result_box: dict[str, Any] = {}
+        error_box: dict[str, Exception] = {}
+
+        def run_query() -> None:
+            try:
+                result_box["result"] = kb_query(DB_PATH, question, limit=limit, use_web=use_web, allow_api=allow_api)
+            except Exception as exc:  # noqa: BLE001
+                error_box["error"] = exc
+
+        started_at = time.monotonic()
+        self.send_stream_event("status", {"message": "正在检索本地索引并整理引用..."})
+        worker = threading.Thread(target=run_query, daemon=True)
+        worker.start()
+        while worker.is_alive():
+            worker.join(timeout=1.0)
+            if worker.is_alive():
+                elapsed = max(1, int(time.monotonic() - started_at))
+                self.send_stream_event(
+                    "status",
+                    {
+                        "message": "仍在处理中：正在等待检索、资料更新或 API 总结完成...",
+                        "elapsed_seconds": elapsed,
+                    },
+                )
+
+        if error_box:
+            self.send_stream_event("error", {"error": str(error_box["error"])})
+            return
+
+        result = result_box["result"]
+        sources = result.get("sources", [])
+        self.send_stream_event(
+            "status",
+            {
+                "message": f"已找到 {len(sources)} 条引用，正在生成答案...",
+                "elapsed_seconds": max(0, int(time.monotonic() - started_at)),
+            },
+        )
+        self.send_stream_event(
+            "meta",
+            {
+                "source_type": result.get("source_type"),
+                "cache_hit": result.get("cache_hit", False),
+                "api_used": result.get("api_used", False),
+            },
+        )
+        self.send_stream_event("sources", {"sources": sources})
+        self.send_stream_event("answer-start", {})
+        answer = str(result.get("answer") or "没有返回答案")
+        for start in range(0, len(answer), 18):
+            self.send_stream_event("answer-delta", {"text": answer[start : start + 18]})
+            time.sleep(0.025)
+        self.send_stream_event(
+            "done",
+            {
+                "source_type": result.get("source_type"),
+                "sources_count": len(sources),
+                "elapsed_seconds": round(time.monotonic() - started_at, 2),
+            },
+        )
 
 
 def compact_ingest_result(result: dict[str, Any]) -> dict[str, Any]:
