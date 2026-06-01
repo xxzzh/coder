@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from api_providers import infer_provider, token_plan_rejected
+from ingest_knowledge_base import extraction_reports, find_winword, is_ignored_raw_file, pending_review_reports
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +19,17 @@ RAW_DIR = ROOT / "knowledge_base" / "raw"
 DB_PATH = ROOT / "knowledge_base" / "index" / "knowledge.db"
 EXTRACTION_REPORT = ROOT / "knowledge_base" / "processed" / "extraction_report.jsonl"
 PROJECT_TESSDATA_DIR = ROOT / "tools" / "tessdata"
-SUPPORTED = {".md", ".docx", ".pdf", ".xlsx"}
+SUPPORTED = {".md", ".doc", ".docx", ".pdf", ".xlsx"}
+
+
+def unsupported_raw_files() -> list[str]:
+    if not RAW_DIR.exists():
+        return []
+    return [
+        str(path.relative_to(RAW_DIR)).replace("\\", "/")
+        for path in sorted(RAW_DIR.rglob("*"))
+        if path.is_file() and not is_ignored_raw_file(path) and path.suffix.lower() not in SUPPORTED
+    ]
 
 
 def sqlite_has_fts5() -> bool:
@@ -105,6 +116,7 @@ def optional_extractors() -> dict[str, object]:
         "modules": modules,
         "tesseract": tesseract,
         "pdftoppm": shutil.which("pdftoppm"),
+        "word_doc_converter": find_winword(),
         "tessdata_dir": str(tessdata_dir) if tessdata_dir else None,
         "ocr_languages": languages,
         "ocr_ready": bool(tesseract and shutil.which("pdftoppm") and {"eng", "chi_sim"}.issubset(set(languages))),
@@ -125,42 +137,39 @@ def offline_translation_status() -> dict[str, object]:
 def extraction_report_stats() -> dict[str, object]:
     if not EXTRACTION_REPORT.exists():
         return {"exists": False}
-    total = 0
+    reports = extraction_reports(EXTRACTION_REPORT.parent)
+    pending = pending_review_reports(RAW_DIR, EXTRACTION_REPORT.parent)
     warnings = 0
-    requires_review = 0
-    examples: list[dict[str, object]] = []
-    with EXTRACTION_REPORT.open("r", encoding="utf-8") as report_in:
-        for line in report_in:
-            if not line.strip():
-                continue
-            total += 1
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if item.get("warnings"):
-                warnings += 1
-            if item.get("requires_review"):
-                requires_review += 1
-                if len(examples) < 5:
-                    examples.append(
-                        {
-                            "file_path": item.get("file_path"),
-                            "warnings": item.get("warnings"),
-                        }
-                    )
+    approved = 0
+    for item in reports:
+        if item.get("warnings"):
+            warnings += 1
+        if item.get("review_approved"):
+            approved += 1
+    examples = [
+        {
+            "file_path": item.get("file_path"),
+            "warnings": item.get("warnings"),
+        }
+        for item in pending[:5]
+    ]
     return {
         "exists": True,
-        "files_reported": total,
+        "files_reported": len(reports),
         "warnings": warnings,
-        "requires_review": requires_review,
+        "requires_review": len(pending),
+        "approved_reviews": approved,
         "review_examples": examples,
     }
 
 
 def main() -> int:
     env = load_env(ROOT / ".env")
-    raw_files = [path for path in RAW_DIR.rglob("*") if path.is_file() and path.suffix.lower() in SUPPORTED]
+    raw_files = [
+        path
+        for path in RAW_DIR.rglob("*")
+        if path.is_file() and not is_ignored_raw_file(path) and path.suffix.lower() in SUPPORTED
+    ]
     counts: dict[str, int] = {}
     for path in raw_files:
         counts[path.suffix.lower()] = counts.get(path.suffix.lower(), 0) + 1
@@ -172,6 +181,7 @@ def main() -> int:
         "raw_dir_exists": RAW_DIR.exists(),
         "raw_supported_files": len(raw_files),
         "raw_counts": counts,
+        "raw_unsupported_files": unsupported_raw_files(),
         "index": stats,
         "optional_extractors": optional_extractors(),
         "offline_translation": offline_translation_status(),
@@ -192,6 +202,7 @@ def main() -> int:
         and int(stats.get("documents", 0) or 0) > 0
         and int(stats.get("chunks", 0) or 0) > 0
         and int(checks["extraction_report"].get("requires_review", 0) or 0) == 0
+        and not checks["raw_unsupported_files"]
     )
     checks["ok"] = ok
     print(json.dumps(checks, ensure_ascii=False, indent=2))

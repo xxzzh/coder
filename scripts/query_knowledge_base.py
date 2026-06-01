@@ -28,6 +28,7 @@ from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
 from api_providers import chat_completion, token_plan_rejected
+from ingest_knowledge_base import ingest_in_progress, is_ignored_raw_file
 
 
 DB_PATH = Path("knowledge_base/index/knowledge.db")
@@ -190,7 +191,7 @@ def human_text(text: str, max_len: int | None = None, simplify: bool = False) ->
     text = re.sub(r"^[ \t]*#{1,6}[ \t]*", "", text, flags=re.MULTILINE)
     text = re.sub(r"^[ \t]*[-*+]\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"^[ \t]*\d+[.)]\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"[*_`~]+", "", text)
+    text = re.sub(r"[*_`]+|~~", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     text = text.strip(" -#\t\r\n")
     if max_len is not None and len(text) > max_len:
@@ -204,7 +205,7 @@ def strip_markdown_preserve_lines(text: str) -> str:
     text = re.sub(r"^[ \t]*#{1,6}[ \t]*", "", text, flags=re.MULTILINE)
     text = re.sub(r"^[ \t]*[-*+]\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"^[ \t]*\d+[.)]\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"[*_`~]+", "", text)
+    text = re.sub(r"[*_`]+|~~", "", text)
     return text
 
 
@@ -365,12 +366,12 @@ def get_metadata(conn: sqlite3.Connection) -> dict[str, str]:
 
 
 def source_fingerprint(raw_dir: Path = RAW_DIR) -> str:
-    supported = {".md", ".docx", ".pdf", ".xlsx"}
+    supported = {".md", ".doc", ".docx", ".pdf", ".xlsx"}
     items: list[str] = []
     if not raw_dir.exists():
         return ""
     for path in sorted(raw_dir.rglob("*")):
-        if path.is_file() and path.suffix.lower() in supported:
+        if path.is_file() and not is_ignored_raw_file(path) and path.suffix.lower() in supported:
             rel_path = str(path.relative_to(raw_dir)).replace("\\", "/")
             stat = path.stat()
             items.append(f"{rel_path}:{stat.st_size}:{int(stat.st_mtime)}")
@@ -379,6 +380,8 @@ def source_fingerprint(raw_dir: Path = RAW_DIR) -> str:
 
 def trigger_async_update(db_path: Path = DB_PATH, raw_dir: Path = RAW_DIR, processed_dir: Path = PROCESSED_DIR) -> bool:
     if not db_path.exists():
+        return False
+    if ingest_in_progress(db_path):
         return False
     try:
         conn = sqlite3.connect(db_path)
@@ -460,11 +463,11 @@ def api_backend_allowed(config: dict[str, str]) -> bool:
 
 def api_cache_variant(config: dict[str, str], allow_api: bool) -> str:
     if not allow_api or not api_enabled(config):
-        return "retrieval-v14:language-guard-zh"
+        return "retrieval-v19:xlsx-coordinate-station-table"
     provider = config.get("LKA_API_PROVIDER", "openai-compatible")
     base_url = config.get("LKA_API_BASE_URL", "")
     model = config.get("LKA_API_MODEL", "")
-    return f"retrieval-v14:language-guard-api-zh:{provider}:{base_url}:{model}"
+    return f"retrieval-v19:xlsx-coordinate-station-table-api:{provider}:{base_url}:{model}"
 
 
 def cache_key(question: str, limit: int, use_web: bool, variant: str = "local") -> str:
@@ -564,7 +567,7 @@ def fts_candidates(conn: sqlite3.Connection, question: str, limit: int) -> list[
             ORDER BY fts_rank
             LIMIT ?
             """,
-            (fts_query(question), max(limit * 5, 20)),
+            (fts_query(question), max(limit * 20, 100)),
         ).fetchall()
     except sqlite3.OperationalError:
         return []
@@ -592,7 +595,7 @@ def semantic_candidates(conn: sqlite3.Connection, question: str, limit: int) -> 
         if item["semantic_score"] > 0:
             scored.append((item["semantic_score"], item))
     scored.sort(key=lambda item: item[0], reverse=True)
-    return [item for _, item in scored[: max(limit * 5, 20)]]
+    return [item for _, item in scored[: max(limit * 20, 100)]]
 
 
 def fallback_like_candidates(conn: sqlite3.Connection, question: str, limit: int) -> list[dict[str, Any]]:
@@ -617,7 +620,22 @@ def fallback_like_candidates(conn: sqlite3.Connection, question: str, limit: int
             item["term_score"] = score
             scored.append((score, item))
     scored.sort(key=lambda item: item[0], reverse=True)
-    return [item for _, item in scored[: max(limit * 3, 12)]]
+    return [item for _, item in scored[: max(limit * 12, 60)]]
+
+
+def chunk_information_quality(text: str) -> float:
+    compact = human_text(text)
+    if not compact:
+        return 0.0
+    header_markers = ("站位 | 测试项目", "测试项 | 测试子项", "工具名称 | 测试门限", "卡关/判定方式")
+    header_hits = sum(marker in compact for marker in header_markers)
+    detail_markers = ("工序名称：", "岗位资源：", "1.", "1、", "PASS", "FAIL", "MES", "测试LOG")
+    detail_hits = sum(marker in compact for marker in detail_markers)
+    if header_hits >= 2 and detail_hits <= 1:
+        return 0.35
+    if header_hits and len(compact) < 180 and detail_hits <= 1:
+        return 0.55
+    return 1.0
 
 
 def rerank(rows: list[dict[str, Any]], question: str, limit: int) -> list[dict[str, Any]]:
@@ -648,10 +666,12 @@ def rerank(rows: list[dict[str, Any]], question: str, limit: int) -> list[dict[s
         fts_score = 0.0 if fts_rank is None else 1.0 / (1.0 + abs(float(fts_rank)))
         term_score = item["term_score"] / max_term
         semantic_score = max(0.0, float(item.get("semantic_score", 0.0)))
-        item["rerank_score"] = round(0.48 * semantic_score + 0.34 * term_score + 0.18 * fts_score, 6)
+        quality_score = chunk_information_quality(item["text"])
+        item["rerank_score"] = round((0.48 * semantic_score + 0.34 * term_score + 0.18 * fts_score) * quality_score, 6)
         item["semantic_score"] = round(semantic_score, 6)
         item["keyword_score"] = round(term_score, 6)
         item["fts_score"] = round(fts_score, 6)
+        item["information_quality_score"] = quality_score
         if item["rerank_score"] > 0:
             ranked.append(item)
 
@@ -697,6 +717,26 @@ def citation_for_text(text: str, question: str, max_len: int = 360) -> str:
             for score, index, sentence in sorted(matches, key=lambda item: (-item[0], item[1]))
             if score >= max(1, max_score - 1)
         ][:2]
+        identifiers = unique_terms(
+            re.findall(r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_-]*\d[A-Za-z0-9_-]*(?![A-Za-z0-9_])", question),
+            limit=8,
+        )
+        for identifier in identifiers:
+            if any(identifier.lower() in sentence.lower() for _, sentence in selected_items):
+                continue
+            identifier_match = next(
+                (
+                    (index, sentence)
+                    for _, index, sentence in sorted(matches, key=lambda item: (-item[0], item[1]))
+                    if identifier.lower() in sentence.lower()
+                ),
+                None,
+            )
+            if identifier_match and identifier_match not in selected_items:
+                selected_items.append(identifier_match)
+            if len(selected_items) >= 3:
+                break
+        selected_items.sort(key=lambda item: item[0])
         selected: list[str] = []
         for index, sentence in selected_items:
             if sentence.startswith("They ") and index > 0:
@@ -714,6 +754,252 @@ def build_answer(question: str, sources: list[dict[str, Any]]) -> str:
     if len(citations) == 1:
         return f"根据本地知识库，{trim_terminal_punctuation(citations[0])}。"
     return "根据本地知识库，" + "；".join(trim_terminal_punctuation(item) for item in citations) + "。"
+
+
+def requested_station_name(question: str) -> str | None:
+    match = re.search(r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_-]{1,30})\s*站位", question, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def structured_cell_text(text: str, max_len: int | None = None) -> str:
+    text = re.sub(r"\s+", " ", unescape(text)).strip()
+    if max_len is not None and len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text
+
+
+def extract_station_table_items(text: str, station_name: str) -> list[str]:
+    return [record["item"] for record in extract_station_table_records(text, station_name)]
+
+
+def _station_record(parent: str, child: str, scheme: str = "") -> dict[str, str] | None:
+    parent = structured_cell_text(parent)
+    child = structured_cell_text(child)
+    if not parent and not child:
+        return None
+    item = parent if not child or parent == child else f"{parent} / {child}" if parent else child
+    return {"item": item, "scheme": structured_cell_text(scheme, max_len=1200)}
+
+
+def _explicit_station_table_records(text: str, station_name: str) -> tuple[list[dict[str, str]], str]:
+    candidates: list[tuple[list[dict[str, str]], str]] = []
+    for section in re.split(r"(?=^工作表 )", text, flags=re.MULTILINE):
+        records: list[dict[str, str]] = []
+        current_parent = ""
+        in_station = False
+        for line in section.splitlines():
+            if "|" not in line:
+                continue
+            columns = [column.strip() for column in line.split("|")]
+            if not columns:
+                continue
+            if re.fullmatch(r"\d+", columns[0]):
+                columns = columns[1:]
+            elif not columns[0] and len(columns) >= 9:
+                columns = columns[1:]
+            else:
+                continue
+            if len(columns) < 3:
+                continue
+            row_station = columns[0]
+            heading_match = re.search(r"工序名称[：:]\s*([A-Za-z][A-Za-z0-9_-]{1,30})", row_station, flags=re.IGNORECASE)
+            if heading_match:
+                row_station = heading_match.group(1)
+            if row_station:
+                if row_station.lower() == station_name.lower():
+                    in_station = True
+                    current_parent = ""
+                elif in_station:
+                    break
+                else:
+                    continue
+            if not in_station:
+                continue
+            if columns[1]:
+                current_parent = columns[1]
+            record = _station_record(current_parent, columns[2], columns[7] if len(columns) > 7 else "")
+            if record and not any(existing["item"] == record["item"] for existing in records):
+                records.append(record)
+        if records:
+            candidates.append((records, section))
+    return max(candidates, key=lambda candidate: len(candidate[0]), default=([], ""))
+
+
+def _heading_station_table_records(text: str, station_name: str) -> tuple[list[dict[str, str]], str]:
+    heading = re.compile(rf"工序名称[：:]\s*{re.escape(station_name)}(?:\s|$)", flags=re.IGNORECASE)
+    match = heading.search(text)
+    if not match:
+        return [], ""
+    end_candidates = [
+        position
+        for position in (
+            text.find("\n工作表 ", match.end()),
+            text.find("\n工序名称：", match.end()),
+            text.find("\n工序名称:", match.end()),
+        )
+        if position >= 0
+    ]
+    section = text[match.start() : min(end_candidates) if end_candidates else len(text)]
+    ignored = {
+        "NA",
+        "LC",
+        "MES",
+        "Acer",
+        "厂商",
+        "程序",
+        "待导入",
+        "程序&MES",
+        "程序&人工",
+        "STPM.exe",
+    }
+    blocks: list[str] = []
+    current_lines: list[str] = []
+    for line in section.splitlines():
+        is_row_start = bool(re.match(r"^\s*(?:\d+\s*)?\|", line) or line.startswith("岗位资源："))
+        if is_row_start and current_lines:
+            blocks.append("\n".join(current_lines))
+            current_lines = []
+        if is_row_start or current_lines:
+            current_lines.append(line)
+    if current_lines:
+        blocks.append("\n".join(current_lines))
+
+    records: list[dict[str, str]] = []
+    for block in blocks:
+        columns = [column.strip() for column in block.split("|")]
+        if columns and re.fullmatch(r"\d+", columns[0]):
+            columns = columns[1:]
+        labels: list[str] = []
+        for column in columns[:4]:
+            column = structured_cell_text(re.sub(r"^岗位资源：\s*", "", column))
+            if (
+                not column
+                or column in ignored
+                or column.lower().endswith((".exe", ".dll", ".bat"))
+                or re.match(r"^\d+[.、]", column)
+            ):
+                continue
+            if column not in labels:
+                labels.append(column)
+        label = " / ".join(labels)
+        if not label:
+            continue
+
+        scheme = ""
+        for column in columns[4:]:
+            column = column.strip()
+            if (
+                not column
+                or column in ignored
+                or column.lower().endswith((".exe", ".dll", ".bat"))
+                or column in {"Y", "N", "PASS", "FAIL", "Tracking", "CLOSE"}
+            ):
+                continue
+            if len(column) >= 12 or "\n" in column or re.search(r"^\s*\d+[.、]", column):
+                scheme = structured_cell_text(column, max_len=1200)
+                break
+        if not any(record["item"] == label for record in records):
+            records.append({"item": label, "scheme": scheme})
+    return records, section
+
+
+def extract_station_table_records_with_excerpt(text: str, station_name: str) -> tuple[list[dict[str, str]], str]:
+    records, excerpt = _explicit_station_table_records(text, station_name)
+    if records:
+        return records, excerpt
+    return _heading_station_table_records(text, station_name)
+
+
+def extract_station_table_records(text: str, station_name: str) -> list[dict[str, str]]:
+    records, _ = extract_station_table_records_with_excerpt(text, station_name)
+    return records
+
+
+def structured_station_result(
+    db_path: Path,
+    question: str,
+    metadata: dict[str, str] | None = None,
+    refresh_scheduled: bool = False,
+) -> dict[str, Any] | None:
+    station_name = requested_station_name(question)
+    if not station_name or not re.search(r"测试项|项目|有哪些|有什么|列出|列表", question):
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT doc_id, file_name, file_path, file_type, text FROM documents "
+            "WHERE file_type = 'xlsx' AND text LIKE ? ORDER BY file_path",
+            (f"%{station_name}%",),
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    for row in rows:
+        records, excerpt_text = extract_station_table_records_with_excerpt(str(row["text"]), station_name)
+        if not records:
+            continue
+        include_schemes = bool(re.search(r"方案|步骤|怎么测|如何测试", question))
+        if include_schemes:
+            lines = [
+                f"- {record['item']}：{record['scheme'] or '资料中未填写测试方案'}"
+                for record in records
+            ]
+            answer = (
+                f"根据本地知识库，{station_name.upper()} 站位包含以下测试项及对应测试方案：\n\n"
+                + "\n".join(lines)
+                + "\n\n[1]"
+            )
+        else:
+            answer = (
+                f"根据本地知识库，{station_name.upper()} 站位包含以下测试项："
+                + "；".join(record["item"] for record in records)
+                + " [1]。"
+            )
+        excerpt = structured_cell_text(excerpt_text, max_len=600)
+        source = {
+            "source_id": 1,
+            "file": row["file_name"],
+            "file_path": row["file_path"],
+            "file_type": row["file_type"],
+            "chunk_id": f"{row['doc_id']}:structured:{station_name.lower()}",
+            "excerpt": excerpt,
+            "citation": excerpt,
+        }
+        metadata = metadata or {}
+        return {
+            "answer": answer,
+            "answer_mode": "local_structured_table_summary",
+            "source_type": "knowledge_base",
+            "sources": [source],
+            "citations": [{"source_id": 1, "file": row["file_name"], "chunk_id": source["chunk_id"], "quote": excerpt}],
+            "need_web_search": False,
+            "web_search_used": False,
+            "index_updated_at": metadata.get("indexed_at"),
+            "embedding_model": metadata.get("embedding_model"),
+            "chunk_strategy": metadata.get("chunk_strategy"),
+            "retrieval_mode": "local_structured_table",
+            "async_update_scheduled": refresh_scheduled,
+            "cache_hit": False,
+        }
+    return None
+
+
+def structured_local_answer(db_path: Path, question: str, sources: list[dict[str, Any]]) -> str | None:
+    result = structured_station_result(db_path, question)
+    if not result:
+        return None
+    source_id = next(
+        (source["source_id"] for source in sources if source.get("file") == result["sources"][0]["file"]),
+        1,
+    )
+    return str(result["answer"]).replace("[1]", f"[{source_id}]")
 
 
 class DuckDuckGoParser(HTMLParser):
@@ -1533,6 +1819,9 @@ def synthesize_with_api(question: str, result: dict[str, Any], config: dict[str,
 def finalize_answer(question: str, result: dict[str, Any], config: dict[str, str], allow_api: bool) -> dict[str, Any]:
     if result.get("source_type") not in {"knowledge_base", "web_search", "hybrid_web_knowledge", "faq_fallback"}:
         return result
+    if result.get("answer_mode") == "local_structured_table_summary":
+        result["api_used"] = False
+        return result
     if allow_api:
         return synthesize_with_api(question, result, config)
     return chinese_grounded_fallback(result)
@@ -1663,6 +1952,14 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
             result = augment_with_web(question, result, limit)
         return finalize_answer(question, result, config, allow_api)
 
+    structured_result = structured_station_result(db_path, question, metadata, refresh_scheduled)
+    if structured_result is not None:
+        result = finalize_answer(question, structured_result, config, allow_api)
+        if cache_conn is not None:
+            cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)
+            cache_conn.close()
+        return result
+
     try:
         rows, metadata = search(db_path, question, limit)
     except sqlite3.DatabaseError:
@@ -1727,8 +2024,10 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
         "async_update_scheduled": refresh_scheduled,
         "cache_hit": False,
     }
-    if use_web:
-        result = augment_with_web(question, result, limit)
+    structured_answer = structured_local_answer(db_path, question, sources)
+    if structured_answer:
+        result["answer"] = structured_answer
+        result["answer_mode"] = "local_structured_table_summary"
     result = finalize_answer(question, result, config, allow_api)
     if cache_conn is not None and not result.get("web_search_reason"):
         cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)

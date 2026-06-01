@@ -5,10 +5,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import sqlite3
@@ -21,10 +24,11 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 
-SUPPORTED = {".md", ".docx", ".pdf", ".xlsx"}
+SUPPORTED = {".md", ".doc", ".docx", ".pdf", ".xlsx"}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = Path("knowledge_base/index/knowledge.db")
 PROCESSED_DIR = Path("knowledge_base/processed")
+REVIEW_APPROVALS_FILE = "review_approvals.json"
 PROJECT_TESSDATA_DIR = PROJECT_ROOT / "tools" / "tessdata"
 EMBEDDING_DIMS = 384
 CHUNK_MAX_CHARS = 1100
@@ -36,6 +40,84 @@ MIN_EXTRACTED_TEXT_CHARS = 80
 OCR_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 
+def is_ignored_raw_file(path: Path) -> bool:
+    """Ignore transient Office lock files created while documents are open."""
+    return path.name.startswith("~$")
+
+
+class IngestAlreadyRunningError(RuntimeError):
+    """Raised when another process is already updating the same index."""
+
+
+def ingest_lock_path(db_path: Path = DB_PATH) -> Path:
+    return db_path.with_suffix(".ingest.lock")
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if process:
+                ctypes.windll.kernel32.CloseHandle(process)
+                return True
+            return False
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def ingest_in_progress(db_path: Path = DB_PATH) -> bool:
+    lock_path = ingest_lock_path(db_path)
+    if not lock_path.exists():
+        return False
+    try:
+        lock_data = json.loads(lock_path.read_text(encoding="utf-8"))
+        pid = int(lock_data.get("pid", 0))
+    except (OSError, ValueError, json.JSONDecodeError):
+        pid = 0
+    if _pid_is_running(pid):
+        return True
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    return False
+
+
+@contextmanager
+def ingestion_lock(db_path: Path):
+    lock_path = ingest_lock_path(db_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if ingest_in_progress(db_path):
+        raise IngestAlreadyRunningError("知识库索引正在更新，请稍后再试。")
+    try:
+        handle = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise IngestAlreadyRunningError("知识库索引正在更新，请稍后再试。") from exc
+    try:
+        payload = json.dumps({"pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+        os.write(handle, payload.encode("utf-8"))
+        os.close(handle)
+        yield
+    finally:
+        try:
+            os.close(handle)
+        except OSError:
+            pass
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def read_plain_text(path: Path) -> str:
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:
@@ -43,6 +125,97 @@ def read_plain_text(path: Path) -> str:
         except UnicodeDecodeError:
             continue
     return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def unsupported_raw_files(raw_dir: Path) -> list[str]:
+    if not raw_dir.exists():
+        return []
+    return [
+        str(path.relative_to(raw_dir)).replace("\\", "/")
+        for path in sorted(raw_dir.rglob("*"))
+        if path.is_file() and not is_ignored_raw_file(path) and path.suffix.lower() not in SUPPORTED
+    ]
+
+
+def raw_file_fingerprint(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_review_approvals(processed_dir: Path = PROCESSED_DIR) -> dict[str, dict[str, str]]:
+    approvals_path = processed_dir / REVIEW_APPROVALS_FILE
+    if not approvals_path.exists():
+        return {}
+    try:
+        payload = json.loads(approvals_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    files = payload.get("files", {})
+    return files if isinstance(files, dict) else {}
+
+
+def write_review_approvals(approvals: dict[str, dict[str, str]], processed_dir: Path = PROCESSED_DIR) -> None:
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    approvals_path = processed_dir / REVIEW_APPROVALS_FILE
+    payload = {"files": approvals}
+    approvals_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def review_approval_matches(approvals: dict[str, dict[str, str]], rel_path: str, path: Path) -> bool:
+    approval = approvals.get(rel_path)
+    return bool(approval and approval.get("fingerprint") == raw_file_fingerprint(path))
+
+
+def extraction_reports(processed_dir: Path = PROCESSED_DIR) -> list[dict[str, Any]]:
+    report_path = processed_dir / "extraction_report.jsonl"
+    if not report_path.exists():
+        return []
+    reports: list[dict[str, Any]] = []
+    with report_path.open("r", encoding="utf-8") as report_in:
+        for line in report_in:
+            if not line.strip():
+                continue
+            try:
+                reports.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return reports
+
+
+def pending_review_reports(raw_dir: Path, processed_dir: Path = PROCESSED_DIR) -> list[dict[str, Any]]:
+    approvals = load_review_approvals(processed_dir)
+    pending: list[dict[str, Any]] = []
+    for report in extraction_reports(processed_dir):
+        rel_path = str(report.get("file_path", ""))
+        path = (raw_dir / rel_path).resolve()
+        if not report.get("requires_review") or not path.exists():
+            continue
+        if review_approval_matches(approvals, rel_path, path):
+            continue
+        pending.append(report)
+    return pending
+
+
+def approve_review_file(raw_dir: Path, processed_dir: Path, rel_path: str) -> dict[str, str]:
+    rel_path = rel_path.replace("\\", "/").strip("/")
+    raw_root = raw_dir.resolve()
+    path = (raw_root / rel_path).resolve()
+    if raw_root not in path.parents or not path.is_file():
+        raise ValueError("待复核文件不存在。")
+    pending_paths = {str(report.get("file_path", "")) for report in pending_review_reports(raw_dir, processed_dir)}
+    if rel_path not in pending_paths:
+        raise ValueError("该文件当前不需要复核，或文件内容已经变化，请刷新列表。")
+    approvals = load_review_approvals(processed_dir)
+    approval = {
+        "fingerprint": raw_file_fingerprint(path),
+        "approved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    approvals[rel_path] = approval
+    write_review_approvals(approvals, processed_dir)
+    return {"file_path": rel_path, **approval}
 
 
 def read_docx(path: Path) -> str:
@@ -65,6 +238,113 @@ def read_docx(path: Path) -> str:
         if line:
             paragraphs.append(line)
     return "\n".join(paragraphs)
+
+
+def find_winword() -> str | None:
+    found = shutil.which("WINWORD.EXE")
+    if found:
+        return found
+    candidates: list[Path] = []
+    for office_version in ("16", "15", "14"):
+        candidates.extend(
+            (
+                Path(f"C:/Program Files/Microsoft Office/root/Office{office_version}/WINWORD.EXE"),
+                Path(f"C:/Program Files (x86)/Microsoft Office/root/Office{office_version}/WINWORD.EXE"),
+                Path(f"C:/Program Files/Microsoft Office/Office{office_version}/WINWORD.EXE"),
+                Path(f"C:/Program Files (x86)/Microsoft Office/Office{office_version}/WINWORD.EXE"),
+            )
+        )
+    if os.name == "nt":
+        try:
+            import winreg
+
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for office_version in ("16.0", "15.0", "14.0"):
+                    for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                        try:
+                            key = winreg.OpenKey(
+                                hive,
+                                rf"SOFTWARE\Microsoft\Office\{office_version}\Common\InstallRoot",
+                                0,
+                                winreg.KEY_READ | view,
+                            )
+                            install_root, _ = winreg.QueryValueEx(key, "Path")
+                            candidates.append(Path(install_root) / "WINWORD.EXE")
+                            winreg.CloseKey(key)
+                        except OSError:
+                            continue
+        except ImportError:
+            pass
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def convert_doc_to_docx(path: Path, target: Path) -> None:
+    if os.name != "nt":
+        raise RuntimeError("旧版 .doc 提取目前需要在 Windows 上运行。")
+    powershell = shutil.which("powershell") or shutil.which("powershell.exe")
+    if not powershell:
+        raise RuntimeError("旧版 .doc 提取需要 Windows PowerShell。")
+    script = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
+$source = [IO.Path]::GetFullPath($env:LKA_DOC_SOURCE)
+$target = [IO.Path]::GetFullPath($env:LKA_DOC_TARGET)
+$word = $null
+$document = $null
+try {
+    $word = New-Object -ComObject Word.Application
+    $word.Visible = $false
+    $word.DisplayAlerts = 0
+    try { $word.AutomationSecurity = 3 } catch {}
+    $document = $word.Documents.Open($source, $false, $true)
+    $document.SaveAs2($target, 16)
+} finally {
+    if ($document) {
+        $document.Close(0)
+        [Runtime.InteropServices.Marshal]::ReleaseComObject($document) | Out-Null
+    }
+    if ($word) {
+        $word.Quit()
+        [Runtime.InteropServices.Marshal]::ReleaseComObject($word) | Out-Null
+    }
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+}
+"""
+    encoded_script = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    env = os.environ.copy()
+    env["LKA_DOC_SOURCE"] = str(path.resolve())
+    env["LKA_DOC_TARGET"] = str(target.resolve())
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-STA", "-EncodedCommand", encoded_script],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        env=env,
+    )
+    if completed.returncode != 0 or not target.exists():
+        detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+        raise RuntimeError(f"Microsoft Word 转换 .doc 失败：{detail}")
+
+
+def read_doc_with_report(path: Path) -> tuple[str, dict[str, Any]]:
+    report = extraction_report(path, "doc")
+    with tempfile.TemporaryDirectory(prefix="lka_doc_") as temp:
+        converted = Path(temp) / f"{path.stem}.docx"
+        convert_doc_to_docx(path, converted)
+        text, converted_report = read_docx_with_report(converted)
+    report["method"] = ["word_com_doc_to_docx", *converted_report["method"]]
+    report["warnings"].extend(converted_report["warnings"])
+    report["requires_review"] = converted_report["requires_review"]
+    report["text_chars"] = len(text)
+    return text, report
 
 
 def read_docx_with_report(path: Path) -> tuple[str, dict[str, Any]]:
@@ -105,19 +385,61 @@ def _xlsx_shared_strings(zf: zipfile.ZipFile) -> list[str]:
     return strings
 
 
+def _xlsx_column_index(cell_reference: str) -> int:
+    match = re.match(r"([A-Z]+)", cell_reference.upper())
+    if not match:
+        return 1
+    index = 0
+    for letter in match.group(1):
+        index = index * 26 + ord(letter) - ord("A") + 1
+    return index
+
+
+def _xlsx_sheets(zf: zipfile.ZipFile) -> list[tuple[str, str]]:
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    package_rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    workbook_path = "xl/workbook.xml"
+    relationships_path = "xl/_rels/workbook.xml.rels"
+    if workbook_path not in zf.namelist() or relationships_path not in zf.namelist():
+        sheets = sorted(
+            (name for name in zf.namelist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)),
+            key=lambda name: int(re.search(r"sheet(\d+)", name).group(1)),
+        )
+        return [(f"sheet{index}", sheet) for index, sheet in enumerate(sheets, start=1)]
+
+    relationships_root = ET.fromstring(zf.read(relationships_path))
+    targets = {
+        relationship.attrib["Id"]: relationship.attrib["Target"]
+        for relationship in relationships_root.findall(f"{{{package_rel_ns}}}Relationship")
+    }
+    workbook_root = ET.fromstring(zf.read(workbook_path))
+    sheets: list[tuple[str, str]] = []
+    for sheet in workbook_root.findall(f".//{{{main_ns}}}sheet"):
+        relation_id = sheet.attrib.get(f"{{{rel_ns}}}id")
+        target = targets.get(str(relation_id), "")
+        if not target:
+            continue
+        normalized_target = target.lstrip("/")
+        if not normalized_target.startswith("xl/"):
+            normalized_target = f"xl/{normalized_target}"
+        sheets.append((sheet.attrib.get("name", f"sheet{len(sheets) + 1}"), normalized_target))
+    return sheets
+
+
 def read_xlsx(path: Path) -> str:
     ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     lines: list[str] = []
 
     with zipfile.ZipFile(path) as zf:
         shared = _xlsx_shared_strings(zf)
-        sheets = sorted(name for name in zf.namelist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name))
+        sheets = _xlsx_sheets(zf)
 
-        for sheet_index, sheet in enumerate(sheets, start=1):
+        for sheet_name, sheet in sheets:
             root = ET.fromstring(zf.read(sheet))
-            lines.append(f"工作表 sheet{sheet_index}")
+            lines.append(f"工作表 {sheet_name}")
             for row in root.findall(".//m:row", ns):
-                cells: list[str] = []
+                cells: dict[int, str] = {}
                 for cell in row.findall("m:c", ns):
                     cell_type = cell.attrib.get("t")
                     value = ""
@@ -131,9 +453,9 @@ def read_xlsx(path: Path) -> str:
                                 index = int(value)
                                 if 0 <= index < len(shared):
                                     value = shared[index]
-                    cells.append(value)
-                if any(cell.strip() for cell in cells):
-                    lines.append(" | ".join(cells))
+                    cells[_xlsx_column_index(cell.attrib.get("r", "A1"))] = re.sub(r"\s*\r?\n\s*", " ", value).strip()
+                if any(cell.strip() for cell in cells.values()):
+                    lines.append(" | ".join(cells.get(index, "") for index in range(1, max(cells) + 1)))
     return "\n".join(lines)
 
 
@@ -417,6 +739,8 @@ def read_document(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix == ".md":
         return read_plain_text(path)
+    if suffix == ".doc":
+        return read_doc_with_report(path)[0]
     if suffix == ".docx":
         return read_docx(path)
     if suffix == ".xlsx":
@@ -431,6 +755,8 @@ def read_document_with_report(path: Path) -> tuple[str, dict[str, Any]]:
     if suffix == ".md":
         text = read_plain_text(path)
         report = extraction_report(path, "md")
+    elif suffix == ".doc":
+        text, report = read_doc_with_report(path)
     elif suffix == ".docx":
         text, report = read_docx_with_report(path)
     elif suffix == ".xlsx":
@@ -763,27 +1089,46 @@ def write_processed_files(conn: sqlite3.Connection, processed_dir: Path) -> int:
     return faq_count
 
 
-def write_extraction_report(processed_dir: Path, reports: list[dict[str, Any]]) -> None:
+def write_extraction_report(
+    processed_dir: Path,
+    reports: list[dict[str, Any]],
+    current_paths: set[str] | None = None,
+) -> None:
     processed_dir.mkdir(parents=True, exist_ok=True)
     report_path = processed_dir / "extraction_report.jsonl"
-    if not reports and report_path.exists():
-        return
+    merged: dict[str, dict[str, Any]] = {}
+    if report_path.exists():
+        with report_path.open("r", encoding="utf-8") as report_in:
+            for line in report_in:
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if item.get("file_path"):
+                    merged[str(item["file_path"])] = item
+    for report in reports:
+        if report.get("file_path"):
+            merged[str(report["file_path"])] = report
+    if current_paths is not None:
+        merged = {file_path: report for file_path, report in merged.items() if file_path in current_paths}
     with report_path.open("w", encoding="utf-8") as report_out:
-        for report in reports:
+        for report in (merged[file_path] for file_path in sorted(merged)):
             report_out.write(json.dumps(report, ensure_ascii=False) + "\n")
 
 
 def source_fingerprint(raw_dir: Path) -> str:
     items: list[str] = []
     for path in sorted(raw_dir.rglob("*")):
-        if path.is_file() and path.suffix.lower() in SUPPORTED:
+        if path.is_file() and not is_ignored_raw_file(path) and path.suffix.lower() in SUPPORTED:
             rel_path = str(path.relative_to(raw_dir)).replace("\\", "/")
             stat = path.stat()
             items.append(f"{rel_path}:{stat.st_size}:{int(stat.st_mtime)}")
     return hashlib.sha256("\n".join(items).encode("utf-8")).hexdigest()
 
 
-def ingest(
+def _ingest_unlocked(
     raw_dir: Path,
     db_path: Path = DB_PATH,
     processed_dir: Path = PROCESSED_DIR,
@@ -808,13 +1153,15 @@ def ingest(
     duplicate_files: list[dict[str, str]] = []
     extraction_reports: list[dict[str, Any]] = []
     current_paths: set[str] = set()
+    approvals = load_review_approvals(processed_dir)
+    approved_review_count = 0
     seen_hashes = {
         row["content_hash"]: row["file_path"]
         for row in conn.execute("SELECT content_hash, file_path FROM documents WHERE duplicate_of IS NULL").fetchall()
     }
 
     for path in sorted(raw_dir.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in SUPPORTED:
+        if not path.is_file() or is_ignored_raw_file(path) or path.suffix.lower() not in SUPPORTED:
             continue
 
         doc_count += 1
@@ -833,6 +1180,10 @@ def ingest(
         try:
             text, extract_report = read_document_with_report(path)
             extract_report["file_path"] = rel_path
+            if extract_report.get("requires_review") and review_approval_matches(approvals, rel_path, path):
+                extract_report["requires_review"] = False
+                extract_report["review_approved"] = True
+                approved_review_count += 1
             extraction_reports.append(extract_report)
             if strict_extraction and extract_report.get("requires_review"):
                 skipped_count += 1
@@ -898,7 +1249,7 @@ def ingest(
     else:
         indexed_at = previous_indexed_at["value"]
     metadata_set(conn, "source_fingerprint", source_fingerprint(raw_dir))
-    write_extraction_report(processed_dir, extraction_reports)
+    write_extraction_report(processed_dir, extraction_reports, current_paths)
     faq_count = write_processed_files(conn, processed_dir)
     totals = conn.execute(
         """
@@ -927,12 +1278,25 @@ def ingest(
         "duplicate_files": duplicate_files,
         "extraction_warnings": len(warning_reports),
         "requires_review": len(review_reports),
+        "approved_reviews": approved_review_count,
         "extraction_report": str(processed_dir / "extraction_report.jsonl"),
         "faq_entries": faq_count,
         "indexed_at": indexed_at,
         "embedding_model": f"local-hash-ngram-{EMBEDDING_DIMS}d",
         "chunk_strategy": "semantic-boundary-local-embedding",
+        "unsupported_files": unsupported_raw_files(raw_dir),
     }
+
+
+def ingest(
+    raw_dir: Path,
+    db_path: Path = DB_PATH,
+    processed_dir: Path = PROCESSED_DIR,
+    reset: bool = False,
+    strict_extraction: bool = False,
+) -> dict[str, Any]:
+    with ingestion_lock(db_path):
+        return _ingest_unlocked(raw_dir, db_path, processed_dir, reset, strict_extraction)
 
 
 def main() -> None:
@@ -948,13 +1312,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    result = ingest(
-        Path(args.raw_dir),
-        Path(args.db),
-        Path(args.processed),
-        reset=args.rebuild,
-        strict_extraction=args.strict_extraction,
-    )
+    try:
+        result = ingest(
+            Path(args.raw_dir),
+            Path(args.db),
+            Path(args.processed),
+            reset=args.rebuild,
+            strict_extraction=args.strict_extraction,
+        )
+    except IngestAlreadyRunningError as exc:
+        result = {"updated": False, "skipped": True, "reason": "update_in_progress", "message": str(exc)}
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

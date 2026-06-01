@@ -7,9 +7,11 @@
 ## 支持格式
 
 - Markdown: `.md`
-- Word: `.docx`
+- Word: `.docx`、`.doc`
 - PDF: `.pdf`
 - Excel: `.xlsx`
+
+旧版 Word `.doc` 会通过本机 Microsoft Word 静默转换后提取，不会修改原文件。处理 `.doc` 的电脑需要安装 Microsoft Word；未安装时索引更新会明确提示提取失败。
 
 资料可以按类型放入子目录，也可以放在 `knowledge_base/raw` 的任意递归子目录中：
 

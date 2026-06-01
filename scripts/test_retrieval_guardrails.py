@@ -4,9 +4,20 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import sqlite3
+import tempfile
+import zipfile
+
 import query_knowledge_base as query_module
+from ingest_knowledge_base import read_xlsx
 from query_knowledge_base import (
+    chunk_information_quality,
+    citation_for_text,
+    extract_station_table_items,
+    extract_station_table_records,
     filter_web_sources,
+    human_text,
     merge_with_web_result,
     normalize_search_question,
     web_query,
@@ -113,6 +124,70 @@ AcWing 是一个算法交流平台。
         allow_relaxed=True,
     )
     assert [source["title"] for source in english_noise] == ["Ohm's law"]
+    assert chunk_information_quality("站位 | 测试项目 | 工具名称 | 测试门限 | 卡关/判定方式") < 0.6
+    assert human_text("采集范围 0~50V") == "采集范围 0~50V"
+    assert "CN2:8路电压采集通道，采集范围0~50V" in citation_for_text(
+        "ZDE-DAQ-V1采集板说明\nCN1:USB通讯接口\nCN2:8路电压采集通道，采集范围0~50V",
+        "ZDE-DAQ-V1采集板的CN2接口是什么",
+    )
+    fat_items = extract_station_table_items(
+        "工序名称：FAT\n"
+        "岗位资源： | MES Station Check | MES站别检测 | STPM.exe | NA |\n"
+        "6 | | ATO 系统时间同步 | 系统时间同步 | STPM.exe | NA |\n"
+        "7 | | FAN Test | FAN speed | STPM.exe | NA |\n"
+        "工作表 sheet6\n",
+        "FAT",
+    )
+    assert fat_items == ["MES Station Check / MES站别检测", "ATO 系统时间同步 / 系统时间同步", "FAN Test / FAN speed"]
+    fat_records = extract_station_table_records(
+        "工序名称：FAT\n"
+        "岗位资源： | MES Station Check | MES站别检测 | STPM.exe | NA | LC | NA | 1.读取主板序列号；\n"
+        "2.查询MES站点状态； | MES | 待导入 |\n"
+        "6 | | FAN Test | FAN speed | STPM.exe | NA | LC | NA | 1.读取风扇转速； | 程序 | 待导入 |\n"
+        "工作表 sheet6\n",
+        "FAT",
+    )
+    assert fat_records == [
+        {"item": "MES Station Check / MES站别检测", "scheme": "1.读取主板序列号； 2.查询MES站点状态；"},
+        {"item": "FAN Test / FAN speed", "scheme": "1.读取风扇转速；"},
+    ]
+    frt_records = extract_station_table_records(
+        "工作表 老化\n"
+        "1 | FRT | AC和网络在位Check | AC和网络在位Check | STPM.exe | NA | LC | NA | 检查AC与网络； | 程序 |\n"
+        "2 |  | Mainboard Test | AC in Check | STPM.exe | NA | LC | NA | 检查AC； | 程序 |\n"
+        "3 |  |  | RTC Test | STPM.exe | NA | LC | NA | 检查RTC； | 程序 |\n"
+        "4 |  | Write Number Check | Check_DMI（SMBIOS） | STPM.exe | NA | LC | NA | 检查DMI； | 程序 |\n",
+        "FRT",
+    )
+    assert [record["item"] for record in frt_records] == [
+        "AC和网络在位Check",
+        "Mainboard Test / AC in Check",
+        "Mainboard Test / RTC Test",
+        "Write Number Check / Check_DMI（SMBIOS）",
+    ]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        xlsx_path = Path(temp_dir) / "coordinates.xlsx"
+        with zipfile.ZipFile(xlsx_path, "w") as archive:
+            archive.writestr(
+                "xl/workbook.xml",
+                """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+                xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+                <sheets><sheet name="Ordered Sheet" sheetId="1" r:id="rId1"/></sheets></workbook>""",
+            )
+            archive.writestr(
+                "xl/_rels/workbook.xml.rels",
+                """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                <Relationship Id="rId1" Target="worksheets/sheet10.xml"
+                Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/>
+                </Relationships>""",
+            )
+            archive.writestr(
+                "xl/worksheets/sheet10.xml",
+                """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                <sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>A</t></is></c>
+                <c r="C1" t="inlineStr"><is><t>C</t></is></c></row></sheetData></worksheet>""",
+            )
+        assert read_xlsx(xlsx_path) == "工作表 Ordered Sheet\nA |  | C"
 
     providers = (
         "jina_baidu_search",
@@ -185,6 +260,97 @@ AcWing 是一个算法交流平台。
     finally:
         for name, provider in originals.items():
             setattr(query_module, name, provider)
+
+    original_search = query_module.search
+    original_trigger_async_update = query_module.trigger_async_update
+    original_web_search = query_module.web_search
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "knowledge.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO metadata(key, value) VALUES ('indexed_at', 'test-index');
+            CREATE TABLE documents(
+                doc_id TEXT PRIMARY KEY,
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                text TEXT NOT NULL
+            );
+            CREATE TABLE query_cache(
+                cache_key TEXT PRIMARY KEY,
+                question TEXT NOT NULL,
+                answer_json TEXT NOT NULL,
+                hit_count INTEGER NOT NULL,
+                index_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO documents(doc_id, file_name, file_path, file_type, text) VALUES (?, ?, ?, ?, ?)",
+            (
+                "fat-doc",
+                "fat.xlsx",
+                "excel/fat.xlsx",
+                "xlsx",
+                "工序名称：FAT\n"
+                "岗位资源： | MES Station Check | MES站别检测 | STPM.exe | NA | LC | NA | 1.读取主板序列号； | MES | 待导入 |\n"
+                "6 | | FAN Test | FAN speed | STPM.exe | NA | LC | NA | 1.读取风扇转速； | 程序 | 待导入 |\n"
+                "工作表 sheet6\n",
+            ),
+        )
+        conn.commit()
+        conn.close()
+        try:
+            query_module.trigger_async_update = lambda *args, **kwargs: False
+            query_module.web_search = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("structured local answer must not search web"))
+            structured = query_module.query(
+                db_path,
+                "FAT 站位包含哪些测试项及其对应的测试方案是什么",
+                use_web=True,
+                allow_api=False,
+            )
+            assert structured["source_type"] == "knowledge_base"
+            assert structured["retrieval_mode"] == "local_structured_table"
+            assert structured["web_search_used"] is False
+            assert structured["answer"].count("\n- ") == 2
+            assert "1.读取主板序列号" in structured["answer"]
+        finally:
+            query_module.trigger_async_update = original_trigger_async_update
+            query_module.web_search = original_web_search
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "knowledge.db"
+        sqlite3.connect(db_path).close()
+        try:
+            query_module.trigger_async_update = lambda *args, **kwargs: False
+            query_module.search = lambda *args, **kwargs: (
+                [
+                    {
+                        "chunk_id": "fat-1",
+                        "file_name": "fat.xlsx",
+                        "file_path": "excel/fat.xlsx",
+                        "file_type": "xlsx",
+                        "text": "FAT站位测试项目包含MES Station Check。",
+                        "rerank_score": 0.9,
+                        "semantic_score": 0.8,
+                        "keyword_score": 1.0,
+                        "fts_score": 1.0,
+                    }
+                ],
+                {},
+            )
+            query_module.web_search = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("local answer must not search web"))
+            local_first = query_module.query(db_path, "FAT站位有哪些测试项", use_web=True, allow_api=False)
+            assert local_first["source_type"] == "knowledge_base"
+            assert local_first["web_search_used"] is False
+        finally:
+            query_module.search = original_search
+            query_module.trigger_async_update = original_trigger_async_update
+            query_module.web_search = original_web_search
     print("retrieval guardrails: ok")
 
 

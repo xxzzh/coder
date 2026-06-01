@@ -1,5 +1,6 @@
 @echo off
 setlocal
+chcp 65001 >nul
 
 set "ROOT=%~dp0"
 set "INGEST=%ROOT%scripts\ingest_knowledge_base.py"
@@ -11,6 +12,7 @@ set "WEB=%ROOT%scripts\web_agent.py"
 set "TRANSLATION_SETUP=%ROOT%scripts\install_translation_model.py"
 set "API_SETUP=%ROOT%scripts\configure_api.py"
 set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 
 if "%~1"=="" goto usage
 if /I "%~1"=="setup" goto setup
@@ -56,7 +58,7 @@ exit /b %ERRORLEVEL%
 
 :web
 shift
-python "%WEB%" %*
+python "%WEB%" %1 %2 %3 %4 %5 %6 %7 %8 %9
 exit /b %ERRORLEVEL%
 
 :translation_setup

@@ -47,10 +47,12 @@ from healthcheck_agent import (  # noqa: E402
     offline_translation_status,
     optional_extractors,
     sqlite_has_fts5,
+    unsupported_raw_files,
 )
 from manage_knowledge_base import rebuild as kb_rebuild  # noqa: E402
 from manage_knowledge_base import sources as kb_sources  # noqa: E402
 from manage_knowledge_base import update as kb_update  # noqa: E402
+from ingest_knowledge_base import approve_review_file, is_ignored_raw_file, pending_review_reports  # noqa: E402
 from query_knowledge_base import query as kb_query  # noqa: E402
 
 
@@ -59,7 +61,7 @@ def raw_file_counts() -> dict[str, int]:
     if not RAW_DIR.exists():
         return counts
     for path in RAW_DIR.rglob("*"):
-        if path.is_file() and path.suffix.lower() in SUPPORTED:
+        if path.is_file() and not is_ignored_raw_file(path) and path.suffix.lower() in SUPPORTED:
             counts[path.suffix.lower()] = counts.get(path.suffix.lower(), 0) + 1
     return dict(sorted(counts.items()))
 
@@ -70,6 +72,7 @@ def health_payload() -> dict[str, Any]:
     extraction = extraction_report_stats()
     extractors = optional_extractors()
     raw_counts = raw_file_counts()
+    unsupported_files = unsupported_raw_files()
     chunks = int(stats.get("chunks", 0) or 0) if isinstance(stats, dict) else 0
     ok = (
         sqlite_has_fts5()
@@ -79,6 +82,7 @@ def health_payload() -> dict[str, Any]:
         and int(stats.get("documents", 0) or 0) > 0
         and chunks > 0
         and int(extraction.get("requires_review", 0) or 0) == 0
+        and not unsupported_files
     )
     return {
         "ok": ok,
@@ -87,6 +91,7 @@ def health_payload() -> dict[str, Any]:
         "raw_dir": str(RAW_DIR),
         "raw_supported_files": sum(raw_counts.values()),
         "raw_counts": raw_counts,
+        "raw_unsupported_files": unsupported_files,
         "index": stats,
         "optional_extractors": extractors,
         "offline_translation": offline_translation_status(),
@@ -114,6 +119,22 @@ def api_config_payload() -> dict[str, Any]:
         "base_url": env.get("LKA_API_BASE_URL", ""),
         "model": env.get("LKA_API_MODEL", ""),
         "providers": provider_options(),
+    }
+
+
+def reviews_payload() -> dict[str, Any]:
+    reviews = pending_review_reports(RAW_DIR, ROOT / "knowledge_base" / "processed")
+    return {
+        "pending": len(reviews),
+        "reviews": [
+            {
+                "file_path": item.get("file_path"),
+                "file_type": item.get("file_type"),
+                "warnings": item.get("warnings", []),
+                "text_chars": item.get("text_chars", 0),
+            }
+            for item in reviews
+        ],
     }
 
 
@@ -336,12 +357,70 @@ def page_html() -> str:
       user-select: none;
     }
     .answer {
-      white-space: pre-wrap;
       border: 1px solid var(--line);
       border-radius: 6px;
       background: #fbfcfd;
       min-height: 120px;
-      padding: 12px;
+      padding: 14px;
+      color: var(--text);
+      overflow-wrap: anywhere;
+    }
+    .answer p {
+      margin: 0;
+      line-height: 1.75;
+    }
+    .answer p + p,
+    .answer p + .answer-list,
+    .answer .answer-list + p {
+      margin-top: 10px;
+    }
+    .answer-lead {
+      color: #344054;
+    }
+    .answer-heading {
+      margin-top: 10px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .answer-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 7px 16px;
+      margin: 10px 0 0;
+      padding: 0;
+      list-style: none;
+    }
+    .answer-list li {
+      position: relative;
+      padding-left: 15px;
+      line-height: 1.55;
+      break-inside: avoid;
+    }
+    .answer-list li::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: .68em;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+    }
+    .citation-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 19px;
+      height: 19px;
+      margin: 0 2px;
+      padding: 0 5px;
+      border: 1px solid #b8d3e8;
+      border-radius: 999px;
+      background: #eaf4fb;
+      color: var(--accent-strong);
+      font-size: 12px;
+      font-weight: 700;
+      vertical-align: text-bottom;
     }
     .source-list {
       display: grid;
@@ -393,6 +472,7 @@ def page_html() -> str:
       header .wrap, main.wrap { display: block; }
       header .wrap > * + *, main.wrap > * + * { margin-top: 14px; }
       .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .answer-list { grid-template-columns: 1fr; }
     }
     @media (max-width: 520px) {
       .cards { grid-template-columns: 1fr; }
@@ -455,10 +535,18 @@ def page_html() -> str:
       <div class="panel">
         <h2>操作</h2>
         <div class="stack">
+          <button onclick="openRawFolder()">打开资料目录</button>
           <button onclick="runAction('/api/update', '增量更新')">增量更新</button>
           <button onclick="runAction('/api/rebuild-strict', '严格重建')">严格重建</button>
           <button onclick="runAction('/api/ocr-eval', 'OCR 评测')">OCR 评测</button>
         </div>
+      </div>
+      <div class="panel">
+        <div class="row between">
+          <h2>待复核资料</h2>
+          <button onclick="loadReviews()">刷新</button>
+        </div>
+        <div id="reviewList" class="stack muted">等待加载</div>
       </div>
       <div class="panel">
         <h2>API 精炼</h2>
@@ -576,10 +664,69 @@ def page_html() -> str:
         ];
         if (data.scale_warning) lines.push('规模提示：chunk 已超过 50000，建议评估独立向量库。');
         if ((data.extraction_report?.requires_review ?? 0) > 0) lines.push('存在待复核抽取结果，请先处理后再交付使用。');
+        if ((data.raw_unsupported_files ?? []).length > 0) lines.push(`未进入索引的不支持文件：${data.raw_unsupported_files.join('；')}`);
         $('healthDetail').innerHTML = lines.map((item) => `<div class="muted">${item}</div>`).join('');
       } catch (error) {
         setBadge(false, '检查失败');
         log('状态检查失败', {error: error.message});
+      }
+    }
+    async function loadReviews() {
+      try {
+        const data = await api('/api/reviews');
+        const items = data.reviews || [];
+        const list = $('reviewList');
+        if (!items.length) {
+          list.className = 'stack muted';
+          list.textContent = '没有待复核资料';
+          return;
+        }
+        list.className = 'stack';
+        list.innerHTML = '';
+        items.forEach((item) => {
+          const node = document.createElement('div');
+          node.className = 'source-item';
+          const title = document.createElement('div');
+          title.className = 'source-title';
+          title.textContent = item.file_path || '';
+          const warning = document.createElement('div');
+          warning.className = 'muted';
+          warning.textContent = (item.warnings || []).join('；');
+          const actions = document.createElement('div');
+          actions.className = 'row';
+          actions.style.marginTop = '8px';
+          const approve = document.createElement('button');
+          approve.textContent = '确认可用';
+          approve.onclick = () => approveReview(item.file_path);
+          actions.appendChild(approve);
+          node.append(title, warning, actions);
+          list.appendChild(node);
+        });
+      } catch (error) {
+        $('reviewList').textContent = `加载失败：${error.message}`;
+      }
+    }
+    async function approveReview(filePath) {
+      if (!window.confirm(`确认已检查并允许索引此文件？\\n${filePath}`)) return;
+      setBusy(true);
+      log('复核确认开始', {file_path: filePath});
+      try {
+        const data = await api('/api/reviews/approve', {method: 'POST', body: JSON.stringify({file_path: filePath})});
+        log('复核确认完成', data.summary || data);
+        await loadHealth();
+        await loadReviews();
+        await loadSources();
+      } catch (error) {
+        log('复核确认失败', {error: error.message});
+      } finally {
+        setBusy(false);
+      }
+    }
+    async function openRawFolder() {
+      try {
+        await api('/api/open-raw-folder', {method: 'POST', body: '{}'});
+      } catch (error) {
+        log('打开资料目录失败', {error: error.message});
       }
     }
     async function ask() {
@@ -635,7 +782,7 @@ def page_html() -> str:
               $('answer').textContent = '';
             } else if (eventName === 'answer-delta') {
               streamedAnswer += data.text || '';
-              $('answer').textContent = streamedAnswer;
+              renderAnswer(streamedAnswer);
             } else if (eventName === 'error') {
               throw new Error(data.error || '查询失败');
             } else if (eventName === 'done') {
@@ -674,6 +821,67 @@ def page_html() -> str:
         $('sources').appendChild(node);
       });
     }
+    function appendAnswerText(parent, text) {
+      const parts = String(text || '').split(/(\\[\\d+\\])/g);
+      parts.forEach((part) => {
+        const citation = part.match(/^\\[(\\d+)\\]$/);
+        if (citation) {
+          const badge = document.createElement('span');
+          badge.className = 'citation-badge';
+          badge.textContent = citation[1];
+          parent.appendChild(badge);
+        } else if (part) {
+          parent.appendChild(document.createTextNode(part));
+        }
+      });
+    }
+    function addAnswerParagraph(container, text, className = '') {
+      const value = String(text || '').trim();
+      if (!value) return;
+      const paragraph = document.createElement('p');
+      if (className) paragraph.className = className;
+      appendAnswerText(paragraph, value);
+      container.appendChild(paragraph);
+    }
+    function renderAnswer(text) {
+      const container = $('answer');
+      container.innerHTML = '';
+      const normalized = String(text || '').replace(/\\r\\n/g, '\\n').trim();
+      if (!normalized) return;
+      const listMarker = '包含以下测试项：';
+      const markerIndex = normalized.indexOf(listMarker);
+      if (markerIndex >= 0) {
+        const lead = normalized.slice(0, markerIndex).trim();
+        const remainder = normalized.slice(markerIndex + listMarker.length).trim();
+        addAnswerParagraph(container, lead, 'answer-lead');
+        addAnswerParagraph(container, '测试项', 'answer-heading');
+        const list = document.createElement('ul');
+        list.className = 'answer-list';
+        remainder.split('；').map((item) => item.trim()).filter(Boolean).forEach((item) => {
+          const row = document.createElement('li');
+          appendAnswerText(row, item);
+          list.appendChild(row);
+        });
+        container.appendChild(list);
+        return;
+      }
+      normalized.split(/\\n{2,}/).forEach((block) => {
+        const lines = block.split('\\n').map((line) => line.trim()).filter(Boolean);
+        const bulletLines = lines.filter((line) => /^[-*•]\\s+/.test(line));
+        if (bulletLines.length === lines.length && lines.length > 0) {
+          const list = document.createElement('ul');
+          list.className = 'answer-list';
+          lines.forEach((line) => {
+            const row = document.createElement('li');
+            appendAnswerText(row, line.replace(/^[-*•]\\s+/, ''));
+            list.appendChild(row);
+          });
+          container.appendChild(list);
+        } else {
+          addAnswerParagraph(container, lines.join(' '));
+        }
+      });
+    }
     async function loadSources() {
       try {
         const data = await api('/api/sources');
@@ -700,6 +908,7 @@ def page_html() -> str:
         const data = await api(path, {method: 'POST', body: '{}'});
         log(`${name}完成`, data.summary || data);
         await loadHealth();
+        await loadReviews();
         if (path !== '/api/ocr-eval') await loadSources();
       } catch (error) {
         log(`${name}失败`, {error: error.message});
@@ -721,6 +930,7 @@ def page_html() -> str:
       if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) ask();
     });
     loadHealth();
+    loadReviews();
     loadSources();
     loadApiConfig();
   </script>
@@ -743,6 +953,8 @@ class AgentHandler(BaseHTTPRequestHandler):
             self.send_json(health_payload())
         elif parsed.path == "/api/sources":
             self.send_json(kb_sources(DB_PATH))
+        elif parsed.path == "/api/reviews":
+            self.send_json(reviews_payload())
         elif parsed.path == "/api/api-config":
             self.send_json(api_config_payload())
         elif parsed.path == "/api/query":
@@ -792,6 +1004,18 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "summary": compact_ingest_result(result), "result": result})
             elif parsed.path == "/api/ocr-eval":
                 self.send_json(run_ocr_eval())
+            elif parsed.path == "/api/reviews/approve":
+                payload = self.read_json()
+                approval = approve_review_file(
+                    RAW_DIR,
+                    ROOT / "knowledge_base" / "processed",
+                    str(payload.get("file_path", "")),
+                )
+                result = kb_update(RAW_DIR, DB_PATH, ROOT / "knowledge_base" / "processed", strict_extraction=True)
+                self.send_json({"ok": True, "approval": approval, "summary": compact_ingest_result(result), "result": result})
+            elif parsed.path == "/api/open-raw-folder":
+                os.startfile(RAW_DIR)  # type: ignore[attr-defined]
+                self.send_json({"ok": True})
             elif parsed.path == "/api/api-models":
                 payload = self.read_json()
                 provider = str(payload.get("provider", "openai-compatible")).strip()
@@ -950,6 +1174,8 @@ def compact_ingest_result(result: dict[str, Any]) -> dict[str, Any]:
         "skipped",
         "extraction_warnings",
         "requires_review",
+        "approved_reviews",
+        "unsupported_files",
         "indexed_at",
     )
     return {key: result.get(key) for key in keys if key in result}

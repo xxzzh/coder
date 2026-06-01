@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions
+chcp 65001 >nul
 
 set "ROOT=%~dp0"
 set "RAW=%ROOT%knowledge_base\raw"
@@ -7,6 +8,7 @@ set "RUNNER=%ROOT%run-agent.bat"
 set "OCR_EVAL=%ROOT%scripts\evaluate_ocr_test_materials.py"
 set "OCR_GEN=%ROOT%scripts\generate_ocr_test_materials.py"
 set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 
 if not exist "%RAW%" mkdir "%RAW%"
 
@@ -70,7 +72,7 @@ goto menu
 :open_raw
 start "" "%RAW%"
 echo.
-echo Put .md, .docx, .pdf, and .xlsx files in this folder, then run option 5 for an incremental update or option 4 for a strict rebuild.
+echo Put .md, .doc, .docx, .pdf, and .xlsx files in this folder, then run option 5 for an incremental update or option 4 for a strict rebuild.
 echo.
 pause
 goto menu

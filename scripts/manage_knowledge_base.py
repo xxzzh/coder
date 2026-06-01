@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ingest_knowledge_base import DB_PATH, PROCESSED_DIR, ingest
+from ingest_knowledge_base import DB_PATH, PROCESSED_DIR, IngestAlreadyRunningError, ingest
 
 
 RAW_DIR = Path("knowledge_base/raw")
@@ -133,14 +133,17 @@ def main() -> None:
     update_parser.add_argument("--strict-extraction", action="store_true")
 
     args = parser.parse_args()
-    if args.command == "sources":
-        output = sources(Path(args.db))
-    elif args.command == "rebuild":
-        output = rebuild(Path(args.raw_dir), Path(args.db), Path(args.processed), args.strict_extraction)
-    elif args.command == "update":
-        output = update(Path(args.raw_dir), Path(args.db), Path(args.processed), args.strict_extraction)
-    else:
-        parser.error(f"Unknown command: {args.command}")
+    try:
+        if args.command == "sources":
+            output = sources(Path(args.db))
+        elif args.command == "rebuild":
+            output = rebuild(Path(args.raw_dir), Path(args.db), Path(args.processed), args.strict_extraction)
+        elif args.command == "update":
+            output = update(Path(args.raw_dir), Path(args.db), Path(args.processed), args.strict_extraction)
+        else:
+            parser.error(f"Unknown command: {args.command}")
+    except IngestAlreadyRunningError as exc:
+        output = {"updated": False, "skipped": True, "reason": "update_in_progress", "message": str(exc)}
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
