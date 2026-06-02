@@ -19,7 +19,7 @@ RAW_DIR = ROOT / "knowledge_base" / "raw"
 DB_PATH = ROOT / "knowledge_base" / "index" / "knowledge.db"
 EXTRACTION_REPORT = ROOT / "knowledge_base" / "processed" / "extraction_report.jsonl"
 PROJECT_TESSDATA_DIR = ROOT / "tools" / "tessdata"
-SUPPORTED = {".md", ".doc", ".docx", ".pdf", ".xlsx"}
+SUPPORTED = {".md", ".txt", ".doc", ".docx", ".pdf", ".xlsx"}
 
 
 def unsupported_raw_files() -> list[str]:
@@ -186,7 +186,11 @@ def main() -> int:
         "optional_extractors": optional_extractors(),
         "offline_translation": offline_translation_status(),
         "extraction_report": extraction_report_stats(),
-        "api_configured": env.get("LKA_USE_API", "false").lower() == "true" and bool(env.get("LKA_API_KEY")),
+        "api_configured": (
+            env.get("LKA_USE_API", "false").lower() == "true"
+            and bool(env.get("LKA_API_KEY"))
+            and bool(env.get("LKA_API_MODEL"))
+        ),
         "api_backend_usable": api_backend_allowed(env),
         "api_provider": infer_provider(
             env.get("LKA_API_BASE_URL", ""),

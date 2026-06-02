@@ -11,11 +11,13 @@ from difflib import SequenceMatcher
 import hashlib
 from html import unescape
 from html.parser import HTMLParser
+from ipaddress import ip_address
 import json
 import math
 import os
 import queue
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -23,8 +25,9 @@ from pathlib import Path
 import threading
 import time
 from typing import Any
-from urllib.parse import parse_qs, quote, quote_plus, urlparse
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from xml.etree import ElementTree
 
 from api_providers import chat_completion, token_plan_rejected
@@ -40,11 +43,19 @@ WEB_TIMEOUT_SECONDS = 5
 WEB_SEARCH_TIMEOUT_SECONDS = 14
 WEB_SEARCH_TOTAL_TIMEOUT_SECONDS = 20
 WEB_SEARCH_MERGE_GRACE_SECONDS = 1.2
+WEB_RESEARCH_SOURCE_LIMIT = 3
+WEB_RESEARCH_TOTAL_TIMEOUT_SECONDS = 12
+WEB_PAGE_FETCH_TIMEOUT_SECONDS = 7
+WEB_PAGE_MAX_BYTES = 750_000
+WEB_PAGE_MAX_TEXT_CHARS = 60_000
+WEB_PAGE_CHUNK_CHARS = 900
 EMBEDDING_DIMS = 384
 LOCAL_SCORE_THRESHOLD = 0.16
 HOT_QUERY_THRESHOLD = 2
 CACHE_TTL_SECONDS = 3600
 DEFAULT_API_TIMEOUT_SECONDS = 20
+SECTION_CONTEXT_FORWARD_CHUNKS = 4
+SECTION_CONTEXT_MAX_CHARS = 3200
 STOP_WORDS = {
     "什么",
     "哪些",
@@ -366,7 +377,7 @@ def get_metadata(conn: sqlite3.Connection) -> dict[str, str]:
 
 
 def source_fingerprint(raw_dir: Path = RAW_DIR) -> str:
-    supported = {".md", ".doc", ".docx", ".pdf", ".xlsx"}
+    supported = {".md", ".txt", ".doc", ".docx", ".pdf", ".xlsx"}
     items: list[str] = []
     if not raw_dir.exists():
         return ""
@@ -451,6 +462,7 @@ def api_enabled(config: dict[str, str]) -> bool:
     return (
         config.get("LKA_USE_API", "false").lower() == "true"
         and bool(config.get("LKA_API_KEY"))
+        and bool(config.get("LKA_API_MODEL"))
         and api_backend_allowed(config)
     )
 
@@ -463,15 +475,15 @@ def api_backend_allowed(config: dict[str, str]) -> bool:
 
 def api_cache_variant(config: dict[str, str], allow_api: bool) -> str:
     if not allow_api or not api_enabled(config):
-        return "retrieval-v19:xlsx-coordinate-station-table"
+        return "retrieval-v28:section-context-expansion"
     provider = config.get("LKA_API_PROVIDER", "openai-compatible")
     base_url = config.get("LKA_API_BASE_URL", "")
     model = config.get("LKA_API_MODEL", "")
-    return f"retrieval-v19:xlsx-coordinate-station-table-api:{provider}:{base_url}:{model}"
+    return f"retrieval-v28:section-context-expansion-api:{provider}:{base_url}:{model}"
 
 
 def cache_key(question: str, limit: int, use_web: bool, variant: str = "local") -> str:
-    normalized = re.sub(r"\s+", " ", question.strip().lower())
+    normalized = canonical_question_for_cache(question)
     return hashlib.sha256(f"{normalized}|{limit}|{int(use_web)}|{variant}".encode("utf-8")).hexdigest()
 
 
@@ -627,6 +639,8 @@ def chunk_information_quality(text: str) -> float:
     compact = human_text(text)
     if not compact:
         return 0.0
+    if markdown_table_of_contents(text):
+        return 0.3
     header_markers = ("站位 | 测试项目", "测试项 | 测试子项", "工具名称 | 测试门限", "卡关/判定方式")
     header_hits = sum(marker in compact for marker in header_markers)
     detail_markers = ("工序名称：", "岗位资源：", "1.", "1、", "PASS", "FAIL", "MES", "测试LOG")
@@ -636,6 +650,73 @@ def chunk_information_quality(text: str) -> float:
     if header_hits and len(compact) < 180 and detail_hits <= 1:
         return 0.55
     return 1.0
+
+
+def markdown_table_of_contents(text: str) -> bool:
+    return bool(re.search(r"(?m)^\s{0,3}#{1,6}\s+目录\s*$", text)) or len(re.findall(r"\]\(#[^)]+\)", text)) >= 4
+
+
+def first_markdown_heading_level(text: str) -> int | None:
+    match = re.search(r"(?m)^\s{0,3}(#{1,6})\s+", text)
+    return len(match.group(1)) if match else None
+
+
+def section_context_question(question: str) -> bool:
+    return bool(re.search(r"是什么|逻辑|机制|原理|流程|如何|怎么|说明|介绍|what\s+is|how\s+does|workflow|mechanism|logic", question, flags=re.IGNORECASE))
+
+
+def expand_section_context(
+    conn: sqlite3.Connection,
+    ranked: list[dict[str, Any]],
+    question: str,
+) -> list[dict[str, Any]]:
+    if not section_context_question(question):
+        return ranked
+
+    expanded: list[dict[str, Any]] = []
+    for row in ranked:
+        item = row.copy()
+        heading_level = first_markdown_heading_level(str(item.get("text", "")))
+        if (
+            str(item.get("file_type", "")).lower() not in {"md", "markdown"}
+            or heading_level is None
+            or markdown_table_of_contents(str(item.get("text", "")))
+        ):
+            expanded.append(item)
+            continue
+
+        neighbors = conn.execute(
+            """
+            SELECT chunk_id, chunk_index, text
+            FROM chunks
+            WHERE doc_id = ? AND chunk_index > ? AND chunk_index <= ?
+            ORDER BY chunk_index
+            """,
+            (
+                item["doc_id"],
+                item["chunk_index"],
+                item["chunk_index"] + SECTION_CONTEXT_FORWARD_CHUNKS,
+            ),
+        ).fetchall()
+        context_chunks = [str(item["text"])]
+        context_chunk_ids = [str(item["chunk_id"])]
+        context_length = len(context_chunks[0])
+        for neighbor in neighbors:
+            neighbor_text = str(neighbor["text"])
+            neighbor_level = first_markdown_heading_level(neighbor_text)
+            if neighbor_level is not None and neighbor_level <= heading_level:
+                break
+            if context_length + len(neighbor_text) > SECTION_CONTEXT_MAX_CHARS:
+                break
+            context_chunks.append(neighbor_text)
+            context_chunk_ids.append(str(neighbor["chunk_id"]))
+            context_length += len(neighbor_text)
+        if len(context_chunks) > 1:
+            item["text"] = "\n\n".join(context_chunks)
+            item["context_expanded"] = True
+            item["context_chunk_ids"] = context_chunk_ids
+        expanded.append(item)
+    return expanded
 
 
 def rerank(rows: list[dict[str, Any]], question: str, limit: int) -> list[dict[str, Any]]:
@@ -689,7 +770,7 @@ def search(db_path: Path, question: str, limit: int) -> tuple[list[dict[str, Any
             *semantic_candidates(conn, question, limit),
             *fallback_like_candidates(conn, question, limit),
         ]
-        ranked = rerank(rows, question, limit)
+        ranked = expand_section_context(conn, rerank(rows, question, limit), question)
         return ranked, metadata
     finally:
         conn.close()
@@ -747,6 +828,12 @@ def citation_for_text(text: str, question: str, max_len: int = 360) -> str:
     return human_text(text, max_len=max_len)
 
 
+def citation_for_retrieval_row(row: dict[str, Any], question: str) -> str:
+    if row.get("context_expanded"):
+        return human_text(str(row["text"]), max_len=1800)
+    return citation_for_text(str(row["text"]), question)
+
+
 def build_answer(question: str, sources: list[dict[str, Any]]) -> str:
     citations = [source["citation"] for source in sources[:3] if source.get("citation")]
     if not citations:
@@ -756,11 +843,41 @@ def build_answer(question: str, sources: list[dict[str, Any]]) -> str:
     return "根据本地知识库，" + "；".join(trim_terminal_punctuation(item) for item in citations) + "。"
 
 
+def station_test_item_question(question: str) -> bool:
+    return bool(re.search(r"测试项|测试项目", question))
+
+
+def station_question_includes_schemes(question: str) -> bool:
+    return bool(re.search(r"方案|步骤|怎么测|如何测试", question))
+
+
 def requested_station_name(question: str) -> str | None:
-    match = re.search(r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_-]{1,30})\s*站位", question, flags=re.IGNORECASE)
-    if not match:
+    explicit = re.search(
+        r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_-]{1,30})\s*(?:站位|工位|站点)",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if explicit:
+        return explicit.group(1)
+    if not station_test_item_question(question):
         return None
-    return match.group(1)
+    implicit = re.search(
+        r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_-]{1,30})"
+        r"(?=\s*的?\s*(?:(?:都有哪些|有哪些|有什么|包含|包括|有)\s*)?(?:测试项|测试项目)"
+        r"|\s*的?\s*(?:测试项|测试项目)\s*(?:都有哪些|有哪些|有什么|包含|包括|有))",
+        question,
+        flags=re.IGNORECASE,
+    )
+    return implicit.group(1) if implicit else None
+
+
+def canonical_question_for_cache(question: str) -> str:
+    normalized = normalize_search_question(question)
+    station_name = requested_station_name(normalized)
+    if station_name and station_test_item_question(normalized):
+        detail = "schemes" if station_question_includes_schemes(normalized) else "items"
+        return f"station:{station_name.lower()}:{detail}"
+    return re.sub(r"\s+", " ", normalized.strip().lower())
 
 
 def structured_cell_text(text: str, max_len: int | None = None) -> str:
@@ -924,7 +1041,7 @@ def structured_station_result(
     refresh_scheduled: bool = False,
 ) -> dict[str, Any] | None:
     station_name = requested_station_name(question)
-    if not station_name or not re.search(r"测试项|项目|有哪些|有什么|列出|列表", question):
+    if not station_name or not station_test_item_question(question):
         return None
     try:
         conn = sqlite3.connect(db_path)
@@ -945,7 +1062,7 @@ def structured_station_result(
         records, excerpt_text = extract_station_table_records_with_excerpt(str(row["text"]), station_name)
         if not records:
             continue
-        include_schemes = bool(re.search(r"方案|步骤|怎么测|如何测试", question))
+        include_schemes = station_question_includes_schemes(question)
         if include_schemes:
             lines = [
                 f"- {record['item']}：{record['scheme'] or '资料中未填写测试方案'}"
@@ -1387,6 +1504,359 @@ def web_search_variant(
     return None, diagnostics
 
 
+def freshness_sensitive_question(question: str) -> bool:
+    lowered = question.lower()
+    markers = (
+        "最新",
+        "当前",
+        "目前",
+        "今天",
+        "即将",
+        "停止使用",
+        "弃用",
+        "下线",
+        "过期",
+        "截止",
+        "何时",
+        "什么时候",
+        "latest",
+        "current",
+        "today",
+        "deprecated",
+        "deprecation",
+        "sunset",
+        "end of life",
+        "eol",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def html_visible_text(html: str) -> str:
+    text = re.sub(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", unescape(text).replace("\x00", "")).strip()
+
+
+class WebPageTextParser(HTMLParser):
+    BLOCK_TAGS = {
+        "article",
+        "blockquote",
+        "br",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "main",
+        "p",
+        "pre",
+        "section",
+        "td",
+        "th",
+        "tr",
+    }
+    SKIP_TAGS = {"aside", "canvas", "footer", "form", "header", "nav", "noscript", "script", "style", "svg"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.title = ""
+        self.blocks: list[str] = []
+        self._block_parts: list[str] = []
+        self._title_parts: list[str] = []
+        self._in_title = False
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if self._skip_depth:
+            self._skip_depth += 1
+            return
+        if tag in self.SKIP_TAGS:
+            self._flush_block()
+            self._skip_depth = 1
+            return
+        if tag == "title":
+            self._in_title = True
+            return
+        if tag in self.BLOCK_TAGS:
+            self._flush_block()
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._skip_depth:
+            self._skip_depth -= 1
+            return
+        if tag == "title":
+            self.title = human_text(" ".join(self._title_parts), max_len=180, simplify=True)
+            self._title_parts = []
+            self._in_title = False
+            return
+        if tag in self.BLOCK_TAGS:
+            self._flush_block()
+
+    def handle_data(self, data: str) -> None:
+        value = re.sub(r"\s+", " ", unescape(data).replace("\x00", " ")).strip()
+        if not value or self._skip_depth:
+            return
+        if self._in_title:
+            self._title_parts.append(value)
+        else:
+            self._block_parts.append(value)
+
+    def close(self) -> None:
+        self._flush_block()
+        super().close()
+
+    def text(self) -> str:
+        self._flush_block()
+        blocks: list[str] = []
+        for block in self.blocks:
+            if block and (not blocks or block != blocks[-1]):
+                blocks.append(block)
+        return "\n".join(blocks)
+
+    def _flush_block(self) -> None:
+        block = human_text(" ".join(self._block_parts), simplify=True)
+        if block:
+            self.blocks.append(block)
+        self._block_parts = []
+
+
+class NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+def validate_public_web_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Only public http/https webpage URLs are allowed.")
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
+        raise ValueError("Local webpage URLs are not allowed.")
+    try:
+        addresses = socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError(f"Cannot resolve webpage host: {hostname}") from exc
+    if not addresses:
+        raise ValueError(f"Cannot resolve webpage host: {hostname}")
+    for address in addresses:
+        value = ip_address(address[4][0].split("%", 1)[0])
+        if not value.is_global:
+            raise ValueError("Non-public webpage addresses are not allowed.")
+    return url
+
+
+def decode_webpage(data: bytes, charset: str | None = None) -> str:
+    candidates = [charset]
+    head = data[:4096].decode("ascii", errors="ignore")
+    match = re.search(r"(?i)charset\s*=\s*[\"']?\s*([a-z0-9._-]+)", head)
+    if match:
+        candidates.append(match.group(1))
+    candidates.extend(["utf-8", "gb18030"])
+    best = ""
+    best_replacements = WEB_PAGE_MAX_BYTES
+    for encoding in candidates:
+        if not encoding:
+            continue
+        try:
+            decoded = data.decode(encoding, errors="replace")
+        except LookupError:
+            continue
+        replacements = decoded.count("\ufffd")
+        if replacements < best_replacements:
+            best = decoded
+            best_replacements = replacements
+        if replacements == 0:
+            break
+    return best
+
+
+def fetch_public_webpage_text(url: str, timeout: int = WEB_PAGE_FETCH_TIMEOUT_SECONDS) -> tuple[str, str, str]:
+    opener = build_opener(NoRedirectHandler())
+    current_url = url
+    for _ in range(4):
+        validate_public_web_url(current_url)
+        request = Request(
+            current_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; local-kb-agent/1.0)",
+                "Accept": "text/html,text/plain;q=0.9,*/*;q=0.1",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
+        )
+        try:
+            response = opener.open(request, timeout=timeout)
+        except HTTPError as exc:
+            location = exc.headers.get("Location", "")
+            if exc.code in {301, 302, 303, 307, 308} and location:
+                current_url = urljoin(current_url, location)
+                continue
+            raise
+        with response:
+            content_type = response.headers.get_content_type()
+            if content_type not in {"text/html", "application/xhtml+xml", "text/plain"}:
+                raise ValueError(f"Unsupported webpage content type: {content_type}")
+            data = response.read(WEB_PAGE_MAX_BYTES + 1)
+            if len(data) > WEB_PAGE_MAX_BYTES:
+                data = data[:WEB_PAGE_MAX_BYTES]
+            return decode_webpage(data, response.headers.get_content_charset()), current_url, content_type
+    raise ValueError("Too many webpage redirects.")
+
+
+def extract_webpage_text(page_text: str, content_type: str = "text/html") -> tuple[str, str]:
+    if content_type == "text/plain":
+        return "", human_text(page_text, max_len=WEB_PAGE_MAX_TEXT_CHARS)
+    parser = WebPageTextParser()
+    parser.feed(page_text)
+    parser.close()
+    text = parser.text()
+    if not text:
+        text = html_visible_text(page_text)
+    return parser.title, text[:WEB_PAGE_MAX_TEXT_CHARS]
+
+
+def webpage_chunks(text: str, max_chars: int = WEB_PAGE_CHUNK_CHARS) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_chars = 0
+    paragraphs = [human_text(part) for part in re.split(r"\n+", text) if human_text(part)]
+    for paragraph in paragraphs:
+        parts = split_sentences(paragraph) if len(paragraph) > max_chars else [paragraph]
+        for part in parts:
+            if not part:
+                continue
+            if current and current_chars + len(part) + 1 > max_chars:
+                chunks.append(" ".join(current))
+                current = []
+                current_chars = 0
+            current.append(part)
+            current_chars += len(part) + 1
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def webpage_chunk_score(question: str, chunk: str) -> float:
+    lexical = sentence_score(chunk, candidate_terms(question))
+    semantic = max(0.0, cosine(local_embedding(question), local_embedding(chunk)))
+    relevance = max(
+        score or 0.0
+        for score in (
+            chinese_relevance_score(normalize_search_question(question), chunk),
+            english_relevance_score(question, chunk),
+        )
+    )
+    return lexical + semantic * 4.0 + relevance * 3.0
+
+
+def research_web_source(question: str, source: dict[str, Any]) -> dict[str, Any]:
+    researched = source.copy()
+    try:
+        page_text, resolved_url, content_type = fetch_public_webpage_text(str(source.get("url", "")))
+        page_title, text = extract_webpage_text(page_text, content_type)
+        chunks = webpage_chunks(text)
+        ranked = sorted(
+            ((webpage_chunk_score(question, chunk), chunk) for chunk in chunks),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        selected = [chunk for score, chunk in ranked[:2] if score > 0]
+        if not selected and chunks:
+            selected = chunks[:1]
+        citation = human_text(
+            " ".join(citation_for_text(chunk, question, max_len=520) for chunk in selected),
+            max_len=1000,
+            simplify=True,
+        )
+        if not citation:
+            raise ValueError("Webpage did not contain readable text.")
+    except Exception as exc:  # noqa: BLE001
+        researched["page_fetch_status"] = "error"
+        researched["page_fetch_error"] = human_text(str(exc), max_len=180)
+        return researched
+    researched.update(
+        {
+            "title": page_title or researched.get("title", ""),
+            "resolved_url": resolved_url,
+            "content_source": "webpage",
+            "page_fetch_status": "ok",
+            "page_chars": len(text),
+            "page_chunk_score": round(ranked[0][0], 4) if ranked else 0.0,
+            "snippet": citation,
+            "excerpt": citation,
+            "citation": citation,
+        }
+    )
+    return researched
+
+
+def enrich_web_search_result(question: str, result: dict[str, Any], limit: int = 5) -> dict[str, Any]:
+    sources = [source.copy() for source in (result.get("sources") or [])]
+    if not sources:
+        result["web_research_used"] = False
+        result["web_pages_fetched"] = 0
+        result["web_pages_extracted"] = 0
+        return result
+
+    selected_sources = sources[: min(len(sources), limit, WEB_RESEARCH_SOURCE_LIMIT)]
+    completed: queue.Queue[tuple[int, dict[str, Any]]] = queue.Queue()
+
+    def invoke(index: int, source: dict[str, Any]) -> None:
+        completed.put((index, research_web_source(question, source)))
+
+    for index, source in enumerate(selected_sources):
+        threading.Thread(target=invoke, args=(index, source), daemon=True).start()
+
+    researched: dict[int, dict[str, Any]] = {}
+    deadline = time.monotonic() + WEB_RESEARCH_TOTAL_TIMEOUT_SECONDS
+    while len(researched) < len(selected_sources):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            index, source = completed.get(timeout=remaining)
+        except queue.Empty:
+            break
+        researched[index] = source
+
+    for index in range(len(selected_sources)):
+        sources[index] = researched.get(
+            index,
+            {
+                **sources[index],
+                "page_fetch_status": "timeout",
+                "page_fetch_error": "Webpage fetch timed out.",
+            },
+        )
+    for index in range(len(selected_sources), len(sources)):
+        sources[index]["page_fetch_status"] = "not_selected"
+
+    for source_id, source in enumerate(sources, start=1):
+        source["source_id"] = source_id
+    extracted_ids = [source["source_id"] for source in sources if source.get("page_fetch_status") == "ok"]
+    result["sources"] = sources
+    result["citations"] = grounded_citations(result)
+    result["summary_source_ids"] = extracted_ids[:3] or result.get("summary_source_ids", [])
+    result["web_research_used"] = True
+    result["web_pages_fetched"] = len(selected_sources)
+    result["web_pages_extracted"] = len(extracted_ids)
+    result["retrieval_mode"] = "web_search_page_rag"
+    snippets = [source_quote(source) for source in sources[:3] if source_quote(source)]
+    if snippets:
+        result["answer"] = human_text(
+            "本地知识库没有找到足够依据，联网研究到：" + "；".join(trim_terminal_punctuation(snippet) for snippet in snippets) + "。",
+            simplify=True,
+        )
+    return result
+
+
 def web_search(question: str, limit: int = 5) -> dict[str, Any]:
     attempts: list[dict[str, Any]] = []
     deadline = time.monotonic() + WEB_SEARCH_TOTAL_TIMEOUT_SECONDS
@@ -1608,6 +2078,9 @@ def merge_with_web_result(local_result: dict[str, Any], web_result: dict[str, An
             "web_search_providers": web_result.get("web_search_providers", []),
             "web_search_attempts": web_result.get("web_search_attempts", []),
             "web_search_used": True,
+            "web_research_used": web_result.get("web_research_used", False),
+            "web_pages_fetched": web_result.get("web_pages_fetched", 0),
+            "web_pages_extracted": web_result.get("web_pages_extracted", 0),
             "need_web_search": False,
             "retrieval_mode": "local_and_web_hybrid",
         }
@@ -1616,7 +2089,7 @@ def merge_with_web_result(local_result: dict[str, Any], web_result: dict[str, An
 
 
 def augment_with_web(question: str, result: dict[str, Any], limit: int) -> dict[str, Any]:
-    return merge_with_web_result(result, web_search(question, limit), limit)
+    return merge_with_web_result(result, enrich_web_search_result(question, web_search(question, limit), limit), limit)
 
 
 def meaningful_query_terms(question: str) -> list[str]:
@@ -1632,12 +2105,31 @@ def meaningful_query_terms(question: str) -> list[str]:
     return unique_terms(terms, limit=16)
 
 
+def query_term_variants(term: str) -> list[str]:
+    variants = [term]
+    reduced = term
+    for _ in range(3):
+        suffix = next(
+            (
+                candidate
+                for candidate in ("是什么", "工作原理", "逻辑", "机制", "原理", "流程", "说明", "介绍")
+                if reduced.endswith(candidate) and len(reduced) - len(candidate) >= 2
+            ),
+            None,
+        )
+        if suffix is None:
+            break
+        reduced = reduced[: -len(suffix)]
+        variants.append(reduced)
+    return unique_terms(variants, limit=4)
+
+
 def lexical_query_coverage(question: str, text: str) -> float:
     terms = meaningful_query_terms(question)
     if not terms:
         return 0.0
     lowered = text.lower()
-    matched = sum(1 for term in terms if term.lower() in lowered)
+    matched = sum(1 for term in terms if any(variant.lower() in lowered for variant in query_term_variants(term)))
     return matched / len(terms)
 
 
@@ -1646,7 +2138,9 @@ def local_result_is_relevant(rows: list[dict[str, Any]], question: str) -> bool:
         return False
     top = rows[0]
     has_lexical_score = float(top.get("keyword_score", 0.0) or 0.0) > 0 or float(top.get("fts_score", 0.0) or 0.0) > 0
-    return has_lexical_score and lexical_query_coverage(question, str(top.get("text", ""))) >= 0.5
+    terms = meaningful_query_terms(question)
+    minimum_coverage = 1.0 if len(terms) <= 2 else 0.5
+    return has_lexical_score and lexical_query_coverage(question, str(top.get("text", ""))) >= minimum_coverage
 
 
 def grounded_citations(result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1673,6 +2167,24 @@ def grounded_citations(result: dict[str, Any]) -> list[dict[str, Any]]:
                 "quote": quote,
             }
         )
+    return citations
+
+
+def synthesis_citations(result: dict[str, Any]) -> list[dict[str, Any]]:
+    citations = grounded_citations(result)
+    if not result.get("web_pages_extracted"):
+        return citations
+    sources = result.get("sources") or []
+    fetched_web_ids = {
+        source.get("source_id")
+        for source in sources
+        if source.get("source_origin") == "web" and source.get("content_source") == "webpage"
+    }
+    if result.get("source_type") == "web_search":
+        return [citation for citation in citations if citation.get("source_id") in fetched_web_ids]
+    if result.get("source_type") == "hybrid_web_knowledge":
+        local_ids = {source.get("source_id") for source in sources if source.get("source_origin") != "web"}
+        return [citation for citation in citations if citation.get("source_id") in local_ids | fetched_web_ids]
     return citations
 
 
@@ -1729,7 +2241,7 @@ def chinese_grounded_fallback(result: dict[str, Any]) -> dict[str, Any]:
         return result
     source_type = result.get("source_type")
     translated_citations: list[str] = []
-    citations = grounded_citations(result)
+    citations = synthesis_citations(result)
     summary_source_ids = set(result.get("summary_source_ids") or [])
     if summary_source_ids:
         citations = [citation for citation in citations if citation.get("source_id") in summary_source_ids]
@@ -1761,7 +2273,7 @@ def synthesize_with_api(question: str, result: dict[str, Any], config: dict[str,
         result["api_used"] = False
         return result
 
-    citations = grounded_citations(result)
+    citations = synthesis_citations(result)
     if not citations:
         result["api_used"] = False
         return result
@@ -1819,12 +2331,27 @@ def synthesize_with_api(question: str, result: dict[str, Any], config: dict[str,
 def finalize_answer(question: str, result: dict[str, Any], config: dict[str, str], allow_api: bool) -> dict[str, Any]:
     if result.get("source_type") not in {"knowledge_base", "web_search", "hybrid_web_knowledge", "faq_fallback"}:
         return result
+    if result.get("answer_mode") == "api_grounded_summary":
+        return result
     if result.get("answer_mode") == "local_structured_table_summary":
         result["api_used"] = False
         return result
     if allow_api:
         return synthesize_with_api(question, result, config)
     return chinese_grounded_fallback(result)
+
+
+def web_research_agent(question: str, config: dict[str, str], allow_api: bool, limit: int = 5) -> dict[str, Any]:
+    result = enrich_web_search_result(question, web_search(question, limit), limit)
+    if result.get("sources") and allow_api and api_enabled(config):
+        result = synthesize_with_api(question, result, config)
+        if result.get("api_used"):
+            result["retrieval_mode"] = "web_research_grounded_api_summary"
+        elif result.get("api_error"):
+            result["retrieval_mode"] = "web_research_local_summary_after_api_error"
+    else:
+        result["api_used"] = False
+    return result
 
 
 def faq_fallback(question: str, limit: int = 3) -> dict[str, Any]:
@@ -1894,9 +2421,17 @@ def faq_fallback(question: str, limit: int = 3) -> dict[str, Any]:
     }
 
 
-def no_local_answer(use_web: bool, question: str, answer: str, metadata: dict[str, str] | None = None) -> dict[str, Any]:
+def no_local_answer(
+    use_web: bool,
+    question: str,
+    answer: str,
+    metadata: dict[str, str] | None = None,
+    config: dict[str, str] | None = None,
+    allow_api: bool = True,
+    limit: int = 5,
+) -> dict[str, Any]:
     if use_web:
-        return web_search(question)
+        return web_research_agent(question, config or {}, allow_api, limit)
     metadata = metadata or {}
     return {
         "answer": answer,
@@ -1924,7 +2459,14 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
             return finalize_answer(question, result, config, allow_api)
         return finalize_answer(
             question,
-            no_local_answer(use_web, question, "本地知识库索引不存在，请先运行 ingest。"),
+            no_local_answer(
+                use_web,
+                question,
+                "本地知识库索引不存在，请先运行 ingest。",
+                config=config,
+                allow_api=allow_api,
+                limit=limit,
+            ),
             config,
             allow_api,
         )
@@ -1973,7 +2515,15 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
         return finalize_answer(question, result, config, allow_api)
 
     if not local_result_is_relevant(rows, question):
-        result = no_local_answer(use_web, question, "本地知识库没有找到足够依据。", metadata)
+        result = no_local_answer(
+            use_web,
+            question,
+            "本地知识库没有找到足够依据。",
+            metadata,
+            config,
+            allow_api,
+            limit,
+        )
         result["async_update_scheduled"] = refresh_scheduled
         result = finalize_answer(question, result, config, allow_api)
         if cache_conn is not None and (not result.get("web_search_used") or result.get("sources")) and not result.get("web_search_reason"):
@@ -1986,7 +2536,7 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
     sources: list[dict[str, Any]] = []
     citations: list[dict[str, Any]] = []
     for index, row in enumerate(rows, start=1):
-        citation = citation_for_text(row["text"], question)
+        citation = citation_for_retrieval_row(row, question)
         source = {
             "source_id": index,
             "file": row["file_name"],
@@ -2000,6 +2550,8 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
             "keyword_score": row["keyword_score"],
             "fts_score": row["fts_score"],
         }
+        if row.get("context_chunk_ids"):
+            source["context_chunk_ids"] = row["context_chunk_ids"]
         sources.append(source)
         citations.append(
             {

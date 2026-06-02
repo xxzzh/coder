@@ -6,7 +6,7 @@
 
 ## 支持格式
 
-- Markdown: `.md`
+- 文本: `.md`、`.txt`
 - Word: `.docx`、`.doc`
 - PDF: `.pdf`
 - Excel: `.xlsx`
@@ -151,14 +151,14 @@ LKA_API_TIMEOUT_SECONDS=20
 LKA_USE_API=false
 ```
 
-API 只用于“基于已召回引用的答案总结”。检索、索引、缓存和引用都在本地完成。联网兜底结果也会先经过相关性过滤，再与引用一起交给 API 去重、精炼和生成中文答案。没有 API 时，系统会优先使用本地离线翻译生成中文答案。
+API 只用于“基于已召回引用的答案总结”。检索、索引、缓存和引用都在本地完成。联网兜底不会让 API 脱离来源直接回答：系统会先搜索网页、抓取公开网页正文、对正文分块并做轻量 RAG 排序，再把整理后的引用交给 API 去重、精炼和生成中文答案。没有 API 时，系统会优先使用本地离线翻译生成中文答案。
 
 联网兜底会区分两种失败情况：
 
 - 搜索源暂时无法访问：检查网络连接或稍后重试。
 - 搜索已完成但没有可信相关结果：补充关键词或换一种更具体的问法。
 
-联网检索会并行尝试百度、Bing 中国、Bing RSS、DuckDuckGo、Wikipedia 和 Jina Bing，并对结果统一做相关性过滤、质量排序和去重。单个搜索源不可用时不会阻塞其他来源返回答案。
+联网检索会并行尝试百度、Bing 中国、Bing RSS、DuckDuckGo、Wikipedia 和 Jina Bing，并对结果统一做相关性过滤、质量排序和去重。随后，联网研究 Agent 会并发抓取前几个公开网页，只允许公网 `http/https` 地址，抽取正文后复用本地 hash n-gram embedding 和关键词评分筛选相关片段。单个搜索源或网页不可用时不会阻塞其他来源返回答案。
 
 支持的 API 提供商：
 
@@ -189,6 +189,7 @@ python scripts\query_knowledge_base.py "What is ACID?" --no-api
 - 本地 hash n-gram embedding
 - 语义分块
 - FTS + semantic cosine + keyword score 混合 rerank
+- 联网网页正文抽取、分块和轻量 RAG rerank
 - 热门 Query 缓存
 - raw 文件变化检测和异步增量更新
 - 索引不可用时 FAQ 兜底

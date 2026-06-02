@@ -24,7 +24,7 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 
-SUPPORTED = {".md", ".doc", ".docx", ".pdf", ".xlsx"}
+SUPPORTED = {".md", ".txt", ".doc", ".docx", ".pdf", ".xlsx"}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = Path("knowledge_base/index/knowledge.db")
 PROCESSED_DIR = Path("knowledge_base/processed")
@@ -737,7 +737,7 @@ def read_pdf_with_report(path: Path) -> tuple[str, dict[str, Any]]:
 
 def read_document(path: Path) -> str:
     suffix = path.suffix.lower()
-    if suffix == ".md":
+    if suffix in {".md", ".txt"}:
         return read_plain_text(path)
     if suffix == ".doc":
         return read_doc_with_report(path)[0]
@@ -752,9 +752,9 @@ def read_document(path: Path) -> str:
 
 def read_document_with_report(path: Path) -> tuple[str, dict[str, Any]]:
     suffix = path.suffix.lower()
-    if suffix == ".md":
+    if suffix in {".md", ".txt"}:
         text = read_plain_text(path)
-        report = extraction_report(path, "md")
+        report = extraction_report(path, suffix.lstrip("."))
     elif suffix == ".doc":
         text, report = read_doc_with_report(path)
     elif suffix == ".docx":
@@ -767,11 +767,11 @@ def read_document_with_report(path: Path) -> tuple[str, dict[str, Any]]:
         raise ValueError(f"Unsupported file type: {path}")
 
     report["text_chars"] = len(text)
-    if len(normalize_text(text)) < MIN_EXTRACTED_TEXT_CHARS and suffix != ".md":
+    if len(normalize_text(text)) < MIN_EXTRACTED_TEXT_CHARS and suffix not in {".md", ".txt"}:
         report["warnings"].append("Extracted text is very short; source may be image-only, encrypted, or layout-heavy.")
         report["requires_review"] = True
     if not report["method"]:
-        report["method"].append("plain_text" if suffix == ".md" else "office_xml")
+        report["method"].append("plain_text" if suffix in {".md", ".txt"} else "office_xml")
     return text, report
 
 

@@ -55,6 +55,13 @@ def main() -> None:
     assert normalize_search_question(question) == "量子纠缠是什么"
     assert web_query(question) == "量子纠缠"
     assert web_query("acwing是什么") == "acwing"
+    assert query_module.requested_station_name("FRT站位有哪些测试项") == "FRT"
+    assert query_module.requested_station_name("FRT有哪些测试项") == "FRT"
+    assert query_module.requested_station_name("FRT测试项有哪些") == "FRT"
+    assert query_module.requested_station_name("FRT的测试项目有什么") == "FRT"
+    assert query_module.canonical_question_for_cache("FRT站位有哪些测试项") == "station:frt:items"
+    assert query_module.canonical_question_for_cache("FRT有哪些测试项") == "station:frt:items"
+    assert query_module.cache_key("FRT站位有哪些测试项", 5, False) == query_module.cache_key("FRT有哪些测试项", 5, False)
     assert [source["title"] for source in filter_web_sources(
         "acwing是什么",
         [{"title": "AcWing", "url": "https://www.acwing.com/", "snippet": "AcWing 算法交流平台。"}],
@@ -130,6 +137,80 @@ AcWing 是一个算法交流平台。
         "ZDE-DAQ-V1采集板说明\nCN1:USB通讯接口\nCN2:8路电压采集通道，采集范围0~50V",
         "ZDE-DAQ-V1采集板的CN2接口是什么",
     )
+    assert not query_module.local_result_is_relevant(
+        [{"rerank_score": 0.8, "keyword_score": 1.0, "fts_score": 1.0, "text": "Extended by quantum mechanics."}],
+        "quantum entanglement",
+    )
+    assert query_module.lexical_query_coverage("恢复机制逻辑", "八、本地缓存与恢复机制") == 1.0
+    assert chunk_information_quality("## 目录\n- [恢复机制](#恢复机制)\n- [配置系统](#配置系统)\n- [运行流程](#运行流程)\n- [API](#api)") < 0.5
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE chunks(chunk_id TEXT PRIMARY KEY, doc_id TEXT, chunk_index INTEGER, text TEXT);
+        INSERT INTO chunks VALUES ('guide-0122', 'guide', 122, '## 八、本地缓存与恢复机制\n### 用途\n支持断点续测。');
+        INSERT INTO chunks VALUES ('guide-0123', 'guide', 123, '### 缓存文件\nOutput/LocalData/');
+        INSERT INTO chunks VALUES ('guide-0124', 'guide', 124, '### 状态值\n-1 等待测试，0 测试失败，1 测试通过。');
+        INSERT INTO chunks VALUES ('guide-0125', 'guide', 125, '### 恢复逻辑\n若 EnableReadLocalStatus = true，状态 = 1 时直接标记 PASS，跳过执行。');
+        INSERT INTO chunks VALUES ('guide-0126', 'guide', 126, '## 九、下一个章节\n不应拼接。');
+        """
+    )
+    expanded_rows = query_module.expand_section_context(
+        conn,
+        [
+            {
+                "chunk_id": "guide-0122",
+                "doc_id": "guide",
+                "chunk_index": 122,
+                "file_type": "md",
+                "text": "## 八、本地缓存与恢复机制\n### 用途\n支持断点续测。",
+                "rerank_score": 0.8,
+                "keyword_score": 1.0,
+                "fts_score": 1.0,
+            }
+        ],
+        "恢复机制是什么",
+    )
+    conn.close()
+    assert expanded_rows[0]["context_chunk_ids"] == ["guide-0122", "guide-0123", "guide-0124", "guide-0125"]
+    assert "状态 = 1" in query_module.citation_for_retrieval_row(expanded_rows[0], "恢复机制是什么")
+    assert "下一个章节" not in expanded_rows[0]["text"]
+    title, page_text = query_module.extract_webpage_text(
+        """
+        <html><head><title>量子纠缠说明</title><script>ignore()</script></head>
+        <body><header>导航文字</header><main><h1>量子纠缠</h1>
+        <p>量子纠缠是量子力学中的一种关联现象。</p>
+        <p>它可用于量子通信与量子计算研究。</p></main><footer>版权信息</footer></body></html>
+        """
+    )
+    assert title == "量子纠缠说明"
+    assert "量子纠缠是量子力学中的一种关联现象" in page_text
+    assert "ignore" not in page_text
+    assert "导航文字" not in page_text
+    assert "版权信息" not in page_text
+    original_fetch_public_webpage_text = query_module.fetch_public_webpage_text
+    try:
+        query_module.fetch_public_webpage_text = lambda *args, **kwargs: (
+            "<main><p>量子纠缠是量子力学中的一种现象，多个粒子的状态之间存在关联。</p></main>",
+            "https://example.com/entanglement",
+            "text/html",
+        )
+        researched = query_module.research_web_source("量子纠缠是什么", quantum_sources[0])
+        assert researched["page_fetch_status"] == "ok"
+        assert researched["content_source"] == "webpage"
+        assert "多个粒子的状态之间存在关联" in researched["citation"]
+    finally:
+        query_module.fetch_public_webpage_text = original_fetch_public_webpage_text
+    assert [citation["source_id"] for citation in query_module.synthesis_citations(
+        {
+            "source_type": "web_search",
+            "web_pages_extracted": 1,
+            "sources": [
+                {"source_id": 1, "source_origin": "web", "snippet": "搜索摘要"},
+                {"source_id": 2, "source_origin": "web", "content_source": "webpage", "citation": "网页正文证据"},
+            ],
+        }
+    )] == [2]
     fat_items = extract_station_table_items(
         "工序名称：FAT\n"
         "岗位资源： | MES Station Check | MES站别检测 | STPM.exe | NA |\n"
@@ -261,6 +342,80 @@ AcWing 是一个算法交流平台。
         for name, provider in originals.items():
             setattr(query_module, name, provider)
 
+    api_config = {
+        "LKA_USE_API": "true",
+        "LKA_API_PROVIDER": "openai-compatible",
+        "LKA_API_BASE_URL": "https://example.com/v1",
+        "LKA_API_KEY": "test-key",
+        "LKA_API_MODEL": "test-model",
+    }
+    original_chat_completion = query_module.chat_completion
+    original_web_search = query_module.web_search
+    original_enrich_web_search_result = query_module.enrich_web_search_result
+    try:
+        steps: list[str] = []
+        query_module.web_search = lambda *args, **kwargs: (
+            steps.append("search")
+            or {
+                "answer": "网页搜索摘要",
+                "source_type": "web_search",
+                "sources": [{"title": "外部资料", "url": "https://example.com/", "snippet": "外部资料摘要"}],
+                "web_search_used": True,
+            }
+        )
+        query_module.enrich_web_search_result = lambda *args, **kwargs: (
+            steps.append("fetch")
+            or {
+                **args[1],
+                "sources": [{"title": "外部资料", "url": "https://example.com/", "citation": "整理后的网页证据"}],
+                "retrieval_mode": "web_search_page_rag",
+            }
+        )
+        query_module.chat_completion = lambda *args, **kwargs: steps.append("api") or "基于网页证据的 API 精炼答案"
+        web_grounded = query_module.no_local_answer(
+            True,
+            "外部问题",
+            "本地知识库没有找到足够依据。",
+            config=api_config,
+            allow_api=True,
+        )
+        assert steps == ["search", "fetch", "api"]
+        assert web_grounded["source_type"] == "web_search"
+        assert web_grounded["web_search_used"] is True
+        assert web_grounded["api_used"] is True
+        assert web_grounded["retrieval_mode"] == "web_research_grounded_api_summary"
+        assert web_grounded["answer"] == "基于网页证据的 API 精炼答案"
+
+        steps.clear()
+        query_module.chat_completion = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("api offline"))
+        web_fallback = query_module.no_local_answer(
+            True,
+            "外部问题",
+            "本地知识库没有找到足够依据。",
+            config=api_config,
+            allow_api=True,
+        )
+        assert web_fallback["source_type"] == "web_search"
+        assert web_fallback["web_search_used"] is True
+        assert web_fallback["retrieval_mode"] == "web_research_local_summary_after_api_error"
+        assert "api offline" in web_fallback["api_error"]
+
+        steps.clear()
+        no_api = query_module.no_local_answer(
+            True,
+            "外部问题",
+            "本地知识库没有找到足够依据。",
+            config=api_config,
+            allow_api=False,
+        )
+        assert steps == ["search", "fetch"]
+        assert no_api["api_used"] is False
+        assert query_module.freshness_sensitive_question("DeepSeek 什么模型名即将停止使用？")
+    finally:
+        query_module.chat_completion = original_chat_completion
+        query_module.web_search = original_web_search
+        query_module.enrich_web_search_result = original_enrich_web_search_result
+
     original_search = query_module.search
     original_trigger_async_update = query_module.trigger_async_update
     original_web_search = query_module.web_search
@@ -318,6 +473,15 @@ AcWing 是一个算法交流平台。
             assert structured["web_search_used"] is False
             assert structured["answer"].count("\n- ") == 2
             assert "1.读取主板序列号" in structured["answer"]
+            shorthand = query_module.query(
+                db_path,
+                "FAT有哪些测试项及其对应的测试方案是什么",
+                use_web=True,
+                allow_api=False,
+            )
+            assert shorthand["retrieval_mode"] == "local_structured_table"
+            assert shorthand["answer"] == structured["answer"]
+            assert shorthand["cache_hit"] is True
         finally:
             query_module.trigger_async_update = original_trigger_async_update
             query_module.web_search = original_web_search

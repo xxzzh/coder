@@ -96,7 +96,11 @@ def health_payload() -> dict[str, Any]:
         "optional_extractors": extractors,
         "offline_translation": offline_translation_status(),
         "extraction_report": extraction,
-        "api_configured": env.get("LKA_USE_API", "false").lower() == "true" and bool(env.get("LKA_API_KEY")),
+        "api_configured": (
+            env.get("LKA_USE_API", "false").lower() == "true"
+            and bool(env.get("LKA_API_KEY"))
+            and bool(env.get("LKA_API_MODEL"))
+        ),
         "api_backend_usable": api_backend_allowed(env),
         "api_provider": env.get("LKA_API_PROVIDER", "none"),
         "scale_warning": chunks >= 50000,
@@ -111,7 +115,11 @@ def api_config_payload() -> dict[str, Any]:
         env.get("LKA_API_KEY", ""),
         env.get("LKA_API_PROVIDER", ""),
     )
-    configured = env.get("LKA_USE_API", "false").lower() == "true" and bool(env.get("LKA_API_KEY"))
+    configured = (
+        env.get("LKA_USE_API", "false").lower() == "true"
+        and bool(env.get("LKA_API_KEY"))
+        and bool(env.get("LKA_API_MODEL"))
+    )
     return {
         "configured": configured,
         "usable": configured and api_backend_allowed(env),
@@ -494,8 +502,8 @@ def page_html() -> str:
         <div class="row between">
           <h2>提问</h2>
           <div class="row">
-            <label class="check"><input id="allowApi" type="checkbox" checked> API 总结</label>
-            <label class="check"><input id="allowWeb" type="checkbox"> 联网兜底</label>
+            <label class="check"><input id="allowApi" type="checkbox" checked> API 精炼</label>
+            <label class="check"><input id="allowWeb" type="checkbox"> 联网研究（先抓网页）</label>
           </div>
         </div>
         <textarea id="question" placeholder="输入问题"></textarea>
@@ -1092,7 +1100,7 @@ class AgentHandler(BaseHTTPRequestHandler):
 
         started_at = time.monotonic()
         initial_status = (
-            "正在检索本地索引和联网资料，并准备整合引用..."
+            "正在检索本地索引；本地不足时将联网搜索、抓取网页正文并整理证据..."
             if use_web
             else "正在检索本地索引并整理引用..."
         )
