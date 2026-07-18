@@ -143,6 +143,8 @@ def build_vector_index(
         "ready": True,
         "reason": "ready",
         "backend": "faiss",
+        "index_type": "IndexFlatIP",
+        "metric": "cosine_on_normalized_vectors",
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "chunk_count": len(records),
         "dimension": dimension,

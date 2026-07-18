@@ -8,6 +8,7 @@ knowledge_base/vector/
 logs/
 output/
 tmp/
+tools/cache/
 
 .env
 .venv/

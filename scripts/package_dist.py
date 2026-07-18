@@ -50,10 +50,12 @@ def ensure_under_root(path: Path) -> Path:
     return resolved
 
 
-def ignore_generated(_: str, names: list[str]) -> set[str]:
+def ignore_generated(directory: str, names: list[str]) -> set[str]:
     ignored: set[str] = set()
     for name in names:
         path = Path(name)
+        if Path(directory).name == "tools" and name == "cache":
+            ignored.add(name)
         if name in EXCLUDED_DIR_NAMES or name in EXCLUDED_FILE_NAMES or path.suffix in EXCLUDED_SUFFIXES:
             ignored.add(name)
     return ignored

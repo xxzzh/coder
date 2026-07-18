@@ -12,6 +12,8 @@ from pathlib import Path
 
 from api_providers import read_env as read_api_env
 from configure_api import main as configure_api
+from configure_embedding import main as configure_embedding
+import project_runtime
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +70,7 @@ def run_update() -> int:
 
 
 def main() -> int:
+    project_runtime.apply_project_runtime_env()
     print("Local Knowledge Base Agent setup")
     print(f"Project: {ROOT}")
     print(f"Python: {sys.executable}")
@@ -88,12 +91,30 @@ def main() -> int:
         "LKA_API_KEY": "",
         "LKA_API_MODEL": "",
         "LKA_API_TIMEOUT_SECONDS": "20",
+        "LKA_EMBEDDING_ENABLED": "false",
+        "LKA_EMBEDDING_PROVIDER": "openai",
+        "LKA_EMBEDDING_BASE_URL": "https://api.openai.com/v1",
+        "LKA_EMBEDDING_API_KEY": "",
+        "LKA_EMBEDDING_MODEL": "text-embedding-3-large",
+        "LKA_EMBEDDING_DIMENSIONS": "3072",
+        "LKA_EMBEDDING_BATCH_SIZE": "32",
+        "LKA_VECTOR_BACKEND": "faiss",
+        "LKA_RERANK_ENABLED": "false",
+        "LKA_LLM_CHUNKING_ENABLED": "false",
+        "LKA_LLM_QUERY_ROUTING_ENABLED": "false",
     }
     if use_api:
         if configure_api() == 0:
-            values = read_api_env()
+            values = {**values, **read_api_env()}
         else:
             print("API 配置未完成，将保持纯本地回答模式。")
+
+    use_embedding = ask_yes_no("是否配置高质量 embedding API 用于 FAISS 向量检索？推荐使用 OpenAI text-embedding-3-large", default=False)
+    if use_embedding:
+        if configure_embedding() == 0:
+            values = {**values, **read_api_env()}
+        else:
+            print("Embedding 配置未完成，将保持本地 hash embedding 降级路径。")
 
     write_env(values)
     print(f"配置已写入: {ENV_PATH}")

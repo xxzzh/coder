@@ -33,6 +33,7 @@ from xml.etree import ElementTree
 from api_providers import chat_completion, token_plan_rejected
 from ingest_knowledge_base import ingest_in_progress, is_ignored_raw_file, raw_file_stat_fingerprint
 import model_capabilities
+import project_runtime
 from retrievers import abbreviation as abbreviation_retriever
 from retrievers import excel_table as excel_table_retriever
 from retrievers import station_test as station_test_retriever
@@ -41,6 +42,7 @@ import vector_store
 
 
 DB_PATH = Path("knowledge_base/index/knowledge.db")
+project_runtime.apply_project_runtime_env()
 RAW_DIR = Path("knowledge_base/raw")
 PROCESSED_DIR = Path("knowledge_base/processed")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -3747,7 +3749,7 @@ def synthesize_with_api(question: str, result: dict[str, Any], config: dict[str,
         return chinese_grounded_fallback(result)
 
     base_url = config.get("LKA_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = config.get("LKA_API_MODEL", "gpt-4o-mini")
+    model = config.get("LKA_API_MODEL", "gpt-5.2")
     timeout = int(config.get("LKA_API_TIMEOUT_SECONDS", str(DEFAULT_API_TIMEOUT_SECONDS)) or DEFAULT_API_TIMEOUT_SECONDS)
     messages = [
             {

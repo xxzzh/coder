@@ -58,7 +58,7 @@ Web UI 当前提供：流式提问进度、答案逐段输出、引用来源展�
 如果资料或联网搜索结果包含英文，安装一次离线英文到中文模型：
 
 ```bat
-python -m pip install -r requirements.txt
+.\run-agent.bat install-deps
 .\run-agent.bat translation-setup
 ```
 
@@ -121,10 +121,12 @@ python -m pip install -r requirements.txt
 
 | 命令 | 作用 |
 |---|---|
+| `install-deps` | 在项目内创建 `.venv`，并把依赖下载缓存放入 `tools/cache` |
 | `setup` | 交互式初始化，创建 `.env`，可选择配置 API |
 | `web` | 启动本地浏览器界面，默认只监听 `127.0.0.1` |
 | `translation-setup` | 下载并安装英文到中文离线翻译模型 |
 | `api-setup` | 识别 API 提供商、读取可用模型、选择模型并验证调用 |
+| `embedding-setup` | 配置高质量 embedding API，默认 OpenAI `text-embedding-3-large` |
 | `verify` / `healthcheck` | 检查 Python、SQLite FTS5、raw 文件、索引、API 配置 |
 | `update` | 增量更新知识库，只处理新增、修改、删除的资料 |
 | `rebuild` | 清理生成索引并从 raw 目录重新导入 |
@@ -141,7 +143,7 @@ LKA_USE_API=true
 LKA_API_PROVIDER=openai-compatible
 LKA_API_BASE_URL=https://api.openai.com/v1
 LKA_API_KEY=your_api_key_here
-LKA_API_MODEL=gpt-4o-mini
+LKA_API_MODEL=gpt-5.2
 LKA_API_TIMEOUT_SECONDS=20
 ```
 
@@ -159,11 +161,11 @@ API 默认用于“基于已召回引用的答案总结”。如果启用大模�
 
 ```env
 LKA_EMBEDDING_ENABLED=true
-LKA_EMBEDDING_PROVIDER=openai-compatible
-LKA_EMBEDDING_BASE_URL=https://your-api-base/v1
+LKA_EMBEDDING_PROVIDER=openai
+LKA_EMBEDDING_BASE_URL=https://api.openai.com/v1
 LKA_EMBEDDING_API_KEY=your_key
-LKA_EMBEDDING_MODEL=your-embedding-model
-LKA_EMBEDDING_DIMENSIONS=1024
+LKA_EMBEDDING_MODEL=text-embedding-3-large
+LKA_EMBEDDING_DIMENSIONS=3072
 LKA_VECTOR_BACKEND=faiss
 LKA_RERANK_ENABLED=true
 LKA_LLM_CHUNKING_ENABLED=true
@@ -173,9 +175,11 @@ LKA_LLM_QUERY_ROUTING_ENABLED=true
 行为规则：
 
 - Embedding 接口使用 OpenAI-compatible `/embeddings`，支持批量请求、重试、维度读取和失败回退。
-- 默认请求 1024 维；如果 API 实际返回其他维度，会以实际维度写入 `knowledge_base/vector/vector_metadata.json`。
+- 默认推荐 OpenAI `text-embedding-3-large`，请求 3072 维，优先质量和后续兼容性。
+- 如果 API 实际返回其他维度，会以实际维度写入 `knowledge_base/vector/vector_metadata.json`。
 - SQLite 继续保存文档、chunk、来源和元数据；FAISS 只保存向量索引文件。
 - 向量文件位于 `knowledge_base/vector/`，包含 `chunks.faiss`、`chunks_map.json` 和 `vector_metadata.json`。
+- 当前 FAISS 默认使用归一化向量 + `IndexFlatIP`，即精确 cosine 检索，不用近似算法牺牲召回质量。
 - 如果 embedding API、FAISS 或配置不可用，系统自动回退到 SQLite FTS5 + 本地 hash embedding，并在 healthcheck/Web UI 中显示降级原因。
 
 联网兜底会区分两种失败情况：
@@ -223,7 +227,35 @@ python scripts\query_knowledge_base.py "What is ACID?" --no-api
 - raw 文件变化检测和异步增量更新
 - 索引不可用时 FAQ 兜底
 
-FAISS 是本地文件型向量索引，不需要 Docker 或外部服务。对于没有 API key 或没有安装 FAISS 的环境，当前 SQLite + 本地 hash embedding 仍是稳定兜底路径。
+FAISS 是本地文件型向量索引，不需要 Docker 或外部服务。当前默认使用精确 `IndexFlatIP`，优先召回质量；当 chunk 规模明显增大时，再有意识地切换到 HNSW/IVF 这类近似索引。对于没有 API key 或没有安装 FAISS 的环境，当前 SQLite + 本地 hash embedding 仍是稳定兜底路径。
+
+## 项目本地依赖和下载目录
+
+推荐用项目命令安装依赖：
+
+```bat
+.\run-agent.bat install-deps
+```
+
+该命令会创建项目内虚拟环境：
+
+```text
+.venv/
+```
+
+并把下载缓存和模型缓存默认放到：
+
+```text
+tools/cache/
+  pip/
+  npm/
+  playwright-browsers/
+  huggingface/
+  torch/
+  argos/
+```
+
+`run-agent.bat` 和 `start.bat` 会优先使用 `.venv\Scripts\python.exe`，并设置 `PIP_CACHE_DIR`、`HF_HOME`、`PLAYWRIGHT_BROWSERS_PATH`、`NPM_CONFIG_CACHE`、`ARGOS_PACKAGE_DIR` 等环境变量，避免依赖和模型缓存散落到用户目录。
 
 ## 依赖
 
@@ -232,7 +264,7 @@ FAISS 是本地文件型向量索引，不需要 Docker 或外部服务。对于
 可选增强依赖列在 `requirements.txt`：
 
 ```bat
-python -m pip install -r requirements.txt
+.\run-agent.bat install-deps
 ```
 
 这些依赖用于改善 PDF 抽取、中文繁简转换、OCR、FAISS 向量检索和联网请求；没有安装时系统会走内置轻量逻辑或降级检索。
@@ -262,7 +294,7 @@ knowledge_base/processed/extraction_report.jsonl
 1. Python 可选依赖：
 
 ```bat
-python -m pip install -r requirements.txt
+.\run-agent.bat install-deps
 ```
 
 2. Tesseract OCR，并确保 `tesseract.exe` 在 PATH 中。

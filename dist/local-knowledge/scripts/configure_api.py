@@ -7,6 +7,7 @@ from __future__ import annotations
 import getpass
 import json
 
+import project_runtime
 from api_providers import (
     default_base_url,
     discover_models,
@@ -28,6 +29,7 @@ def choose(prompt: str, options: list[str], default: int = 1) -> str:
 
 
 def main() -> int:
+    project_runtime.apply_project_runtime_env()
     current = read_env()
     providers = provider_options()
     print("配置答案精炼 API")

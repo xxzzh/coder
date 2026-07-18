@@ -57,8 +57,11 @@ from manage_knowledge_base import sources as kb_sources  # noqa: E402
 from manage_knowledge_base import update as kb_update  # noqa: E402
 from ingest_knowledge_base import approve_review_file, is_ignored_raw_file, pending_review_reports  # noqa: E402
 import model_capabilities  # noqa: E402
+import project_runtime  # noqa: E402
 from query_knowledge_base import query as kb_query  # noqa: E402
 import vector_store  # noqa: E402
+
+project_runtime.apply_project_runtime_env()
 
 
 def raw_file_counts() -> dict[str, int]:

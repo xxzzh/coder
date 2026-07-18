@@ -9,6 +9,25 @@ set "OCR_EVAL=%ROOT%scripts\evaluate_ocr_test_materials.py"
 set "OCR_GEN=%ROOT%scripts\generate_ocr_test_materials.py"
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
+set "LKA_PROJECT_ROOT=%ROOT%"
+set "LKA_PROJECT_CACHE_DIR=%ROOT%tools\cache"
+set "PIP_CACHE_DIR=%ROOT%tools\cache\pip"
+set "XDG_CACHE_HOME=%ROOT%tools\cache\xdg-cache"
+set "XDG_DATA_HOME=%ROOT%tools\cache\xdg-data"
+set "HF_HOME=%ROOT%tools\cache\huggingface"
+set "HF_HUB_CACHE=%ROOT%tools\cache\huggingface\hub"
+set "TRANSFORMERS_CACHE=%ROOT%tools\cache\huggingface\transformers"
+set "TORCH_HOME=%ROOT%tools\cache\torch"
+set "PLAYWRIGHT_BROWSERS_PATH=%ROOT%tools\cache\playwright-browsers"
+set "NPM_CONFIG_CACHE=%ROOT%tools\cache\npm"
+set "ARGOS_PACKAGES_DIR=%ROOT%tools\cache\argos"
+set "ARGOS_PACKAGE_DIR=%ROOT%tools\cache\argos"
+if not exist "%ROOT%tools\cache" mkdir "%ROOT%tools\cache"
+if exist "%ROOT%.venv\Scripts\python.exe" (
+  set "PY=%ROOT%.venv\Scripts\python.exe"
+) else (
+  set "PY=python"
+)
 
 if not exist "%RAW%" mkdir "%RAW%"
 
@@ -30,6 +49,8 @@ echo  9. Run OCR test materials evaluation
 echo 10. Generate OCR test materials
 echo 11. Install offline English-to-Chinese translation model
 echo 12. Configure answer refinement API
+echo 13. Install project-local dependencies
+echo 14. Configure high-quality embedding API
 echo  0. Exit
 echo.
 set /p "CHOICE=Choose an option: "
@@ -46,6 +67,8 @@ if "%CHOICE%"=="9" goto ocr_eval
 if "%CHOICE%"=="10" goto ocr_generate
 if "%CHOICE%"=="11" goto translation_setup
 if "%CHOICE%"=="12" goto api_setup
+if "%CHOICE%"=="13" goto install_deps
+if "%CHOICE%"=="14" goto embedding_setup
 if "%CHOICE%"=="0" goto end
 
 echo.
@@ -125,7 +148,7 @@ if not exist "%OCR_EVAL%" (
   pause
   goto menu
 )
-python "%OCR_EVAL%"
+"%PY%" "%OCR_EVAL%"
 echo.
 pause
 goto menu
@@ -136,7 +159,7 @@ if not exist "%OCR_GEN%" (
   pause
   goto menu
 )
-python "%OCR_GEN%"
+"%PY%" "%OCR_GEN%"
 echo.
 pause
 goto menu
@@ -149,6 +172,18 @@ goto menu
 
 :api_setup
 call "%RUNNER%" api-setup
+echo.
+pause
+goto menu
+
+:install_deps
+call "%RUNNER%" install-deps
+echo.
+pause
+goto menu
+
+:embedding_setup
+call "%RUNNER%" embedding-setup
 echo.
 pause
 goto menu

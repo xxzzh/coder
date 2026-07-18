@@ -17,7 +17,8 @@ from api_providers import api_request, chat_completion, default_base_url, infer_
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
-DEFAULT_EMBEDDING_DIMENSIONS = 1024
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-large"
+DEFAULT_EMBEDDING_DIMENSIONS = 3072
 
 
 def read_env(path: Path = ENV_PATH) -> dict[str, str]:
@@ -70,11 +71,11 @@ def embedding_config(config: dict[str, str] | None = None) -> dict[str, Any]:
     provider = infer_provider(
         config.get("LKA_EMBEDDING_BASE_URL", ""),
         config.get("LKA_EMBEDDING_API_KEY", ""),
-        config.get("LKA_EMBEDDING_PROVIDER", "openai-compatible"),
+        config.get("LKA_EMBEDDING_PROVIDER", "openai"),
     )
     base_url = config.get("LKA_EMBEDDING_BASE_URL", "") or default_base_url(provider)
     api_key = config.get("LKA_EMBEDDING_API_KEY", "")
-    model = config.get("LKA_EMBEDDING_MODEL", "")
+    model = config.get("LKA_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
     try:
         dimensions = int(config.get("LKA_EMBEDDING_DIMENSIONS", DEFAULT_EMBEDDING_DIMENSIONS) or DEFAULT_EMBEDDING_DIMENSIONS)
     except ValueError:
@@ -243,4 +244,3 @@ def evaluate_answer(question: str, answer: str, sources: list[dict[str, Any]]) -
     if question.strip() and len(answer.strip()) < 4:
         issues.append("answer_too_short")
     return {"ok": not issues, "issues": issues}
-

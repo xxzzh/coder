@@ -13,6 +13,7 @@ from pathlib import Path
 from api_providers import infer_provider, token_plan_rejected
 from ingest_knowledge_base import extraction_reports, find_winword, is_ignored_raw_file, pending_review_reports
 import model_capabilities
+import project_runtime
 import vector_store
 
 
@@ -211,6 +212,7 @@ def retrieval_quality_report_stats() -> dict[str, object]:
 
 
 def main() -> int:
+    project_runtime.apply_project_runtime_env()
     env = load_env(ROOT / ".env")
     env = {**env, **{key: value for key, value in model_capabilities.runtime_config().items() if key not in env}}
     raw_files = [

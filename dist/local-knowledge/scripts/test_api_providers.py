@@ -24,7 +24,7 @@ class MockHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             assert payload["model"] == "mock-embedding"
-            assert payload["dimensions"] == 1024
+            assert payload["dimensions"] == 3072
             inputs = payload["input"]
             self.send_json(
                 {
@@ -87,7 +87,7 @@ def main() -> None:
                 "LKA_EMBEDDING_BASE_URL": base_url,
                 "LKA_EMBEDDING_API_KEY": "test-key",
                 "LKA_EMBEDDING_MODEL": "mock-embedding",
-                "LKA_EMBEDDING_DIMENSIONS": "1024",
+                "LKA_EMBEDDING_DIMENSIONS": "3072",
                 "LKA_EMBEDDING_BATCH_SIZE": "2",
                 "LKA_VECTOR_BACKEND": "faiss",
             },

@@ -25,13 +25,13 @@ PROVIDERS: dict[str, dict[str, Any]] = {
     "deepseek": {
         "name": "DeepSeek",
         "base_url": "https://api.deepseek.com",
-        "fallback_models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+        "fallback_models": ["deepseek-v4-pro", "deepseek-v4-flash"],
         "docs": "https://api-docs.deepseek.com/",
     },
     "openai": {
         "name": "OpenAI",
         "base_url": "https://api.openai.com/v1",
-        "fallback_models": ["gpt-5-mini", "gpt-5.2"],
+        "fallback_models": ["gpt-5.2", "gpt-5-mini"],
         "docs": "https://platform.openai.com/docs/models",
     },
     "openai-compatible": {

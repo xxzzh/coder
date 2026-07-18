@@ -7,8 +7,11 @@ from __future__ import annotations
 import json
 import sys
 
+import project_runtime
+
 
 def main() -> int:
+    project_runtime.apply_project_runtime_env()
     try:
         from argostranslate import package, translate
     except ImportError:

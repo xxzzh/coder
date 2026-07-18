@@ -17,18 +17,31 @@
 
 ```env
 LKA_EMBEDDING_ENABLED=true
-LKA_EMBEDDING_PROVIDER=openai-compatible
-LKA_EMBEDDING_BASE_URL=https://your-api-base/v1
+LKA_EMBEDDING_PROVIDER=openai
+LKA_EMBEDDING_BASE_URL=https://api.openai.com/v1
 LKA_EMBEDDING_API_KEY=your_key
-LKA_EMBEDDING_MODEL=your-embedding-model
-LKA_EMBEDDING_DIMENSIONS=1024
+LKA_EMBEDDING_MODEL=text-embedding-3-large
+LKA_EMBEDDING_DIMENSIONS=3072
 LKA_VECTOR_BACKEND=faiss
 LKA_RERANK_ENABLED=true
 LKA_LLM_CHUNKING_ENABLED=true
 LKA_LLM_QUERY_ROUTING_ENABLED=true
 ```
 
-默认请求 1024 维 embedding。如果 API 实际返回其他维度，系统以实际返回维度写入 `vector_metadata.json`，并按该维度构建 FAISS。
+默认推荐 OpenAI `text-embedding-3-large`，请求 3072 维 embedding。如果 API 实际返回其他维度，系统以实际返回维度写入 `vector_metadata.json`，并按该维度构建 FAISS。当前 FAISS 默认使用归一化向量 + `IndexFlatIP` 做精确 cosine 检索，优先召回质量；只有在 chunk 规模明显扩大、延迟成为瓶颈时，再切换 HNSW/IVF 等近似索引。
+
+## 项目本地下载目录
+
+项目命令会优先使用 `.venv/` 和 `tools/cache/`：
+
+- `.venv/`: Python 虚拟环境。
+- `tools/cache/pip`: pip 下载缓存。
+- `tools/cache/playwright-browsers`: Playwright 浏览器缓存。
+- `tools/cache/huggingface`: Hugging Face/Transformers 缓存。
+- `tools/cache/torch`: Torch 缓存。
+- `tools/cache/argos`: Argos 翻译模型缓存。
+
+推荐用 `.\run-agent.bat install-deps` 安装依赖，避免下载内容散落到用户目录。
 
 ## 降级规则
 
@@ -44,4 +57,3 @@ LKA_LLM_QUERY_ROUTING_ENABLED=true
 3. 将查询改写扩展为 2-5 个检索 query，并为不同 query type 配置不同召回权重。
 4. 把 rerank 从 chat JSON 排序升级为专用 rerank 模型或更严格的打分协议。
 5. 扩展答案质量检查，增加引用覆盖率、证据冲突和证据不足提示。
-
