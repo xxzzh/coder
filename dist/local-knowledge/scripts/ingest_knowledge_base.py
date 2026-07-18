@@ -73,12 +73,18 @@ def _pid_is_running(pid: int) -> bool:
     if os.name == "nt":
         try:
             import ctypes
+            from ctypes import wintypes
 
             process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-            if process:
+            if not process:
+                return False
+            try:
+                exit_code = wintypes.DWORD()
+                if not ctypes.windll.kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code)):
+                    return False
+                return exit_code.value == 259
+            finally:
                 ctypes.windll.kernel32.CloseHandle(process)
-                return True
-            return False
         except Exception:
             return False
     try:

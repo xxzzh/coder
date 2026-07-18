@@ -9,6 +9,7 @@ import json
 import threading
 
 from api_providers import chat_completion, discover_models, infer_provider, token_plan_rejected, validate_chat_model
+import model_capabilities
 from model_capabilities import embed_texts
 
 
@@ -98,6 +99,42 @@ def main() -> None:
         disabled = embed_texts(["x"], {"LKA_EMBEDDING_ENABLED": "false"})
         assert disabled["ok"] is False
         assert disabled["error"] == "embedding_not_configured"
+
+        original_dependency = model_capabilities.local_embedding_dependency_status
+        original_local_embed = model_capabilities.embed_texts_local
+
+        def fake_local_embed(texts: list[str], cfg: dict[str, object]) -> dict[str, object]:
+            assert texts == ["本地向量"]
+            assert cfg["provider"] == "local-bge-m3"
+            assert cfg["base_url"] == ""
+            assert cfg["api_key"] == ""
+            assert cfg["model"] == "BAAI/bge-m3"
+            assert cfg["requested_dimensions"] == 1024
+            return {
+                "ok": True,
+                "vectors": [[0.1, 0.2, 0.3]],
+                "dimension": 3,
+                "model": cfg["model"],
+                "provider": cfg["provider"],
+                "backend": cfg["backend"],
+            }
+
+        try:
+            model_capabilities.local_embedding_dependency_status = lambda: {"available": True, "error": None}
+            model_capabilities.embed_texts_local = fake_local_embed
+            local_embeddings = model_capabilities.embed_texts(
+                ["本地向量"],
+                {
+                    "LKA_EMBEDDING_ENABLED": "true",
+                    "LKA_EMBEDDING_PROVIDER": "local-bge-m3",
+                    "LKA_VECTOR_BACKEND": "faiss",
+                },
+            )
+            assert local_embeddings["ok"] is True
+            assert local_embeddings["provider"] == "local-bge-m3"
+        finally:
+            model_capabilities.local_embedding_dependency_status = original_dependency
+            model_capabilities.embed_texts_local = original_local_embed
     finally:
         server.shutdown()
         server.server_close()

@@ -2,7 +2,7 @@
 
 ## 当前实现
 
-本项目已从“离线可验证版”升级为“本地知识库 + 可选大模型能力层”的第一阶段架构。默认仍可在无 API key、无 FAISS 依赖的环境中运行；启用配置后，会使用 OpenAI-compatible embedding API 生成 dense embedding，并写入本地 FAISS 向量索引。
+本项目已从“离线可验证版”升级为“本地知识库 + 可选大模型能力层”的第一阶段架构。默认仍可在无 embedding API key 的环境中运行；启用配置后，会使用本地 `BAAI/bge-m3` 生成 dense embedding，并写入本地 FAISS 向量索引。DeepSeek 可继续用于答案生成、查询路由和 rerank。
 
 已落地能力：
 
@@ -17,18 +17,18 @@
 
 ```env
 LKA_EMBEDDING_ENABLED=true
-LKA_EMBEDDING_PROVIDER=openai
-LKA_EMBEDDING_BASE_URL=https://api.openai.com/v1
-LKA_EMBEDDING_API_KEY=your_key
-LKA_EMBEDDING_MODEL=text-embedding-3-large
-LKA_EMBEDDING_DIMENSIONS=3072
+LKA_EMBEDDING_PROVIDER=local-bge-m3
+LKA_EMBEDDING_BASE_URL=
+LKA_EMBEDDING_API_KEY=
+LKA_EMBEDDING_MODEL=BAAI/bge-m3
+LKA_EMBEDDING_DIMENSIONS=1024
 LKA_VECTOR_BACKEND=faiss
 LKA_RERANK_ENABLED=true
 LKA_LLM_CHUNKING_ENABLED=true
 LKA_LLM_QUERY_ROUTING_ENABLED=true
 ```
 
-默认推荐 OpenAI `text-embedding-3-large`，请求 3072 维 embedding。如果 API 实际返回其他维度，系统以实际返回维度写入 `vector_metadata.json`，并按该维度构建 FAISS。当前 FAISS 默认使用归一化向量 + `IndexFlatIP` 做精确 cosine 检索，优先召回质量；只有在 chunk 规模明显扩大、延迟成为瓶颈时，再切换 HNSW/IVF 等近似索引。
+默认推荐本地 `BAAI/bge-m3`，1024 维 embedding，不需要额外 embedding API key。如果 OpenAI-compatible API 实际返回其他维度，系统以实际返回维度写入 `vector_metadata.json`，并按该维度构建 FAISS。当前 FAISS 默认使用归一化向量 + `IndexFlatIP` 做精确 cosine 检索，优先召回质量；只有在 chunk 规模明显扩大、延迟成为瓶颈时，再切换 HNSW/IVF 等近似索引。
 
 ## 项目本地下载目录
 

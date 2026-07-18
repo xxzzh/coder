@@ -92,11 +92,11 @@ def main() -> int:
         "LKA_API_MODEL": "",
         "LKA_API_TIMEOUT_SECONDS": "20",
         "LKA_EMBEDDING_ENABLED": "false",
-        "LKA_EMBEDDING_PROVIDER": "openai",
-        "LKA_EMBEDDING_BASE_URL": "https://api.openai.com/v1",
+        "LKA_EMBEDDING_PROVIDER": "local-bge-m3",
+        "LKA_EMBEDDING_BASE_URL": "",
         "LKA_EMBEDDING_API_KEY": "",
-        "LKA_EMBEDDING_MODEL": "text-embedding-3-large",
-        "LKA_EMBEDDING_DIMENSIONS": "3072",
+        "LKA_EMBEDDING_MODEL": "BAAI/bge-m3",
+        "LKA_EMBEDDING_DIMENSIONS": "1024",
         "LKA_EMBEDDING_BATCH_SIZE": "32",
         "LKA_VECTOR_BACKEND": "faiss",
         "LKA_RERANK_ENABLED": "false",
@@ -109,7 +109,7 @@ def main() -> int:
         else:
             print("API 配置未完成，将保持纯本地回答模式。")
 
-    use_embedding = ask_yes_no("是否配置高质量 embedding API 用于 FAISS 向量检索？推荐使用 OpenAI text-embedding-3-large", default=False)
+    use_embedding = ask_yes_no("是否配置本地高质量 embedding 用于 FAISS 向量检索？推荐 BAAI/bge-m3", default=False)
     if use_embedding:
         if configure_embedding() == 0:
             values = {**values, **read_api_env()}

@@ -126,7 +126,7 @@ Web UI 当前提供：流式提问进度、答案逐段输出、引用来源展�
 | `web` | 启动本地浏览器界面，默认只监听 `127.0.0.1` |
 | `translation-setup` | 下载并安装英文到中文离线翻译模型 |
 | `api-setup` | 识别 API 提供商、读取可用模型、选择模型并验证调用 |
-| `embedding-setup` | 配置高质量 embedding API，默认 OpenAI `text-embedding-3-large` |
+| `embedding-setup` | 配置高质量 embedding，默认本地 `BAAI/bge-m3` |
 | `verify` / `healthcheck` | 检查 Python、SQLite FTS5、raw 文件、索引、API 配置 |
 | `update` | 增量更新知识库，只处理新增、修改、删除的资料 |
 | `rebuild` | 清理生成索引并从 raw 目录重新导入 |
@@ -153,7 +153,7 @@ LKA_API_TIMEOUT_SECONDS=20
 LKA_USE_API=false
 ```
 
-API 默认用于“基于已召回引用的答案总结”。如果启用大模型能力层，系统还可以调用 OpenAI-compatible embedding API 生成 dense embedding，并把结果写入本地 FAISS 索引；查询时优先合并 FAISS、SQLite FTS5、领域 retriever 和本地 hash embedding 候选，再进行 rerank。联网兜底不会让 API 脱离来源直接回答：系统会先搜索网页、抓取公开网页正文、对正文分块并做轻量 RAG 排序，再把整理后的引用交给 API 去重、精炼和生成中文答案。没有 API 时，系统会优先使用本地离线翻译生成中文答案。
+API 默认用于“基于已召回引用的答案总结”。如果启用大模型能力层，系统可以使用本地 `BAAI/bge-m3` 或 OpenAI-compatible embedding API 生成 dense embedding，并把结果写入本地 FAISS 索引；查询时优先合并 FAISS、SQLite FTS5、领域 retriever 和本地 hash embedding 候选，再进行 rerank。联网兜底不会让 API 脱离来源直接回答：系统会先搜索网页、抓取公开网页正文、对正文分块并做轻量 RAG 排序，再把整理后的引用交给 API 去重、精炼和生成中文答案。没有 API 时，系统会优先使用本地离线翻译生成中文答案。
 
 ### 大模型能力层
 
@@ -161,11 +161,11 @@ API 默认用于“基于已召回引用的答案总结”。如果启用大模�
 
 ```env
 LKA_EMBEDDING_ENABLED=true
-LKA_EMBEDDING_PROVIDER=openai
-LKA_EMBEDDING_BASE_URL=https://api.openai.com/v1
-LKA_EMBEDDING_API_KEY=your_key
-LKA_EMBEDDING_MODEL=text-embedding-3-large
-LKA_EMBEDDING_DIMENSIONS=3072
+LKA_EMBEDDING_PROVIDER=local-bge-m3
+LKA_EMBEDDING_BASE_URL=
+LKA_EMBEDDING_API_KEY=
+LKA_EMBEDDING_MODEL=BAAI/bge-m3
+LKA_EMBEDDING_DIMENSIONS=1024
 LKA_VECTOR_BACKEND=faiss
 LKA_RERANK_ENABLED=true
 LKA_LLM_CHUNKING_ENABLED=true
@@ -174,8 +174,8 @@ LKA_LLM_QUERY_ROUTING_ENABLED=true
 
 行为规则：
 
-- Embedding 接口使用 OpenAI-compatible `/embeddings`，支持批量请求、重试、维度读取和失败回退。
-- 默认推荐 OpenAI `text-embedding-3-large`，请求 3072 维，优先质量和后续兼容性。
+- Embedding 默认使用本地 `BAAI/bge-m3`，1024 维，不需要额外 embedding API key。
+- 也支持 OpenAI-compatible `/embeddings`，支持批量请求、重试、维度读取和失败回退。
 - 如果 API 实际返回其他维度，会以实际维度写入 `knowledge_base/vector/vector_metadata.json`。
 - SQLite 继续保存文档、chunk、来源和元数据；FAISS 只保存向量索引文件。
 - 向量文件位于 `knowledge_base/vector/`，包含 `chunks.faiss`、`chunks_map.json` 和 `vector_metadata.json`。
@@ -216,6 +216,7 @@ python scripts\query_knowledge_base.py "What is ACID?" --no-api
 
 - SQLite FTS5 全文检索
 - 本地 hash n-gram embedding
+- 本地 BGE-M3 dense embedding，可选
 - OpenAI-compatible dense embedding，可选
 - FAISS 本地向量索引，可选
 - 查询分类：缩写、Excel 表格、站位测试、代码/文档说明、普通 RAG

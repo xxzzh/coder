@@ -13,12 +13,17 @@ from pathlib import Path
 from typing import Any
 
 from api_providers import api_request, chat_completion, default_base_url, infer_provider, token_plan_rejected
+import project_runtime
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-large"
 DEFAULT_EMBEDDING_DIMENSIONS = 3072
+DEFAULT_LOCAL_EMBEDDING_MODEL = "BAAI/bge-m3"
+DEFAULT_LOCAL_EMBEDDING_DIMENSIONS = 1024
+LOCAL_EMBEDDING_PROVIDERS = {"local", "local-bge-m3", "sentence-transformers", "huggingface"}
+LOCAL_EMBEDDING_MODEL: Any = None
 
 
 def read_env(path: Path = ENV_PATH) -> dict[str, str]:
@@ -66,31 +71,58 @@ def enabled(config: dict[str, str], key: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def is_local_embedding_provider(provider: str) -> bool:
+    return provider.strip().lower() in LOCAL_EMBEDDING_PROVIDERS
+
+
+def local_embedding_dependency_status() -> dict[str, Any]:
+    try:
+        import sentence_transformers  # type: ignore  # noqa: F401
+        import torch  # type: ignore  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "error": str(exc)}
+    return {"available": True, "error": None}
+
+
 def embedding_config(config: dict[str, str] | None = None) -> dict[str, Any]:
     config = config or runtime_config()
-    provider = infer_provider(
-        config.get("LKA_EMBEDDING_BASE_URL", ""),
-        config.get("LKA_EMBEDDING_API_KEY", ""),
-        config.get("LKA_EMBEDDING_PROVIDER", "openai"),
-    )
-    base_url = config.get("LKA_EMBEDDING_BASE_URL", "") or default_base_url(provider)
-    api_key = config.get("LKA_EMBEDDING_API_KEY", "")
-    model = config.get("LKA_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+    raw_provider = config.get("LKA_EMBEDDING_PROVIDER", "openai").strip() or "openai"
+    if is_local_embedding_provider(raw_provider):
+        provider = raw_provider.lower()
+        base_url = ""
+        api_key = ""
+        model = config.get("LKA_EMBEDDING_MODEL", DEFAULT_LOCAL_EMBEDDING_MODEL) or DEFAULT_LOCAL_EMBEDDING_MODEL
+        default_dimensions = DEFAULT_LOCAL_EMBEDDING_DIMENSIONS
+    else:
+        provider = infer_provider(
+            config.get("LKA_EMBEDDING_BASE_URL", ""),
+            config.get("LKA_EMBEDDING_API_KEY", ""),
+            raw_provider,
+        )
+        base_url = config.get("LKA_EMBEDDING_BASE_URL", "") or default_base_url(provider)
+        api_key = config.get("LKA_EMBEDDING_API_KEY", "")
+        model = config.get("LKA_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+        default_dimensions = DEFAULT_EMBEDDING_DIMENSIONS
     try:
-        dimensions = int(config.get("LKA_EMBEDDING_DIMENSIONS", DEFAULT_EMBEDDING_DIMENSIONS) or DEFAULT_EMBEDDING_DIMENSIONS)
+        dimensions = int(config.get("LKA_EMBEDDING_DIMENSIONS", default_dimensions) or default_dimensions)
     except ValueError:
-        dimensions = DEFAULT_EMBEDDING_DIMENSIONS
+        dimensions = default_dimensions
     try:
         batch_size = max(1, min(int(config.get("LKA_EMBEDDING_BATCH_SIZE", "32") or 32), 128))
     except ValueError:
         batch_size = 32
-    usable = (
-        enabled(config, "LKA_EMBEDDING_ENABLED")
-        and bool(base_url)
-        and bool(api_key)
-        and bool(model)
-        and not token_plan_rejected(base_url, api_key)
-    )
+    if is_local_embedding_provider(provider):
+        dependency = local_embedding_dependency_status()
+        usable = enabled(config, "LKA_EMBEDDING_ENABLED") and bool(model) and bool(dependency["available"])
+    else:
+        dependency = None
+        usable = (
+            enabled(config, "LKA_EMBEDDING_ENABLED")
+            and bool(base_url)
+            and bool(api_key)
+            and bool(model)
+            and not token_plan_rejected(base_url, api_key)
+        )
     return {
         "enabled": enabled(config, "LKA_EMBEDDING_ENABLED"),
         "usable": usable,
@@ -101,6 +133,7 @@ def embedding_config(config: dict[str, str] | None = None) -> dict[str, Any]:
         "requested_dimensions": dimensions,
         "batch_size": batch_size,
         "backend": config.get("LKA_VECTOR_BACKEND", "faiss").strip().lower() or "faiss",
+        "local_dependency": dependency,
     }
 
 
@@ -110,7 +143,10 @@ def embedding_status(config: dict[str, str] | None = None) -> dict[str, Any]:
     if not cfg["enabled"]:
         return {**public, "ready": False, "reason": "disabled"}
     if not cfg["usable"]:
-        return {**public, "ready": False, "reason": "missing_or_invalid_embedding_config"}
+        reason = "missing_or_invalid_embedding_config"
+        if is_local_embedding_provider(str(cfg.get("provider", ""))) and cfg.get("local_dependency"):
+            reason = "local_embedding_dependency_missing"
+        return {**public, "ready": False, "reason": reason}
     return {**public, "ready": True, "reason": "ready"}
 
 
@@ -134,6 +170,8 @@ def embed_texts(
     cfg = embedding_config(config)
     if not cfg["usable"]:
         return {"ok": False, "vectors": [], "error": "embedding_not_configured", "config": embedding_status(config)}
+    if is_local_embedding_provider(str(cfg["provider"])):
+        return embed_texts_local(texts, cfg)
 
     vectors: list[list[float]] = []
     base_url = str(cfg["base_url"]).rstrip("/")
@@ -177,6 +215,39 @@ def embed_texts(
         "provider": cfg["provider"],
         "backend": cfg["backend"],
     }
+
+
+def embed_texts_local(texts: list[str], cfg: dict[str, Any]) -> dict[str, Any]:
+    global LOCAL_EMBEDDING_MODEL
+    project_runtime.apply_project_runtime_env()
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+
+        model_name = str(cfg["model"])
+        if LOCAL_EMBEDDING_MODEL is None or getattr(LOCAL_EMBEDDING_MODEL, "_lka_model_name", "") != model_name:
+            LOCAL_EMBEDDING_MODEL = SentenceTransformer(
+                model_name,
+                cache_folder=str(project_runtime.CACHE_DIR / "huggingface"),
+            )
+            setattr(LOCAL_EMBEDDING_MODEL, "_lka_model_name", model_name)
+        vectors_raw = LOCAL_EMBEDDING_MODEL.encode(
+            texts,
+            batch_size=int(cfg["batch_size"]),
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        vectors = [[float(value) for value in row] for row in vectors_raw.tolist()]
+        dimension = len(vectors[0]) if vectors else 0
+        return {
+            "ok": True,
+            "vectors": vectors,
+            "dimension": dimension,
+            "model": model_name,
+            "provider": cfg["provider"],
+            "backend": cfg["backend"],
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "vectors": [], "error": str(exc), "config": embedding_status()}
 
 
 def classify_query(question: str, config: dict[str, str] | None = None) -> dict[str, Any]:

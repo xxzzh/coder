@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Configure the high-quality OpenAI-compatible embedding backend."""
+"""Configure the high-quality embedding backend."""
 
 from __future__ import annotations
 
-import getpass
 import json
 
 import project_runtime
@@ -15,18 +14,31 @@ import model_capabilities
 def main() -> int:
     project_runtime.apply_project_runtime_env()
     current = read_env()
-    print("配置向量检索 Embedding API")
-    print("默认推荐：OpenAI text-embedding-3-large，3072 维，FAISS 本地精确检索。")
-    provider = input("Embedding provider [openai]: ").strip() or "openai"
-    base_url = input(f"Embedding base URL [{default_base_url(provider)}]: ").strip() or default_base_url(provider)
-    api_key = getpass.getpass("Embedding API key（输入时不会显示）: ").strip()
-    if not api_key:
-        print("未输入 API key，配置未变更。")
-        return 1
-    model = input(f"Embedding model [{model_capabilities.DEFAULT_EMBEDDING_MODEL}]: ").strip()
-    model = model or model_capabilities.DEFAULT_EMBEDDING_MODEL
-    dimensions = input(f"Embedding dimensions [{model_capabilities.DEFAULT_EMBEDDING_DIMENSIONS}]: ").strip()
-    dimensions = dimensions or str(model_capabilities.DEFAULT_EMBEDDING_DIMENSIONS)
+    print("配置向量检索 Embedding")
+    print("默认推荐：本地 BAAI/bge-m3，1024 维，FAISS 本地精确检索。")
+    print("DeepSeek 当前不提供 embeddings；DeepSeek key 继续用于答案生成、rerank 和查询路由。")
+    provider = input("Embedding provider [local-bge-m3]: ").strip() or "local-bge-m3"
+    local_provider = model_capabilities.is_local_embedding_provider(provider)
+    base_url = ""
+    api_key = ""
+    if not local_provider:
+        base_url = input(f"Embedding base URL [{default_base_url(provider)}]: ").strip() or default_base_url(provider)
+        api_key = input("Embedding API key: ").strip()
+        if not api_key:
+            print("未输入 API key，配置未变更。")
+            return 1
+    default_model = (
+        model_capabilities.DEFAULT_LOCAL_EMBEDDING_MODEL
+        if local_provider
+        else model_capabilities.DEFAULT_EMBEDDING_MODEL
+    )
+    default_dimensions = (
+        model_capabilities.DEFAULT_LOCAL_EMBEDDING_DIMENSIONS
+        if local_provider
+        else model_capabilities.DEFAULT_EMBEDDING_DIMENSIONS
+    )
+    model = input(f"Embedding model [{default_model}]: ").strip() or default_model
+    dimensions = input(f"Embedding dimensions [{default_dimensions}]: ").strip() or str(default_dimensions)
     values = {
         **current,
         "LKA_EMBEDDING_ENABLED": "true",
@@ -43,7 +55,7 @@ def main() -> int:
     }
     validation = model_capabilities.embed_texts(["本地知识库 embedding 配置验证"], values, retries=0)
     if not validation.get("ok"):
-        print("Embedding 调用验证失败，配置未保存：")
+        print("Embedding 验证失败，配置未保存：")
         print(validation.get("error"))
         return 2
     write_env(values)
@@ -67,4 +79,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
