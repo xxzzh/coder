@@ -23,6 +23,9 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
+import model_capabilities
+import vector_store
+
 
 SUPPORTED = {".md", ".txt", ".doc", ".docx", ".pdf", ".xlsx"}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -1433,6 +1436,82 @@ def write_retrieval_quality_report(conn: sqlite3.Connection, processed_dir: Path
     return report["summary"]
 
 
+def build_optional_vector_index(
+    conn: sqlite3.Connection,
+    indexed_at: str,
+    source_hash: str,
+    force: bool = False,
+) -> dict[str, Any]:
+    config = model_capabilities.runtime_config()
+    embedding = model_capabilities.embedding_config(config)
+    chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    existing_status = vector_store.vector_status(sqlite_chunk_count=int(chunk_count or 0))
+    if not force and existing_status.get("ready"):
+        metadata = existing_status.get("metadata", {})
+        return {
+            "ready": True,
+            "reason": "unchanged",
+            "backend": "faiss",
+            "chunk_count": int(metadata.get("chunk_count", 0) or 0),
+            "dimension": metadata.get("dimension"),
+            "model": metadata.get("model"),
+        }
+    if not embedding["enabled"]:
+        vector_store.reset_vector_index()
+        payload = vector_store.write_unavailable_metadata(
+            "embedding_disabled",
+            chunk_count=int(chunk_count or 0),
+            indexed_at=indexed_at,
+            source_fingerprint=source_hash,
+        )
+        return payload
+    if not embedding["usable"]:
+        vector_store.reset_vector_index()
+        payload = vector_store.write_unavailable_metadata(
+            "embedding_config_unusable",
+            chunk_count=int(chunk_count or 0),
+            indexed_at=indexed_at,
+            source_fingerprint=source_hash,
+            embedding_status=model_capabilities.embedding_status(config),
+        )
+        return payload
+
+    rows = conn.execute(
+        """
+        SELECT chunks.chunk_id, chunks.doc_id, chunks.chunk_index, chunks.text,
+               documents.file_name, documents.file_path, documents.file_type
+        FROM chunks
+        JOIN documents ON documents.doc_id = chunks.doc_id
+        ORDER BY documents.file_path, chunks.chunk_index
+        """
+    ).fetchall()
+    records = [dict(row) for row in rows]
+    embedded = model_capabilities.embed_texts([str(row["text"]) for row in records], config)
+    if not embedded.get("ok"):
+        vector_store.reset_vector_index()
+        payload = vector_store.write_unavailable_metadata(
+            "embedding_api_unavailable",
+            chunk_count=len(records),
+            indexed_at=indexed_at,
+            source_fingerprint=source_hash,
+            error=embedded.get("error"),
+            embedding_status=model_capabilities.embedding_status(config),
+        )
+        return payload
+    payload = vector_store.build_vector_index(
+        records,
+        embedded["vectors"],
+        {
+            "indexed_at": indexed_at,
+            "source_fingerprint": source_hash,
+            "provider": embedded.get("provider"),
+            "model": embedded.get("model"),
+            "requested_dimensions": embedding.get("requested_dimensions"),
+        },
+    )
+    return payload
+
+
 def source_fingerprint(raw_dir: Path) -> str:
     items: list[str] = []
     for path in sorted(raw_dir.rglob("*")):
@@ -1577,7 +1656,21 @@ def _ingest_unlocked(
         metadata_set(conn, "indexed_at", indexed_at)
     else:
         indexed_at = previous_indexed_at["value"]
-    metadata_set(conn, "source_fingerprint", source_fingerprint(raw_dir))
+    source_hash = source_fingerprint(raw_dir)
+    metadata_set(conn, "source_fingerprint", source_hash)
+    vector_index = build_optional_vector_index(
+        conn,
+        indexed_at,
+        source_hash,
+        force=bool(changed_doc_count or removed_count or reset),
+    )
+    metadata_set(conn, "vector_backend", str(vector_index.get("backend", "faiss")))
+    metadata_set(conn, "vector_index_status", "ready" if vector_index.get("ready") else "degraded")
+    metadata_set(conn, "vector_index_reason", str(vector_index.get("reason", "")))
+    if vector_index.get("model"):
+        metadata_set(conn, "vector_embedding_model", str(vector_index.get("model")))
+    if vector_index.get("dimension"):
+        metadata_set(conn, "vector_embedding_dimension", str(vector_index.get("dimension")))
     write_extraction_report(processed_dir, extraction_reports, current_paths)
     faq_count = write_processed_files(conn, processed_dir)
     quality_summary = write_retrieval_quality_report(conn, processed_dir)
@@ -1614,8 +1707,13 @@ def _ingest_unlocked(
         "faq_entries": faq_count,
         "quality_report": str(processed_dir / "retrieval_quality_report.json"),
         "quality_summary": quality_summary,
+        "vector_index": vector_index,
         "indexed_at": indexed_at,
         "embedding_model": f"local-hash-ngram-{EMBEDDING_DIMS}d",
+        "vector_backend": vector_index.get("backend", "faiss"),
+        "vector_index_status": "ready" if vector_index.get("ready") else "degraded",
+        "vector_embedding_model": vector_index.get("model"),
+        "vector_embedding_dimension": vector_index.get("dimension"),
         "chunk_strategy": "semantic-boundary-local-embedding",
         "semantic_candidate_strategy": "exact-scan-small-lsh-large",
         "unsupported_files": unsupported_raw_files(raw_dir),

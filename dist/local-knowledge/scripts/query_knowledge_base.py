@@ -32,10 +32,12 @@ from xml.etree import ElementTree
 
 from api_providers import chat_completion, token_plan_rejected
 from ingest_knowledge_base import ingest_in_progress, is_ignored_raw_file, raw_file_stat_fingerprint
+import model_capabilities
 from retrievers import abbreviation as abbreviation_retriever
 from retrievers import excel_table as excel_table_retriever
 from retrievers import station_test as station_test_retriever
 from retrievers.base import DomainRetriever
+import vector_store
 
 
 DB_PATH = Path("knowledge_base/index/knowledge.db")
@@ -612,6 +614,17 @@ def runtime_config() -> dict[str, str]:
         "LKA_API_KEY",
         "LKA_API_MODEL",
         "LKA_API_TIMEOUT_SECONDS",
+        "LKA_EMBEDDING_ENABLED",
+        "LKA_EMBEDDING_PROVIDER",
+        "LKA_EMBEDDING_BASE_URL",
+        "LKA_EMBEDDING_API_KEY",
+        "LKA_EMBEDDING_MODEL",
+        "LKA_EMBEDDING_DIMENSIONS",
+        "LKA_EMBEDDING_BATCH_SIZE",
+        "LKA_VECTOR_BACKEND",
+        "LKA_RERANK_ENABLED",
+        "LKA_LLM_CHUNKING_ENABLED",
+        "LKA_LLM_QUERY_ROUTING_ENABLED",
     ):
         if os.environ.get(key):
             config[key] = os.environ[key]
@@ -646,7 +659,22 @@ def api_cache_variant(config: dict[str, str], allow_api: bool) -> str:
 
 def query_cache_variant(config: dict[str, str], allow_api: bool, use_web: bool) -> str:
     web_part = "web-enabled" if use_web else "local-only"
-    return f"{web_part}:{api_cache_variant(config, allow_api)}"
+    embedding_part = "embedding-disabled"
+    if model_capabilities.enabled(config, "LKA_EMBEDDING_ENABLED"):
+        embedding_part = (
+            "embedding:"
+            + ":".join(
+                [
+                    config.get("LKA_EMBEDDING_PROVIDER", ""),
+                    config.get("LKA_EMBEDDING_BASE_URL", ""),
+                    config.get("LKA_EMBEDDING_MODEL", ""),
+                    config.get("LKA_EMBEDDING_DIMENSIONS", ""),
+                    config.get("LKA_VECTOR_BACKEND", ""),
+                ]
+            )
+        )
+    rerank_part = "rerank-on" if model_capabilities.enabled(config, "LKA_RERANK_ENABLED") else "rerank-off"
+    return f"{web_part}:{api_cache_variant(config, allow_api)}:{embedding_part}:{rerank_part}"
 
 
 def cache_key(question: str, limit: int, use_web: bool, variant: str = "local") -> str:
@@ -825,6 +853,57 @@ def lsh_semantic_candidates(
             scored.append((item["semantic_score"], item))
     scored.sort(key=lambda item: item[0], reverse=True)
     return [item for _, item in scored[: max(limit * 20, 100)]]
+
+
+def external_vector_candidates(
+    conn: sqlite3.Connection,
+    question: str,
+    limit: int,
+    config: dict[str, str],
+) -> list[dict[str, Any]]:
+    embedding_cfg = model_capabilities.embedding_config(config)
+    if embedding_cfg.get("backend") != "faiss" or not embedding_cfg.get("usable"):
+        return []
+    try:
+        sqlite_chunk_count = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] or 0)
+    except sqlite3.OperationalError:
+        sqlite_chunk_count = None
+    status = vector_store.vector_status(sqlite_chunk_count=sqlite_chunk_count)
+    if not status.get("ready"):
+        return []
+    embedded = model_capabilities.embed_texts([question], config)
+    if not embedded.get("ok") or not embedded.get("vectors"):
+        return []
+    vector_rows = vector_store.search_vector_index(embedded["vectors"][0], max(limit * 20, 100))
+    if not vector_rows.get("ok") or not vector_rows.get("rows"):
+        return []
+    score_by_chunk = {str(row["chunk_id"]): row for row in vector_rows["rows"]}
+    chunk_ids = list(score_by_chunk.keys())
+    placeholders = ",".join("?" for _ in chunk_ids)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT chunks.chunk_id, chunks.doc_id, chunks.chunk_index, documents.file_name,
+                   documents.file_path, documents.file_type, chunks.text, chunks.embedding,
+                   NULL AS fts_rank
+            FROM chunks
+            JOIN documents ON documents.doc_id = chunks.doc_id
+            WHERE chunks.chunk_id IN ({placeholders})
+            """,
+            chunk_ids,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    ranked: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        vector_row = score_by_chunk.get(str(item["chunk_id"]), {})
+        item["semantic_candidate_mode"] = "faiss"
+        item["vector_score"] = float(vector_row.get("vector_score", 0.0) or 0.0)
+        item["semantic_score"] = float(vector_row.get("semantic_score", item["vector_score"]) or 0.0)
+        ranked.append(item)
+    ranked.sort(key=lambda item: float(item.get("vector_score", 0.0) or 0.0), reverse=True)
+    return ranked
 
 
 def fallback_like_candidates(conn: sqlite3.Connection, question: str, limit: int) -> list[dict[str, Any]]:
@@ -1042,7 +1121,7 @@ def expand_section_context(
     return expanded
 
 
-def rerank(rows: list[dict[str, Any]], question: str, limit: int) -> list[dict[str, Any]]:
+def rerank(rows: list[dict[str, Any]], question: str, limit: int, config: dict[str, str] | None = None) -> list[dict[str, Any]]:
     terms = candidate_terms(question)
     query_embedding = local_embedding(question)
     merged: dict[str, dict[str, Any]] = {}
@@ -1054,6 +1133,10 @@ def rerank(rows: list[dict[str, Any]], question: str, limit: int) -> list[dict[s
             item["fts_rank"] = row["fts_rank"]
         if row.get("semantic_score") is not None:
             item["semantic_score"] = max(item.get("semantic_score", 0.0), row["semantic_score"])
+        if row.get("semantic_candidate_mode") == "faiss":
+            item["semantic_candidate_mode"] = "faiss"
+        if row.get("vector_score") is not None:
+            item["vector_score"] = max(float(item.get("vector_score", 0.0) or 0.0), float(row["vector_score"]))
         if row.get("term_score") is not None:
             item["term_score"] = max(item.get("term_score", 0), row["term_score"])
 
@@ -1080,24 +1163,52 @@ def rerank(rows: list[dict[str, Any]], question: str, limit: int) -> list[dict[s
             ranked.append(item)
 
     ranked.sort(key=lambda item: item["rerank_score"], reverse=True)
+    llm_rerank = model_capabilities.rerank_chunks(question, ranked, config)
+    if llm_rerank.get("ok") and llm_rerank.get("ordered_chunk_ids"):
+        by_id = {str(item["chunk_id"]): item for item in ranked}
+        ordered: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for chunk_id in llm_rerank["ordered_chunk_ids"]:
+            item = by_id.get(str(chunk_id))
+            if not item or str(chunk_id) in seen:
+                continue
+            item = item.copy()
+            item["llm_rerank_used"] = True
+            ordered.append(item)
+            seen.add(str(chunk_id))
+        ordered.extend(item for item in ranked if str(item["chunk_id"]) not in seen)
+        ranked = ordered
     return ranked[:limit]
 
 
-def search(db_path: Path, question: str, limit: int) -> tuple[list[dict[str, Any]], dict[str, str]]:
+def search(
+    db_path: Path,
+    question: str,
+    limit: int,
+    config: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    config = config or runtime_config()
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         metadata = get_metadata(conn)
         search_question = retrieval_question_with_aliases(question)
+        route = model_capabilities.classify_query(question, config)
         search_limit = max(limit, ITERATIVE_RETRIEVAL_LIMIT) if iterative_retrieval_question(question) else limit
         rows = [
+            *external_vector_candidates(conn, search_question, search_limit, config),
             *fts_candidates(conn, search_question, search_limit),
             *semantic_candidates(conn, search_question, search_limit, metadata),
             *fallback_like_candidates(conn, search_question, search_limit),
         ]
-        ranked = rerank(rows, search_question, search_limit)
+        ranked = rerank(rows, search_question, search_limit, config)
         ranked = expand_fft_manual_table_context(conn, ranked, question)
         ranked = expand_section_context(conn, ranked, question)
+        metadata = {
+            **metadata,
+            "query_route": json.dumps(route, ensure_ascii=False),
+            "vector_retrieval_used": "true" if any(row.get("semantic_candidate_mode") == "faiss" for row in ranked) else "false",
+        }
         return ranked, metadata
     finally:
         conn.close()
@@ -3928,7 +4039,7 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
         return result
 
     try:
-        rows, metadata = search(db_path, question, limit)
+        rows, metadata = search(db_path, question, limit, config)
     except sqlite3.DatabaseError:
         if cache_conn is not None:
             cache_conn.close()
@@ -3983,6 +4094,12 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
             "keyword_score": row["keyword_score"],
             "fts_score": row["fts_score"],
         }
+        if row.get("vector_score") is not None:
+            source["vector_score"] = row["vector_score"]
+        if row.get("semantic_candidate_mode"):
+            source["semantic_candidate_mode"] = row["semantic_candidate_mode"]
+        if row.get("llm_rerank_used"):
+            source["llm_rerank_used"] = True
         if row.get("context_chunk_ids"):
             source["context_chunk_ids"] = row["context_chunk_ids"]
         sources.append(source)
@@ -4006,7 +4123,15 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
         "embedding_model": metadata.get("embedding_model"),
         "chunk_strategy": metadata.get("chunk_strategy"),
         "semantic_candidate_strategy": metadata.get("semantic_candidate_strategy"),
-        "retrieval_mode": "hybrid_fts_semantic_keyword",
+        "vector_backend": metadata.get("vector_backend", "faiss"),
+        "vector_index_status": metadata.get("vector_index_status"),
+        "vector_index_reason": metadata.get("vector_index_reason"),
+        "vector_embedding_model": metadata.get("vector_embedding_model"),
+        "vector_embedding_dimension": metadata.get("vector_embedding_dimension"),
+        "query_route": json.loads(metadata.get("query_route", "{}") or "{}"),
+        "retrieval_mode": "hybrid_faiss_fts_semantic_keyword"
+        if metadata.get("vector_retrieval_used") == "true"
+        else "hybrid_fts_semantic_keyword",
         "async_update_scheduled": refresh_scheduled,
         "index_status": "updating" if refresh_scheduled else "ready",
         "cache_hit": False,
@@ -4016,6 +4141,7 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
         result["answer"] = structured_answer
         result["answer_mode"] = "local_structured_table_summary"
     result = finalize_answer(question, result, config, allow_api)
+    result["answer_quality"] = model_capabilities.evaluate_answer(question, str(result.get("answer", "")), result.get("sources") or [])
     apply_index_status(result, refresh_scheduled)
     if cache_conn is not None and not result.get("web_search_reason"):
         cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)

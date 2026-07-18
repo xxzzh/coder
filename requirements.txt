@@ -8,6 +8,10 @@ Pillow>=10.0.0
 pytesseract>=0.3.10
 openpyxl>=3.1.0
 requests>=2.32.0
+# Optional FAISS vector backend for API-provided dense embeddings. The app
+# automatically falls back to SQLite + local hash embeddings when unavailable.
+faiss-cpu>=1.8.0
+numpy>=1.26.0
 # Optional offline English-to-Chinese answer translation. Install the en -> zh
 # Argos model after installing this package.
 argostranslate>=1.11.0

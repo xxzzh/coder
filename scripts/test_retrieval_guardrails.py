@@ -12,7 +12,9 @@ import tempfile
 import zipfile
 
 import ingest_knowledge_base as ingest_module
+import model_capabilities
 import query_knowledge_base as query_module
+import vector_store
 from ingest_knowledge_base import read_xlsx
 from query_knowledge_base import (
     chunk_information_quality,
@@ -90,6 +92,14 @@ def main() -> None:
     assert query_module.query_cache_variant({}, allow_api=False, use_web=False) != query_module.query_cache_variant(
         {}, allow_api=False, use_web=True
     )
+    assert "embedding-disabled" in query_module.query_cache_variant({}, allow_api=False, use_web=False)
+    assert model_capabilities.classify_query("PR")["type"] == "abbreviation"
+    assert model_capabilities.classify_query("FRT站位有哪些测试项")["type"] == "excel_table"
+    assert model_capabilities.classify_query("LogMsgType有哪些值")["type"] == "code_or_document"
+    with tempfile.TemporaryDirectory() as temp_vector_dir:
+        vector_status = vector_store.vector_status(sqlite_chunk_count=0, vector_dir=Path(temp_vector_dir))
+        assert vector_status["ready"] is False
+        assert vector_status["reason"] in {"faiss_dependency_missing", "vector_index_missing"}
     assert query_module.station_test_item_question("FFT站位测试")
     assert query_module.canonical_question_for_cache("FFT站位测试") == "station:fft:items"
     assert query_module.canonical_question_for_cache("FFT站位测试项") == "station:fft:items"

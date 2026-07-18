@@ -2,7 +2,7 @@
 
 一个可本地运行的知识库问答 Agent。用户把原始资料放入 `knowledge_base/raw`，运行索引更新命令后，就可以通过命令行直接提问。
 
-当前定位：可交付给普通用户试用的本地 RAG 工具。它已经具备一键菜单、本地 Web UI、状态面板、安装配置、健康检查、多格式资料导入、OCR 抽取、语义分块、混合检索、缓存、增量索引和降级兜底能力；但它不是带多租户权限隔离和分布式向量数据库的生产级平台。
+当前定位：可交付给普通用户试用的本地 RAG 工具。它已经具备一键菜单、本地 Web UI、状态面板、安装配置、健康检查、多格式资料导入、OCR 抽取、语义分块、混合检索、缓存、增量索引和降级兜底能力；同时开始接入“大模型能力层”，用于 embedding、FAISS 向量召回、查询分类、rerank 和答案质量检查。它仍不是带多租户权限隔离和分布式向量数据库的生产级平台。
 
 ## 支持格式
 
@@ -53,7 +53,7 @@ start.bat
 http://127.0.0.1:8765/
 ```
 
-Web UI 当前提供：流式提问进度、答案逐段输出、引用来源展示、健康状态、OCR 状态、抽取待复核数量、增量更新、严格重建、OCR 评测、来源列表和 API 精炼配置。
+Web UI 当前提供：流式提问进度、答案逐段输出、引用来源展示、健康状态、OCR 状态、embedding/FAISS/rerank 状态、抽取待复核数量、增量更新、严格重建、向量索引重建、embedding API 验证、向量索引验证、检索诊断、OCR 评测、来源列表和 API 精炼配置。
 
 如果资料或联网搜索结果包含英文，安装一次离线英文到中文模型：
 
@@ -151,7 +151,32 @@ LKA_API_TIMEOUT_SECONDS=20
 LKA_USE_API=false
 ```
 
-API 只用于“基于已召回引用的答案总结”。检索、索引、缓存和引用都在本地完成。联网兜底不会让 API 脱离来源直接回答：系统会先搜索网页、抓取公开网页正文、对正文分块并做轻量 RAG 排序，再把整理后的引用交给 API 去重、精炼和生成中文答案。没有 API 时，系统会优先使用本地离线翻译生成中文答案。
+API 默认用于“基于已召回引用的答案总结”。如果启用大模型能力层，系统还可以调用 OpenAI-compatible embedding API 生成 dense embedding，并把结果写入本地 FAISS 索引；查询时优先合并 FAISS、SQLite FTS5、领域 retriever 和本地 hash embedding 候选，再进行 rerank。联网兜底不会让 API 脱离来源直接回答：系统会先搜索网页、抓取公开网页正文、对正文分块并做轻量 RAG 排序，再把整理后的引用交给 API 去重、精炼和生成中文答案。没有 API 时，系统会优先使用本地离线翻译生成中文答案。
+
+### 大模型能力层
+
+可选配置：
+
+```env
+LKA_EMBEDDING_ENABLED=true
+LKA_EMBEDDING_PROVIDER=openai-compatible
+LKA_EMBEDDING_BASE_URL=https://your-api-base/v1
+LKA_EMBEDDING_API_KEY=your_key
+LKA_EMBEDDING_MODEL=your-embedding-model
+LKA_EMBEDDING_DIMENSIONS=1024
+LKA_VECTOR_BACKEND=faiss
+LKA_RERANK_ENABLED=true
+LKA_LLM_CHUNKING_ENABLED=true
+LKA_LLM_QUERY_ROUTING_ENABLED=true
+```
+
+行为规则：
+
+- Embedding 接口使用 OpenAI-compatible `/embeddings`，支持批量请求、重试、维度读取和失败回退。
+- 默认请求 1024 维；如果 API 实际返回其他维度，会以实际维度写入 `knowledge_base/vector/vector_metadata.json`。
+- SQLite 继续保存文档、chunk、来源和元数据；FAISS 只保存向量索引文件。
+- 向量文件位于 `knowledge_base/vector/`，包含 `chunks.faiss`、`chunks_map.json` 和 `vector_metadata.json`。
+- 如果 embedding API、FAISS 或配置不可用，系统自动回退到 SQLite FTS5 + 本地 hash embedding，并在 healthcheck/Web UI 中显示降级原因。
 
 联网兜底会区分两种失败情况：
 
@@ -187,14 +212,18 @@ python scripts\query_knowledge_base.py "What is ACID?" --no-api
 
 - SQLite FTS5 全文检索
 - 本地 hash n-gram embedding
+- OpenAI-compatible dense embedding，可选
+- FAISS 本地向量索引，可选
+- 查询分类：缩写、Excel 表格、站位测试、代码/文档说明、普通 RAG
 - 语义分块
-- FTS + semantic cosine + keyword score 混合 rerank
+- FAISS + FTS + semantic cosine + keyword score 混合 rerank
+- 可选大模型 rerank 和答案质量检查
 - 联网网页正文抽取、分块和轻量 RAG rerank
 - 热门 Query 缓存
 - raw 文件变化检测和异步增量更新
 - 索引不可用时 FAQ 兜底
 
-当前没有接入独立向量数据库。对于小中型本地资料库，SQLite + 本地 embedding 更轻量；当 chunk 数量达到几万以上时，可以再迁移到 Qdrant、Milvus、Chroma 或 FAISS。
+FAISS 是本地文件型向量索引，不需要 Docker 或外部服务。对于没有 API key 或没有安装 FAISS 的环境，当前 SQLite + 本地 hash embedding 仍是稳定兜底路径。
 
 ## 依赖
 
@@ -206,7 +235,7 @@ python scripts\query_knowledge_base.py "What is ACID?" --no-api
 python -m pip install -r requirements.txt
 ```
 
-这些依赖用于改善 PDF 抽取和中文繁简转换；没有安装时系统会走内置轻量逻辑。
+这些依赖用于改善 PDF 抽取、中文繁简转换、OCR、FAISS 向量检索和联网请求；没有安装时系统会走内置轻量逻辑或降级检索。
 
 ## 扫描件、图片表格和复杂版式
 
@@ -290,5 +319,5 @@ python -m pip install -r requirements.txt
 ## 限制
 
 - 当前 Web UI 是本机单用户界面，不包含账号、用户权限和多租户隔离。
-- 当前没有独立向量数据库，超大规模知识库需要升级检索后端。
-- API 总结只基于本地召回引用，不会替代资料质量和索引质量。
+- 当前使用本地 FAISS 文件索引，不是多节点向量数据库；超大规模知识库仍需要升级检索后端。
+- API 生成和大模型增强只基于可追溯证据，不会替代资料质量和索引质量。

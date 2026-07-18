@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ingest_knowledge_base import DB_PATH, PROCESSED_DIR, IngestAlreadyRunningError, ingest
+import vector_store
 
 
 RAW_DIR = Path("knowledge_base/raw")
@@ -60,6 +61,12 @@ def sources(db_path: Path = DB_PATH) -> dict[str, Any]:
         "embedding_model": meta.get("embedding_model"),
         "chunk_strategy": meta.get("chunk_strategy"),
         "semantic_candidate_strategy": meta.get("semantic_candidate_strategy"),
+        "vector_backend": meta.get("vector_backend"),
+        "vector_index_status": meta.get("vector_index_status"),
+        "vector_index_reason": meta.get("vector_index_reason"),
+        "vector_embedding_model": meta.get("vector_embedding_model"),
+        "vector_embedding_dimension": meta.get("vector_embedding_dimension"),
+        "vector_index": vector_store.vector_status(sqlite_chunk_count=sum(int(item.get("chunk_count", 0) or 0) for item in items)),
         "documents": len(items),
         "indexed_documents": len([item for item in items if not item.get("duplicate_of")]),
         "duplicates": len(duplicate_items),
@@ -98,6 +105,7 @@ def rebuild(
     strict_extraction: bool = False,
 ) -> dict[str, Any]:
     safe_remove_generated(db_path, processed_dir)
+    vector_store.reset_vector_index()
     result = ingest(raw_dir, db_path, processed_dir, reset=True, strict_extraction=strict_extraction)
     return {"rebuilt": True, **result}
 

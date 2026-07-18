@@ -4,6 +4,7 @@ __pycache__/
 knowledge_base/index/
 knowledge_base/processed/
 knowledge_base/raw/
+knowledge_base/vector/
 logs/
 output/
 tmp/

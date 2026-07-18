@@ -12,6 +12,8 @@ from pathlib import Path
 
 from api_providers import infer_provider, token_plan_rejected
 from ingest_knowledge_base import extraction_reports, find_winword, is_ignored_raw_file, pending_review_reports
+import model_capabilities
+import vector_store
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +82,11 @@ def db_stats() -> dict[str, object]:
             "chunk_strategy": metadata.get("chunk_strategy"),
             "embedding_model": metadata.get("embedding_model"),
             "semantic_candidate_strategy": metadata.get("semantic_candidate_strategy"),
+            "vector_backend": metadata.get("vector_backend"),
+            "vector_index_status": metadata.get("vector_index_status"),
+            "vector_index_reason": metadata.get("vector_index_reason"),
+            "vector_embedding_model": metadata.get("vector_embedding_model"),
+            "vector_embedding_dimension": metadata.get("vector_embedding_dimension"),
         }
     except sqlite3.Error as exc:
         return {"exists": True, "error": str(exc)}
@@ -87,7 +94,7 @@ def db_stats() -> dict[str, object]:
 
 def optional_extractors() -> dict[str, object]:
     modules: dict[str, bool] = {}
-    for module_name in ("pypdf", "PyPDF2", "pdfplumber", "PIL", "pytesseract", "openpyxl"):
+    for module_name in ("pypdf", "PyPDF2", "pdfplumber", "PIL", "pytesseract", "openpyxl", "faiss", "numpy"):
         try:
             __import__(module_name)
             modules[module_name] = True
@@ -205,6 +212,7 @@ def retrieval_quality_report_stats() -> dict[str, object]:
 
 def main() -> int:
     env = load_env(ROOT / ".env")
+    env = {**env, **{key: value for key, value in model_capabilities.runtime_config().items() if key not in env}}
     raw_files = [
         path
         for path in RAW_DIR.rglob("*")
@@ -215,6 +223,9 @@ def main() -> int:
         counts[path.suffix.lower()] = counts.get(path.suffix.lower(), 0) + 1
 
     stats = db_stats()
+    sqlite_chunks = int(stats.get("chunks", 0) or 0) if isinstance(stats, dict) else 0
+    embedding = model_capabilities.embedding_status(env)
+    vector_index = vector_store.vector_status(sqlite_chunk_count=sqlite_chunks)
     configured = api_configured(env)
     checks = {
         "python_version": sys.version.split()[0],
@@ -229,6 +240,15 @@ def main() -> int:
         "online_translation": online_translation_status(env),
         "extraction_report": extraction_report_stats(),
         "retrieval_quality_report": retrieval_quality_report_stats(),
+        "embedding": embedding,
+        "vector_index": vector_index,
+        "llm_capabilities": {
+            "chunking_enabled": model_capabilities.enabled(env, "LKA_LLM_CHUNKING_ENABLED"),
+            "query_routing_enabled": model_capabilities.enabled(env, "LKA_LLM_QUERY_ROUTING_ENABLED"),
+            "rerank_enabled": model_capabilities.enabled(env, "LKA_RERANK_ENABLED"),
+            "degraded": not bool(vector_index.get("ready")) or not bool(embedding.get("ready")),
+            "degrade_reason": vector_index.get("reason") if not vector_index.get("ready") else embedding.get("reason"),
+        },
         "api_configured": configured,
         "api_backend_usable": api_backend_allowed(env),
         "api_provider": infer_provider(

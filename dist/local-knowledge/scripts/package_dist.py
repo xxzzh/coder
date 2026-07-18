@@ -25,6 +25,7 @@ ROOT_FILES = [
 
 ROOT_DIRS = [
     ".codex",
+    "docs",
     "scripts",
     "test_materials",
     "tools",

@@ -88,6 +88,35 @@ def parse_json_from_tail(step: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
+def check_vector_fallback(health_payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not health_payload:
+        return {"ok": False, "reason": "missing_health_payload"}
+    embedding = health_payload.get("embedding") or {}
+    vector_index = health_payload.get("vector_index") or {}
+    index = health_payload.get("index") or {}
+    embedding_ready = bool(embedding.get("ready"))
+    vector_ready = bool(vector_index.get("ready"))
+    if embedding_ready:
+        return {
+            "ok": vector_ready and bool(vector_index.get("aligned_with_sqlite", False)),
+            "mode": "faiss",
+            "embedding": embedding,
+            "vector_index": vector_index,
+        }
+    fallback_ok = (
+        index.get("exists") is True
+        and int(index.get("chunks", 0) or 0) > 0
+        and bool(index.get("embedding_model"))
+    )
+    return {
+        "ok": fallback_ok,
+        "mode": "local_hash_embedding_fallback",
+        "embedding": embedding,
+        "vector_index": vector_index,
+        "reason": vector_index.get("reason") or embedding.get("reason"),
+    }
+
+
 def main() -> int:
     checks: list[dict[str, Any]] = []
 
@@ -105,6 +134,7 @@ def main() -> int:
             "summary": health_payload,
         }
     )
+    checks.append({"id": "vector-or-fallback", **check_vector_fallback(health_payload)})
 
     guardrails = run_step([sys.executable, "scripts/test_retrieval_guardrails.py"])
     guardrails.pop("stdout", None)

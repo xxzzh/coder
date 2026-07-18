@@ -56,7 +56,9 @@ from manage_knowledge_base import rebuild as kb_rebuild  # noqa: E402
 from manage_knowledge_base import sources as kb_sources  # noqa: E402
 from manage_knowledge_base import update as kb_update  # noqa: E402
 from ingest_knowledge_base import approve_review_file, is_ignored_raw_file, pending_review_reports  # noqa: E402
+import model_capabilities  # noqa: E402
 from query_knowledge_base import query as kb_query  # noqa: E402
+import vector_store  # noqa: E402
 
 
 def raw_file_counts() -> dict[str, int]:
@@ -83,6 +85,8 @@ def health_payload() -> dict[str, Any]:
     raw_counts = raw_file_counts()
     unsupported_files = unsupported_raw_files()
     chunks = int(stats.get("chunks", 0) or 0) if isinstance(stats, dict) else 0
+    embedding = model_capabilities.embedding_status(env)
+    vector_index = vector_store.vector_status(sqlite_chunk_count=chunks)
     ok = (
         sqlite_has_fts5()
         and RAW_DIR.exists()
@@ -109,6 +113,15 @@ def health_payload() -> dict[str, Any]:
             "provider": env.get("LKA_API_PROVIDER", "none"),
         },
         "extraction_report": extraction,
+        "embedding": embedding,
+        "vector_index": vector_index,
+        "llm_capabilities": {
+            "chunking_enabled": model_capabilities.enabled(env, "LKA_LLM_CHUNKING_ENABLED"),
+            "query_routing_enabled": model_capabilities.enabled(env, "LKA_LLM_QUERY_ROUTING_ENABLED"),
+            "rerank_enabled": model_capabilities.enabled(env, "LKA_RERANK_ENABLED"),
+            "degraded": not bool(vector_index.get("ready")) or not bool(embedding.get("ready")),
+            "degrade_reason": vector_index.get("reason") if not vector_index.get("ready") else embedding.get("reason"),
+        },
         "api_configured": api_configured,
         "api_backend_usable": api_usable,
         "api_provider": env.get("LKA_API_PROVIDER", "none"),
@@ -200,6 +213,43 @@ def save_api_config(payload: dict[str, Any]) -> dict[str, Any]:
     )
     write_api_env(env)
     return {"ok": True, "provider": provider, "base_url": base_url.rstrip("/"), "model": model}
+
+
+def verify_embedding_api() -> dict[str, Any]:
+    config = model_capabilities.runtime_config()
+    result = model_capabilities.embed_texts(["本地知识库 embedding 连接测试"], config, retries=0)
+    public = {
+        key: value
+        for key, value in result.items()
+        if key not in {"vectors", "config"}
+    }
+    if result.get("config"):
+        public["config"] = result["config"]
+    if public.get("error"):
+        public["error"] = redact_secrets(str(public["error"]))
+    return {"ok": bool(result.get("ok")), **public}
+
+
+def verify_vector_index() -> dict[str, Any]:
+    stats = db_stats()
+    chunks = int(stats.get("chunks", 0) or 0) if isinstance(stats, dict) else 0
+    status = vector_store.vector_status(sqlite_chunk_count=chunks)
+    return {"ok": bool(status.get("ready")), "status": status}
+
+
+def retrieval_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
+    question = str(payload.get("question", "")).strip() or "本地知识库状态"
+    config = model_capabilities.runtime_config()
+    stats = db_stats()
+    chunks = int(stats.get("chunks", 0) or 0) if isinstance(stats, dict) else 0
+    return {
+        "ok": True,
+        "question": question,
+        "query_route": model_capabilities.classify_query(question, config),
+        "embedding": model_capabilities.embedding_status(config),
+        "vector_index": vector_store.vector_status(sqlite_chunk_count=chunks),
+        "rerank_enabled": model_capabilities.enabled(config, "LKA_RERANK_ENABLED"),
+    }
 
 
 def run_ocr_eval() -> dict[str, Any]:
@@ -585,6 +635,10 @@ def page_html() -> str:
           <button onclick="openRawFolder()">打开资料目录</button>
           <button onclick="runAction('/api/update', '增量更新')">增量更新</button>
           <button onclick="runAction('/api/rebuild-strict', '严格重建')">严格重建</button>
+          <button onclick="runAction('/api/vector-rebuild', '重建向量索引')">重建向量索引</button>
+          <button onclick="runAction('/api/embedding-verify', '验证 Embedding API')">验证 Embedding API</button>
+          <button onclick="runAction('/api/vector-verify', '验证向量索引')">验证向量索引</button>
+          <button onclick="runDiagnostics()">检索诊断</button>
           <button onclick="runAction('/api/ocr-eval', 'OCR 评测')">OCR 评测</button>
         </div>
       </div>
@@ -735,6 +789,9 @@ def page_html() -> str:
       const lines = [
         `索引时间：${formatShanghaiTimestamp(data.index?.indexed_at)}`,
         `分块：${data.index?.chunk_strategy || '-'}`,
+        `Embedding：${data.embedding?.enabled ? `${data.embedding?.provider || '-'} · ${data.embedding?.model || '-'} · ${data.embedding?.requested_dimensions || '-'}维` : '未启用'}`,
+        `向量库：${data.vector_index?.backend || 'faiss'} · ${data.vector_index?.ready ? 'ready' : `降级（${data.vector_index?.reason || '-'}）`}`,
+        `LLM 分块：${data.llm_capabilities?.chunking_enabled ? '开启' : '关闭'} · 查询路由：${data.llm_capabilities?.query_routing_enabled ? '开启' : '关闭'} · Rerank：${data.llm_capabilities?.rerank_enabled ? '开启' : '关闭'}`,
         `OCR：${ocrStatus(data)}`,
         `英译中：${translationStatus(data)}`,
         `API：${data.api_configured ? (data.api_backend_usable ? data.api_provider : '当前配置不可用于应用后端') : '未配置'}`
@@ -1015,6 +1072,19 @@ def page_html() -> str:
         setBusy(false);
       }
     }
+    async function runDiagnostics() {
+      const question = $('question').value.trim() || '本地知识库状态';
+      setBusy(true);
+      log('检索诊断开始', {question});
+      try {
+        const data = await api('/api/retrieval-diagnostics', {method: 'POST', body: JSON.stringify({question})});
+        log('检索诊断完成', data);
+      } catch (error) {
+        log('检索诊断失败', {error: error.message});
+      } finally {
+        setBusy(false);
+      }
+    }
     function clearAnswer() {
       $('question').value = '';
       $('answer').className = 'answer muted';
@@ -1107,6 +1177,16 @@ class AgentHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/rebuild-strict":
                 result = kb_rebuild(RAW_DIR, DB_PATH, ROOT / "knowledge_base" / "processed", strict_extraction=True)
                 self.send_json({"ok": True, "summary": compact_ingest_result(result), "result": result})
+            elif parsed.path == "/api/vector-rebuild":
+                vector_store.reset_vector_index()
+                result = kb_update(RAW_DIR, DB_PATH, ROOT / "knowledge_base" / "processed", strict_extraction=True)
+                self.send_json({"ok": True, "summary": compact_ingest_result(result), "result": result, "vector_index": verify_vector_index()})
+            elif parsed.path == "/api/embedding-verify":
+                self.send_json(verify_embedding_api())
+            elif parsed.path == "/api/vector-verify":
+                self.send_json(verify_vector_index())
+            elif parsed.path == "/api/retrieval-diagnostics":
+                self.send_json(retrieval_diagnostics(self.read_json()))
             elif parsed.path == "/api/ocr-eval":
                 self.send_json(run_ocr_eval())
             elif parsed.path == "/api/reviews/approve":
@@ -1300,6 +1380,11 @@ def compact_ingest_result(result: dict[str, Any]) -> dict[str, Any]:
         "unsupported_files",
         "quality_summary",
         "quality_report",
+        "vector_index_status",
+        "vector_index_reason",
+        "vector_backend",
+        "vector_embedding_model",
+        "vector_embedding_dimension",
         "indexed_at",
     )
     return {key: result.get(key) for key in keys if key in result}
