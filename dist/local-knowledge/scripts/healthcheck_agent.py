@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RAW_DIR = ROOT / "knowledge_base" / "raw"
 DB_PATH = ROOT / "knowledge_base" / "index" / "knowledge.db"
 EXTRACTION_REPORT = ROOT / "knowledge_base" / "processed" / "extraction_report.jsonl"
+QUALITY_REPORT = ROOT / "knowledge_base" / "processed" / "retrieval_quality_report.json"
 PROJECT_TESSDATA_DIR = ROOT / "tools" / "tessdata"
 SUPPORTED = {".md", ".txt", ".doc", ".docx", ".pdf", ".xlsx"}
 
@@ -78,6 +79,7 @@ def db_stats() -> dict[str, object]:
             "indexed_at": metadata.get("indexed_at"),
             "chunk_strategy": metadata.get("chunk_strategy"),
             "embedding_model": metadata.get("embedding_model"),
+            "semantic_candidate_strategy": metadata.get("semantic_candidate_strategy"),
         }
     except sqlite3.Error as exc:
         return {"exists": True, "error": str(exc)}
@@ -186,6 +188,21 @@ def extraction_report_stats() -> dict[str, object]:
     }
 
 
+def retrieval_quality_report_stats() -> dict[str, object]:
+    if not QUALITY_REPORT.exists():
+        return {"exists": False}
+    try:
+        payload = json.loads(QUALITY_REPORT.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"exists": True, "error": str(exc)}
+    return {
+        "exists": True,
+        "generated_at": payload.get("generated_at"),
+        "summary": payload.get("summary", {}),
+        "vector_index_recommendation": payload.get("vector_index_recommendation"),
+    }
+
+
 def main() -> int:
     env = load_env(ROOT / ".env")
     raw_files = [
@@ -211,6 +228,7 @@ def main() -> int:
         "offline_translation": offline_translation_status(),
         "online_translation": online_translation_status(env),
         "extraction_report": extraction_report_stats(),
+        "retrieval_quality_report": retrieval_quality_report_stats(),
         "api_configured": configured,
         "api_backend_usable": api_backend_allowed(env),
         "api_provider": infer_provider(

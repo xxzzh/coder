@@ -5,9 +5,12 @@ knowledge_base/index/
 knowledge_base/processed/
 knowledge_base/raw/
 logs/
+output/
+tmp/
 
 .env
 .venv/
 venv/
 .codex/skills/
 .playwright-cli/
+require.txt

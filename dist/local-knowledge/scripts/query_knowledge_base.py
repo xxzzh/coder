@@ -31,7 +31,11 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from xml.etree import ElementTree
 
 from api_providers import chat_completion, token_plan_rejected
-from ingest_knowledge_base import ingest_in_progress, is_ignored_raw_file
+from ingest_knowledge_base import ingest_in_progress, is_ignored_raw_file, raw_file_stat_fingerprint
+from retrievers import abbreviation as abbreviation_retriever
+from retrievers import excel_table as excel_table_retriever
+from retrievers import station_test as station_test_retriever
+from retrievers.base import DomainRetriever
 
 
 DB_PATH = Path("knowledge_base/index/knowledge.db")
@@ -50,16 +54,31 @@ WEB_PAGE_MAX_BYTES = 750_000
 WEB_PAGE_MAX_TEXT_CHARS = 60_000
 WEB_PAGE_CHUNK_CHARS = 900
 EMBEDDING_DIMS = 384
+VECTOR_INDEX_THRESHOLD_CHUNKS = 10_000
+VECTOR_CANDIDATE_MULTIPLIER = 80
+VECTOR_CANDIDATE_MIN = 400
+VECTOR_CANDIDATE_FALLBACK_MIN = 80
+EMBEDDING_LSH_BUCKETS = 12
+EMBEDDING_LSH_PAIR_BUCKETS = 4
 LOCAL_SCORE_THRESHOLD = 0.16
 HOT_QUERY_THRESHOLD = 2
 CACHE_TTL_SECONDS = 3600
+NEGATIVE_CACHE_TTL_SECONDS = 120
 DEFAULT_API_TIMEOUT_SECONDS = 20
 SECTION_CONTEXT_FORWARD_CHUNKS = 4
 SECTION_CONTEXT_MAX_CHARS = 3200
-CACHE_VARIANT_VERSION = "retrieval-v47:polished-internal-answer-colon"
+CACHE_VARIANT_VERSION = "retrieval-v52:validated-guidance-candidates"
 ITERATIVE_RETRIEVAL_LIMIT = 12
+EMBEDDING_CACHE: dict[str, Any] = {"key": None, "rows": []}
+EMBEDDING_CACHE_LOCK = threading.Lock()
 QUERY_TRAILING_PHRASES = (
     "分别是什么",
+    "是什么意思",
+    "什么意思",
+    "啥意思",
+    "代表什么",
+    "表示什么",
+    "含义是什么",
     "有哪些值",
     "有那些值",
     "有什么值",
@@ -72,6 +91,9 @@ QUERY_TRAILING_PHRASES = (
     "取值",
     "清单",
     "列表",
+    "的含义",
+    "含义",
+    "意思",
     "值",
 )
 QUERY_ALIAS_PHRASES = {
@@ -410,6 +432,67 @@ def cosine(left: dict[int, float], right: dict[int, float]) -> float:
     return sum(value * right.get(index, 0.0) for index, value in left.items())
 
 
+def embedding_lsh_buckets(embedding: dict[int, float]) -> list[str]:
+    top = sorted(embedding.items(), key=lambda item: abs(item[1]), reverse=True)[:EMBEDDING_LSH_BUCKETS]
+    buckets = [f"d:{index}:{1 if value >= 0 else 0}" for index, value in top]
+    pair_dims = top[:EMBEDDING_LSH_PAIR_BUCKETS]
+    for left_index in range(len(pair_dims)):
+        for right_index in range(left_index + 1, len(pair_dims)):
+            left = pair_dims[left_index]
+            right = pair_dims[right_index]
+            buckets.append(
+                "p:"
+                + ":".join(
+                    [
+                        str(min(left[0], right[0])),
+                        str(max(left[0], right[0])),
+                        str(1 if left[1] >= 0 else 0),
+                        str(1 if right[1] >= 0 else 0),
+                    ]
+                )
+            )
+    return list(dict.fromkeys(buckets))
+
+
+def embedding_cache_key(conn: sqlite3.Connection, metadata: dict[str, str]) -> str:
+    try:
+        chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    except sqlite3.OperationalError:
+        chunk_count = 0
+    try:
+        db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+    except Exception:
+        db_file = str(DB_PATH)
+    return f"{Path(db_file or ':memory:').resolve()}:{metadata.get('indexed_at', '')}:{chunk_count}"
+
+
+def cached_embedding_rows(conn: sqlite3.Connection, metadata: dict[str, str]) -> list[dict[str, Any]]:
+    key = embedding_cache_key(conn, metadata)
+    with EMBEDDING_CACHE_LOCK:
+        if EMBEDDING_CACHE.get("key") == key:
+            return [row.copy() for row in EMBEDDING_CACHE.get("rows", [])]
+
+    rows = conn.execute(
+        """
+        SELECT chunks.chunk_id, chunks.doc_id, chunks.chunk_index, documents.file_name,
+               documents.file_path, documents.file_type, chunks.text, chunks.embedding,
+               NULL AS fts_rank
+        FROM chunks
+        JOIN documents ON documents.doc_id = chunks.doc_id
+        """
+    ).fetchall()
+    cached_rows: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["embedding_vector"] = parse_embedding(item.get("embedding", ""))
+        cached_rows.append(item)
+
+    with EMBEDDING_CACHE_LOCK:
+        EMBEDDING_CACHE["key"] = key
+        EMBEDDING_CACHE["rows"] = cached_rows
+    return [row.copy() for row in cached_rows]
+
+
 def fts_query(question: str) -> str:
     terms = candidate_terms(question)
     if not terms:
@@ -454,9 +537,7 @@ def source_fingerprint(raw_dir: Path = RAW_DIR) -> str:
         return ""
     for path in sorted(raw_dir.rglob("*")):
         if path.is_file() and not is_ignored_raw_file(path) and path.suffix.lower() in supported:
-            rel_path = str(path.relative_to(raw_dir)).replace("\\", "/")
-            stat = path.stat()
-            items.append(f"{rel_path}:{stat.st_size}:{int(stat.st_mtime)}")
+            items.append(raw_file_stat_fingerprint(path, raw_dir))
     return hashlib.sha256("\n".join(items).encode("utf-8")).hexdigest()
 
 
@@ -499,6 +580,14 @@ def trigger_async_update(db_path: Path = DB_PATH, raw_dir: Path = RAW_DIR, proce
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     return True
+
+
+def apply_index_status(result: dict[str, Any], refresh_scheduled: bool) -> dict[str, Any]:
+    result["async_update_scheduled"] = bool(refresh_scheduled)
+    result["index_status"] = "updating" if refresh_scheduled else result.get("index_status", "ready")
+    if refresh_scheduled:
+        result["index_message"] = "资料已变化，正在后台更新，稍后重试可得到最新结果。"
+    return result
 
 
 def load_env_file(path: Path = ENV_PATH) -> dict[str, str]:
@@ -545,12 +634,19 @@ def api_backend_allowed(config: dict[str, str]) -> bool:
 
 
 def api_cache_variant(config: dict[str, str], allow_api: bool) -> str:
-    if not allow_api or not api_enabled(config):
-        return CACHE_VARIANT_VERSION
+    if not allow_api:
+        return f"{CACHE_VARIANT_VERSION}:no-api"
+    if not api_enabled(config):
+        return f"{CACHE_VARIANT_VERSION}:api-disabled"
     provider = config.get("LKA_API_PROVIDER", "openai-compatible")
     base_url = config.get("LKA_API_BASE_URL", "")
     model = config.get("LKA_API_MODEL", "")
-    return f"{CACHE_VARIANT_VERSION}-api:{provider}:{base_url}:{model}"
+    return f"{CACHE_VARIANT_VERSION}:api-refined:{provider}:{base_url}:{model}"
+
+
+def query_cache_variant(config: dict[str, str], allow_api: bool, use_web: bool) -> str:
+    web_part = "web-enabled" if use_web else "local-only"
+    return f"{web_part}:{api_cache_variant(config, allow_api)}"
 
 
 def cache_key(question: str, limit: int, use_web: bool, variant: str = "local") -> str:
@@ -574,8 +670,12 @@ def cache_get(
     if not row or row["index_version"] != index_version:
         return None
 
+    result = json.loads(row["answer_json"])
+    ttl_seconds = NEGATIVE_CACHE_TTL_SECONDS if (
+        result.get("source_type") == "none" or not result.get("sources")
+    ) else CACHE_TTL_SECONDS
     updated_at = datetime.fromisoformat(row["updated_at"])
-    if (datetime.now(timezone.utc) - updated_at).total_seconds() > CACHE_TTL_SECONDS:
+    if (datetime.now(timezone.utc) - updated_at).total_seconds() > ttl_seconds:
         return None
 
     hit_count = int(row["hit_count"] or 0) + 1
@@ -587,7 +687,6 @@ def cache_get(
     if hit_count < HOT_QUERY_THRESHOLD:
         return None
 
-    result = json.loads(row["answer_json"])
     if result.get("web_search_used") and not result.get("sources"):
         return None
     if result.get("web_search_used"):
@@ -657,23 +756,70 @@ def fts_candidates(conn: sqlite3.Connection, question: str, limit: int) -> list[
     return [dict(row) for row in rows]
 
 
-def semantic_candidates(conn: sqlite3.Connection, question: str, limit: int) -> list[dict[str, Any]]:
+def semantic_candidates(
+    conn: sqlite3.Connection,
+    question: str,
+    limit: int,
+    metadata: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     query_embedding = local_embedding(question)
     if not query_embedding:
         return []
 
-    rows = conn.execute(
-        """
-        SELECT chunks.chunk_id, chunks.doc_id, chunks.chunk_index, documents.file_name,
-               documents.file_path, documents.file_type, chunks.text, chunks.embedding,
-               NULL AS fts_rank
-        FROM chunks
-        JOIN documents ON documents.doc_id = chunks.doc_id
-        """
-    ).fetchall()
+    try:
+        chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    except sqlite3.OperationalError:
+        chunk_count = 0
+    if chunk_count >= VECTOR_INDEX_THRESHOLD_CHUNKS:
+        lsh_rows = lsh_semantic_candidates(conn, query_embedding, limit)
+        if len(lsh_rows) >= min(VECTOR_CANDIDATE_FALLBACK_MIN, max(limit * 5, 20)):
+            return lsh_rows
+
+    rows = cached_embedding_rows(conn, metadata or get_metadata(conn))
     scored: list[tuple[float, dict[str, Any]]] = []
     for row in rows:
         item = dict(row)
+        item["semantic_score"] = cosine(query_embedding, item.get("embedding_vector") or parse_embedding(item.get("embedding", "")))
+        if item["semantic_score"] > 0:
+            scored.append((item["semantic_score"], item))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [item for _, item in scored[: max(limit * 20, 100)]]
+
+
+def lsh_semantic_candidates(
+    conn: sqlite3.Connection,
+    query_embedding: dict[int, float],
+    limit: int,
+) -> list[dict[str, Any]]:
+    buckets = embedding_lsh_buckets(query_embedding)
+    if not buckets:
+        return []
+    placeholders = ",".join("?" for _ in buckets)
+    candidate_limit = max(limit * VECTOR_CANDIDATE_MULTIPLIER, VECTOR_CANDIDATE_MIN)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT chunks.chunk_id, chunks.doc_id, chunks.chunk_index, documents.file_name,
+                   documents.file_path, documents.file_type, chunks.text, chunks.embedding,
+                   NULL AS fts_rank,
+                   COUNT(embedding_lsh.bucket) AS vector_bucket_hits
+            FROM embedding_lsh
+            JOIN chunks ON chunks.chunk_id = embedding_lsh.chunk_id
+            JOIN documents ON documents.doc_id = chunks.doc_id
+            WHERE embedding_lsh.bucket IN ({placeholders})
+            GROUP BY chunks.chunk_id
+            ORDER BY vector_bucket_hits DESC
+            LIMIT ?
+            """,
+            (*buckets, candidate_limit),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for row in rows:
+        item = dict(row)
+        item["semantic_candidate_mode"] = "lsh"
         item["semantic_score"] = cosine(query_embedding, parse_embedding(item.get("embedding", "")))
         if item["semantic_score"] > 0:
             scored.append((item["semantic_score"], item))
@@ -686,6 +832,13 @@ def fallback_like_candidates(conn: sqlite3.Connection, question: str, limit: int
     if not terms:
         return []
 
+    try:
+        chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    except sqlite3.OperationalError:
+        chunk_count = 0
+    if chunk_count >= VECTOR_INDEX_THRESHOLD_CHUNKS:
+        return sql_like_candidates(conn, terms, limit)
+
     rows = conn.execute(
         """
         SELECT chunks.chunk_id, chunks.doc_id, chunks.chunk_index, documents.file_name,
@@ -695,6 +848,38 @@ def fallback_like_candidates(conn: sqlite3.Connection, question: str, limit: int
         JOIN documents ON documents.doc_id = chunks.doc_id
         """
     ).fetchall()
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for row in rows:
+        item = dict(row)
+        score = sentence_score(item["text"], terms)
+        if score > 0:
+            item["term_score"] = score
+            scored.append((score, item))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [item for _, item in scored[: max(limit * 12, 60)]]
+
+
+def sql_like_candidates(conn: sqlite3.Connection, terms: list[str], limit: int) -> list[dict[str, Any]]:
+    selected_terms = terms[:10]
+    if not selected_terms:
+        return []
+    where_clause = " OR ".join("chunks.text LIKE ?" for _ in selected_terms)
+    params = [f"%{term}%" for term in selected_terms]
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT chunks.chunk_id, chunks.doc_id, chunks.chunk_index, documents.file_name,
+                   documents.file_path, documents.file_type, chunks.text, chunks.embedding,
+                   NULL AS fts_rank
+            FROM chunks
+            JOIN documents ON documents.doc_id = chunks.doc_id
+            WHERE {where_clause}
+            LIMIT ?
+            """,
+            (*params, max(limit * 40, 240)),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
     scored: list[tuple[int, dict[str, Any]]] = []
     for row in rows:
         item = dict(row)
@@ -907,7 +1092,7 @@ def search(db_path: Path, question: str, limit: int) -> tuple[list[dict[str, Any
         search_limit = max(limit, ITERATIVE_RETRIEVAL_LIMIT) if iterative_retrieval_question(question) else limit
         rows = [
             *fts_candidates(conn, search_question, search_limit),
-            *semantic_candidates(conn, search_question, search_limit),
+            *semantic_candidates(conn, search_question, search_limit, metadata),
             *fallback_like_candidates(conn, search_question, search_limit),
         ]
         ranked = rerank(rows, search_question, search_limit)
@@ -1160,7 +1345,7 @@ def requested_station_name(question: str) -> str | None:
 
 
 def canonical_question_for_cache(question: str) -> str:
-    normalized = normalize_search_question(question)
+    normalized = normalize_search_question(normalized_retrieval_question(question))
     abbreviation = abbreviation_query_term(normalized)
     if abbreviation:
         return f"abbreviation:{abbreviation.lower()}"
@@ -3085,6 +3270,263 @@ def synthesis_citations(result: dict[str, Any]) -> list[dict[str, Any]]:
     return citations
 
 
+def evidence_terms(text: str) -> set[str]:
+    lowered = text.lower()
+    terms = set(re.findall(r"[a-z0-9_]{3,}", lowered))
+    for block in re.findall(r"[\u4e00-\u9fff]+", text):
+        if len(block) <= 4:
+            terms.add(block)
+        for size in (2, 3, 4):
+            terms.update(block[index : index + size] for index in range(max(0, len(block) - size + 1)))
+    return {term for term in terms if term and term not in STOP_WORDS and term not in ENGLISH_QUERY_STOP_WORDS}
+
+
+def citation_validation(result: dict[str, Any]) -> dict[str, Any]:
+    citations = result.get("citations") or synthesis_citations(result)
+    citation_ids = {int(item["source_id"]) for item in citations if str(item.get("source_id", "")).isdigit()}
+    source_ids = {int(item["source_id"]) for item in result.get("sources", []) if str(item.get("source_id", "")).isdigit()}
+    allowed_ids = citation_ids | source_ids
+    answer = str(result.get("answer", ""))
+    referenced_ids = {int(match) for match in re.findall(r"\[(\d+)\]", answer)}
+    issues: list[str] = []
+    warnings: list[str] = []
+    if referenced_ids and not referenced_ids <= allowed_ids:
+        issues.append("answer_references_missing_source_id")
+    if citations and result.get("api_used") and not referenced_ids:
+        warnings.append("api_answer_missing_citation_marker")
+
+    quotes_by_id = {
+        int(item["source_id"]): str(item.get("quote") or item.get("citation") or "")
+        for item in citations
+        if str(item.get("source_id", "")).isdigit()
+    }
+    for sentence in re.split(r"(?<=[。！？.!?])\s+|\n+", answer):
+        ids = [int(match) for match in re.findall(r"\[(\d+)\]", sentence)]
+        if not ids:
+            continue
+        sentence_terms = evidence_terms(re.sub(r"\[\d+\]", "", sentence))
+        if len(sentence_terms) < 3:
+            continue
+        quote_terms: set[str] = set()
+        for source_id in ids:
+            quote_terms.update(evidence_terms(quotes_by_id.get(source_id, "")))
+        overlap = sentence_terms & quote_terms
+        if len(overlap) < min(3, max(1, len(sentence_terms) // 5)):
+            warnings.append("cited_sentence_not_clearly_supported")
+            break
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "warnings": warnings,
+        "referenced_source_ids": sorted(referenced_ids),
+    }
+
+
+def attach_query_structure(question: str, result: dict[str, Any]) -> dict[str, Any]:
+    if "query" not in result:
+        result["query"] = {
+            "original": question,
+            "normalized": normalize_search_question(question),
+            "canonical": canonical_question_for_cache(question),
+            "web_query": web_query(question),
+        }
+    return result
+
+
+def guidance_query_subject(question: str) -> str:
+    normalized = normalize_search_question(normalized_retrieval_question(question)).strip()
+    normalized = re.sub(r"[，。！？?；;：:\s]+", " ", normalized).strip()
+    station = requested_station_name(normalized)
+    if station and station_test_item_question(normalized):
+        return station.upper() if re.fullmatch(r"[A-Za-z0-9_-]+", station) else station
+    normalized = re.sub(r"^(?:请问|我想问|想问|帮我查一下|帮我查|查询一下|查询|查一下|查|关于)\s*", "", normalized).strip()
+    normalized = re.sub(r"^(?:我的|我)\s*", "", normalized).strip()
+    for _ in range(3):
+        reduced = re.sub(
+            r"(?:是什么|是啥|是多少|有哪些|有那些|有什么|怎么查|如何查|是|为|吗|呢)$",
+            "",
+            normalized,
+        ).strip()
+        if reduced == normalized:
+            break
+        normalized = reduced
+    return normalized or question.strip()
+
+
+def verified_local_suggestions(db_path: Path | None, question: str, subject: str) -> list[str]:
+    if db_path is None or not db_path.exists():
+        return []
+    suggestions: list[str] = []
+    abbreviation = abbreviation_query_term(subject)
+    if abbreviation and structured_abbreviation_result(db_path, abbreviation) is not None:
+        suggestions.append(f"{abbreviation}是什么")
+    station = requested_station_name(question)
+    if station:
+        station_question = f"{station}有哪些测试项"
+        if (
+            structured_fft_station_result(db_path, station_question) is not None
+            or structured_station_result(db_path, station_question) is not None
+        ):
+            suggestions.append(station_question)
+    return list(dict.fromkeys(suggestions))[:3]
+
+
+def local_candidate_has_answer(db_path: Path | None, question: str) -> bool:
+    if db_path is None or not db_path.exists():
+        return False
+    abbreviation = abbreviation_query_term(question)
+    if abbreviation and structured_abbreviation_result(db_path, abbreviation) is not None:
+        return True
+    station = requested_station_name(question)
+    if station and station_test_item_question(question):
+        return (
+            structured_fft_station_result(db_path, question) is not None
+            or structured_station_result(db_path, question) is not None
+        )
+    try:
+        rows, _metadata = search(db_path, question, 5)
+    except sqlite3.DatabaseError:
+        return False
+    return local_result_is_relevant(rows, question)
+
+
+def suggested_local_questions(question: str, db_path: Path | None = None) -> list[str]:
+    normalized = normalize_search_question(normalized_retrieval_question(question)).strip()
+    subject = guidance_query_subject(question)
+    verified = verified_local_suggestions(db_path, normalized, subject)
+    if verified:
+        return verified
+    candidates: list[str] = []
+    station = requested_station_name(normalized)
+    if station:
+        candidates.append(f"{station}有哪些测试项")
+    wants_test_items = bool(re.search(r"测试|test|items?", normalized, re.IGNORECASE))
+    for token in re.findall(r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_-]{1,30})(?![A-Za-z0-9_])", normalized):
+        if token.lower() in ENGLISH_QUERY_STOP_WORDS:
+            continue
+        if token.lower() == "test":
+            continue
+        if token.upper() == token or any(ch.isdigit() for ch in token) or wants_test_items:
+            display_token = token.upper() if len(token) <= 12 and re.fullmatch(r"[A-Za-z0-9_-]+", token) else token
+            if wants_test_items or any(ch.isdigit() for ch in token):
+                candidates.append(f"{display_token}有哪些测试项")
+                candidates.append(f"{display_token}的测试方案是什么")
+            else:
+                candidates.append(f"{display_token}是什么")
+            break
+    if not candidates and subject:
+        candidates.append(f"{subject}是什么")
+    candidates = list(dict.fromkeys(candidates))[:3]
+    if db_path is not None and db_path.exists():
+        return [candidate for candidate in candidates if local_candidate_has_answer(db_path, candidate)][:3]
+    return candidates
+
+
+def guidance_subject(question: str, suggestions: list[str]) -> str:
+    if suggestions:
+        subject = re.split(r"有哪些测试项|的测试方案是什么|是什么", suggestions[0], maxsplit=1)[0].strip()
+        if subject:
+            return subject
+    return guidance_query_subject(question)
+
+
+def no_index_user_guidance(question: str, faq_missing: bool = True) -> dict[str, Any]:
+    suggestions = suggested_local_questions(question)
+    subject = guidance_subject(question, suggestions)
+    target = suggestions[0] if suggestions else ""
+    message = f"本地索引和 FAQ 都不可用，当前没有与「{subject}」相关的索引和 FAQ，无法从资料中判断这个问题。"
+    if not faq_missing:
+        message = f"本地索引不可用，FAQ 也没有命中与「{subject}」相关的足够依据。"
+    if target:
+        message += f" 你是否想问：{target}？请先建立索引后，再用这种更完整的问法查询。"
+    else:
+        message += " 请先建立索引后，再换成更完整、包含对象和问题类型的问法查询。"
+    return {
+        "kind": "no_index_no_faq" if faq_missing else "no_index_faq_no_match",
+        "severity": "error",
+        "message": message,
+        "suggested_questions": suggestions,
+    }
+
+
+def local_no_match_user_guidance(question: str, db_path: Path | None = None) -> dict[str, Any]:
+    suggestions = suggested_local_questions(question, db_path)
+    subject = guidance_subject(question, suggestions)
+    target = suggestions[0] if suggestions else ""
+    message = f"本地索引存在，但当前问法没有命中与「{subject}」相关的足够依据。"
+    if target:
+        message += f" 你是否想问：{target}？请换成这种更完整的问法查询我们已有的索引答案。"
+    else:
+        message += " 请换成更完整、包含对象和问题类型的问法查询我们已有的索引答案。"
+    return {
+        "kind": "local_no_match",
+        "severity": "error",
+        "message": message,
+        "suggested_questions": suggestions,
+    }
+
+
+def strip_native_reference_markers(text: str) -> str:
+    return re.sub(r"\s*\[\d{1,3}\]", "", text)
+
+
+def prune_unreferenced_output_sources(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("source_type") not in {"web_search", "hybrid_web_knowledge"}:
+        return result
+
+    sources = result.get("sources") or []
+    if not sources:
+        return result
+
+    answer = str(result.get("answer", ""))
+    referenced_ids = {int(match) for match in re.findall(r"\[(\d+)\]", answer)}
+    summary_ids = {
+        int(source_id)
+        for source_id in result.get("summary_source_ids", [])
+        if str(source_id).isdigit()
+    }
+    if referenced_ids:
+        keep_ids = referenced_ids | summary_ids
+    else:
+        keep_ids = summary_ids
+
+    if not keep_ids:
+        return result
+
+    pruned_sources = [
+        source
+        for source in sources
+        if str(source.get("source_id", "")).isdigit() and int(source["source_id"]) in keep_ids
+    ]
+    if not pruned_sources:
+        return result
+
+    for source in pruned_sources:
+        for key in ("snippet", "excerpt", "citation"):
+            if key in source and isinstance(source[key], str):
+                source[key] = strip_native_reference_markers(source[key])
+    result["sources"] = pruned_sources
+    result["summary_source_ids"] = [
+        source_id for source_id in result.get("summary_source_ids", []) if int(source_id) in keep_ids
+    ]
+    citations = result.get("citations") or []
+    result["citations"] = [
+        citation
+        for citation in citations
+        if str(citation.get("source_id", "")).isdigit() and int(citation["source_id"]) in keep_ids
+    ] or grounded_citations(result)
+    for citation in result["citations"]:
+        if isinstance(citation.get("quote"), str):
+            citation["quote"] = strip_native_reference_markers(citation["quote"])
+    result["output_sources_pruned"] = True
+    return result
+
+
+def apply_citation_validation(result: dict[str, Any]) -> dict[str, Any]:
+    result["citation_validation"] = citation_validation(result)
+    return result
+
+
 def local_translate_to_chinese(text: str) -> str:
     text = human_text(text, max_len=520, simplify=True)
     if not text:
@@ -3132,6 +3574,14 @@ def local_translate_to_chinese(text: str) -> str:
         return ""
 
 
+OFFLINE_TRANSLATION_SETUP_HINT = (
+    "需要联网安装一次离线英译中模型：\n"
+    "python -m pip install -r requirements.txt\n"
+    ".\\run-agent.bat translation-setup\n"
+    ".\\run-agent.bat verify"
+)
+
+
 def chinese_grounded_fallback(result: dict[str, Any]) -> dict[str, Any]:
     if not result.get("sources"):
         result["api_used"] = False
@@ -3146,6 +3596,7 @@ def chinese_grounded_fallback(result: dict[str, Any]) -> dict[str, Any]:
     for citation in citations[:citation_limit]:
         translated = local_translate_to_chinese(str(citation.get("quote", "")))
         if translated:
+            translated = strip_native_reference_markers(translated)
             translated_citations.append(f"{trim_terminal_punctuation(translated)} [{citation['source_id']}]")
     if translated_citations:
         if source_type == "web_search":
@@ -3157,10 +3608,16 @@ def chinese_grounded_fallback(result: dict[str, Any]) -> dict[str, Any]:
         result["answer"] = prefix + "；".join(translated_citations) + "。"
         result["answer_mode"] = "local_translation_grounded_summary"
     elif source_type == "web_search":
-        result["answer"] = "已找到相关联网资料，但当前缺少可用的本地翻译模型。请查看下方引用来源；为避免误译，原始引用保持不变。"
+        result["answer"] = (
+            "已找到相关联网资料，但当前缺少可用的本地翻译模型。请查看下方引用来源；为避免误译，原始引用保持不变。\n\n"
+            + OFFLINE_TRANSLATION_SETUP_HINT
+        )
         result["answer_mode"] = "chinese_grounded_fallback"
     else:
-        result["answer"] = "已找到相关本地资料，但当前缺少可用的本地翻译模型。请查看下方引用来源；为避免误译，原始引用保持不变。"
+        result["answer"] = (
+            "已找到相关本地资料，但当前缺少可用的本地翻译模型。请查看下方引用来源；为避免误译，原始引用保持不变。\n\n"
+            + OFFLINE_TRANSLATION_SETUP_HINT
+        )
         result["answer_mode"] = "chinese_grounded_fallback"
     result["api_used"] = False
     return result
@@ -3223,20 +3680,29 @@ def synthesize_with_api(question: str, result: dict[str, Any], config: dict[str,
         result["api_used"] = True
         result["api_provider"] = config.get("LKA_API_PROVIDER", "openai-compatible")
         result["api_model"] = model
+        validation = citation_validation(result)
+        if not validation["ok"]:
+            result["api_used"] = False
+            result["api_validation_error"] = validation["issues"]
+            return chinese_grounded_fallback(result)
+        result["citation_validation"] = validation
     return result
 
 
 def finalize_answer(question: str, result: dict[str, Any], config: dict[str, str], allow_api: bool) -> dict[str, Any]:
+    attach_query_structure(question, result)
     if result.get("source_type") not in {"knowledge_base", "web_search", "hybrid_web_knowledge", "faq_fallback"}:
         return result
     if result.get("answer_mode") == "api_grounded_summary":
-        return polish_internal_answer(result)
+        return apply_citation_validation(prune_unreferenced_output_sources(polish_internal_answer(result)))
     if str(result.get("answer_mode", "")).startswith("local_structured_"):
         result["api_used"] = False
-        return polish_internal_answer(result)
+        return apply_citation_validation(polish_internal_answer(result))
     if allow_api:
-        return polish_internal_answer(synthesize_with_api(question, result, config))
-    return polish_internal_answer(chinese_grounded_fallback(result))
+        return apply_citation_validation(
+            prune_unreferenced_output_sources(polish_internal_answer(synthesize_with_api(question, result, config)))
+        )
+    return apply_citation_validation(prune_unreferenced_output_sources(polish_internal_answer(chinese_grounded_fallback(result))))
 
 
 def web_research_agent(question: str, config: dict[str, str], allow_api: bool, limit: int = 5) -> dict[str, Any]:
@@ -3344,9 +3810,32 @@ def no_local_answer(
     }
 
 
+def domain_retrievers() -> list[DomainRetriever]:
+    return [
+        abbreviation_retriever.create(structured_abbreviation_result),
+        station_test_retriever.create(structured_fft_station_result),
+        station_test_retriever.create(structured_station_result),
+        excel_table_retriever.create(structured_n972_excel_result),
+    ]
+
+
+def run_domain_retrievers(
+    db_path: Path,
+    question: str,
+    metadata: dict[str, str],
+    refresh_scheduled: bool,
+) -> dict[str, Any] | None:
+    for retriever in domain_retrievers():
+        result = retriever.retrieve(db_path, question, metadata, refresh_scheduled)
+        if result is not None:
+            result["retriever_plugin"] = retriever.name
+            return result
+    return None
+
+
 def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, allow_api: bool = True) -> dict[str, Any]:
     config = runtime_config()
-    cache_variant = api_cache_variant(config, allow_api)
+    cache_variant = query_cache_variant(config, allow_api, use_web)
     if not db_path.exists():
         result = faq_fallback(question, limit)
         if result.get("sources"):
@@ -3355,9 +3844,24 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
             if use_web:
                 result = augment_with_web(question, result, limit)
             return finalize_answer(question, result, config, allow_api)
+        faq_missing = not (PROCESSED_DIR / "faq.jsonl").exists()
         return finalize_answer(
             question,
-            no_local_answer(
+            {
+                **no_local_answer(
+                    use_web,
+                    question,
+                    "本地知识库索引不存在，请先运行 ingest。",
+                    config=config,
+                    allow_api=allow_api,
+                    limit=limit,
+                ),
+                "degraded": True,
+                "degrade_reason": "local_index_missing",
+                "user_guidance": no_index_user_guidance(question, faq_missing=faq_missing),
+            }
+            if not use_web
+            else no_local_answer(
                 use_web,
                 question,
                 "本地知识库索引不存在，请先运行 ingest。",
@@ -3379,7 +3883,7 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
         index_version = metadata.get("indexed_at", "")
         cached = cache_get(cache_conn, question, limit, use_web, index_version, cache_variant)
         if cached is not None:
-            cached["async_update_scheduled"] = refresh_scheduled
+            apply_index_status(cached, refresh_scheduled)
             cache_conn.close()
             return cached
     except sqlite3.DatabaseError:
@@ -3392,16 +3896,33 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
             result = augment_with_web(question, result, limit)
         return finalize_answer(question, result, config, allow_api)
 
-    structured_result = structured_abbreviation_result(db_path, question, metadata, refresh_scheduled)
-    if structured_result is None:
-        structured_result = structured_fft_station_result(db_path, question, metadata, refresh_scheduled)
-    if structured_result is None:
-        structured_result = structured_station_result(db_path, question, metadata, refresh_scheduled)
-    if structured_result is None:
-        structured_result = structured_n972_excel_result(db_path, question, metadata, refresh_scheduled)
+    structured_result = run_domain_retrievers(db_path, question, metadata, refresh_scheduled)
     if structured_result is not None:
         result = finalize_answer(question, structured_result, config, allow_api)
+        apply_index_status(result, refresh_scheduled)
         if cache_conn is not None:
+            cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)
+            cache_conn.close()
+        return result
+
+    verified_suggestions = verified_local_suggestions(db_path, question, guidance_query_subject(question))
+    if station_test_item_question(question) and requested_station_name(question) and verified_suggestions:
+        result = no_local_answer(
+            use_web,
+            question,
+            "本地知识库没有找到足够依据。",
+            metadata,
+            config,
+            allow_api,
+            limit,
+        )
+        if not use_web:
+            result["degraded"] = True
+            result["degrade_reason"] = "local_no_match"
+            result["user_guidance"] = local_no_match_user_guidance(question, db_path)
+        apply_index_status(result, refresh_scheduled)
+        result = finalize_answer(question, result, config, allow_api)
+        if cache_conn is not None and (not result.get("web_search_used") or result.get("sources")) and not result.get("web_search_reason"):
             cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)
             cache_conn.close()
         return result
@@ -3428,7 +3949,11 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
             allow_api,
             limit,
         )
-        result["async_update_scheduled"] = refresh_scheduled
+        if not use_web:
+            result["degraded"] = True
+            result["degrade_reason"] = "local_no_match"
+            result["user_guidance"] = local_no_match_user_guidance(question, db_path)
+        apply_index_status(result, refresh_scheduled)
         result = finalize_answer(question, result, config, allow_api)
         if cache_conn is not None and (not result.get("web_search_used") or result.get("sources")) and not result.get("web_search_reason"):
             cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)
@@ -3480,8 +4005,10 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
         "index_updated_at": metadata.get("indexed_at"),
         "embedding_model": metadata.get("embedding_model"),
         "chunk_strategy": metadata.get("chunk_strategy"),
+        "semantic_candidate_strategy": metadata.get("semantic_candidate_strategy"),
         "retrieval_mode": "hybrid_fts_semantic_keyword",
         "async_update_scheduled": refresh_scheduled,
+        "index_status": "updating" if refresh_scheduled else "ready",
         "cache_hit": False,
     }
     structured_answer = structured_local_answer(db_path, question, sources)
@@ -3489,6 +4016,7 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
         result["answer"] = structured_answer
         result["answer_mode"] = "local_structured_table_summary"
     result = finalize_answer(question, result, config, allow_api)
+    apply_index_status(result, refresh_scheduled)
     if cache_conn is not None and not result.get("web_search_reason"):
         cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)
         cache_conn.close()

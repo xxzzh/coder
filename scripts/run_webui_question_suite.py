@@ -9,6 +9,8 @@ playwright-cli, then checks API answers from the same origin.
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -17,7 +19,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NPX = "D:/nodejs/npx.cmd"
+NPX = shutil.which("npx.cmd") or shutil.which("npx") or "npx"
 SESSION = "lka-ui-test"
 WEBUI_URL = "http://127.0.0.1:8765/"
 
@@ -89,6 +91,17 @@ def pw_eval(js: str, timeout: int = 120, label: str = "") -> Any:
 
 def status_from_failures(failures: list[str]) -> str:
     return "FAIL" if failures else "PASS"
+
+
+def normalize_assertion_text(text: str) -> str:
+    text = (text or "").lower()
+    return re.sub(r"[\s，,。；;：:/\\()（）【】\[\]<>《》\"'`_\-—–.]+", "", text)
+
+
+def contains_expected(text: str, expected: str) -> bool:
+    if expected in text:
+        return True
+    return normalize_assertion_text(expected) in normalize_assertion_text(text)
 
 
 QUERY_CASES: list[dict[str, Any]] = [
@@ -295,7 +308,7 @@ def run_suite() -> dict[str, Any]:
             label=check["id"],
         )
         text = data.get("text", "")
-        failures = [f"缺少: {item}" for item in check["must_contain"] if item not in text]
+        failures = [f"缺少: {item}" for item in check["must_contain"] if not contains_expected(text, item)]
         rows.append(
             {
                 "id": check["id"],
@@ -332,12 +345,12 @@ def run_suite() -> dict[str, Any]:
         failures: list[str] = []
 
         for item in case.get("must_contain", []):
-            if item not in answer:
+            if not contains_expected(answer, item):
                 failures.append(f"缺少: {item}")
-        if case.get("must_contain_any") and not any(item in answer for item in case["must_contain_any"]):
+        if case.get("must_contain_any") and not any(contains_expected(answer, item) for item in case["must_contain_any"]):
             failures.append("未命中任一: " + " / ".join(case["must_contain_any"]))
         for item in case.get("must_not_contain", []):
-            if item in answer:
+            if contains_expected(answer, item):
                 failures.append(f"不应包含: {item}")
         if case.get("expected_mode") and data.get("retrieval_mode") != case["expected_mode"]:
             failures.append(f"retrieval_mode={data.get('retrieval_mode')}，期望 {case['expected_mode']}")

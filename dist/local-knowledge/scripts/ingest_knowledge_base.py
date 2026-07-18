@@ -31,6 +31,8 @@ PROCESSED_DIR = Path("knowledge_base/processed")
 REVIEW_APPROVALS_FILE = "review_approvals.json"
 PROJECT_TESSDATA_DIR = PROJECT_ROOT / "tools" / "tessdata"
 EMBEDDING_DIMS = 384
+EMBEDDING_LSH_BUCKETS = 12
+EMBEDDING_LSH_PAIR_BUCKETS = 4
 CHUNK_MAX_CHARS = 1100
 CHUNK_MIN_CHARS = 180
 SEMANTIC_BREAK_SIMILARITY = 0.08
@@ -38,6 +40,15 @@ FAQ_LIMIT = 200
 OCR_LANGUAGES = "eng+chi_sim"
 MIN_EXTRACTED_TEXT_CHARS = 80
 OCR_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+SMALL_FILE_HASH_BYTES = 1024 * 1024
+
+
+def portable_error_message(exc: Exception) -> str:
+    """Avoid leaking machine-specific temp/runtime paths into generated reports."""
+    if isinstance(exc, subprocess.CalledProcessError):
+        command = Path(str(exc.cmd[0])).name if isinstance(exc.cmd, list) and exc.cmd else "command"
+        return f"{command} exited with status {exc.returncode}"
+    return str(exc)
 
 
 def is_ignored_raw_file(path: Path) -> bool:
@@ -143,6 +154,15 @@ def raw_file_fingerprint(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def raw_file_stat_fingerprint(path: Path, raw_dir: Path | None = None) -> str:
+    stat = path.stat()
+    rel_path = str(path.relative_to(raw_dir)).replace("\\", "/") if raw_dir else str(path)
+    parts = [rel_path, str(stat.st_size), str(stat.st_mtime_ns)]
+    if stat.st_size <= SMALL_FILE_HASH_BYTES:
+        parts.append(raw_file_fingerprint(path))
+    return ":".join(parts)
 
 
 def load_review_approvals(processed_dir: Path = PROCESSED_DIR) -> dict[str, dict[str, str]]:
@@ -542,6 +562,37 @@ def pdf_likely_has_images(path: Path) -> bool:
     return b"/Subtype" in data and b"/Image" in data
 
 
+def find_pdftotext() -> str | None:
+    found = shutil.which("pdftotext")
+    if found:
+        return found
+    pdftoppm = shutil.which("pdftoppm")
+    if pdftoppm:
+        for suffix in (".cmd", ".exe", ""):
+            candidate = Path(pdftoppm).with_name(f"pdftotext{suffix}")
+            if candidate.exists():
+                return str(candidate)
+    return None
+
+
+def _read_pdf_with_pdftotext(path: Path) -> str | None:
+    pdftotext = find_pdftotext()
+    if not pdftotext:
+        return None
+    with tempfile.TemporaryDirectory(prefix="lka_pdftotext_") as temp:
+        output_path = Path(temp) / "out.txt"
+        proc = subprocess.run(
+            [pdftotext, "-layout", "-enc", "UTF-8", str(path), str(output_path)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if proc.returncode != 0 or not output_path.exists():
+            return None
+        text = output_path.read_text(encoding="utf-8", errors="ignore").strip()
+    return text or None
+
+
 def find_tesseract() -> str | None:
     found = shutil.which("tesseract")
     if found:
@@ -637,7 +688,7 @@ def ocr_pdf(path: Path) -> tuple[str, list[str]]:
         try:
             images = render_pdf_pages_for_ocr(path, Path(temp))
         except Exception as exc:
-            warnings.append(f"OCR render failed: {exc}")
+            warnings.append(f"OCR render failed: {portable_error_message(exc)}")
             return "", warnings
         for page_index, image_path in enumerate(images, start=1):
             page_text = ocr_image(image_path)
@@ -664,6 +715,10 @@ def read_pdf(path: Path) -> str:
         return text
 
     text = _read_pdf_with_library(path)
+    if text is not None:
+        return text
+
+    text = _read_pdf_with_pdftotext(path)
     if text is not None:
         return text
 
@@ -708,6 +763,11 @@ def read_pdf_with_report(path: Path) -> tuple[str, dict[str, Any]]:
     if library_text and library_text not in pieces:
         pieces.append(library_text)
         report["method"].append("pypdf_or_pypdf2")
+
+    pdftotext_text = _read_pdf_with_pdftotext(path)
+    if pdftotext_text and pdftotext_text not in pieces:
+        pieces.append(pdftotext_text)
+        report["method"].append("pdftotext")
 
     fallback_text = ""
     if not pieces:
@@ -931,6 +991,49 @@ def local_embedding_dict(text: str, dims: int = EMBEDDING_DIMS) -> dict[int, flo
     return {int(index): float(value) for index, value in local_embedding(text, dims)}
 
 
+def embedding_lsh_buckets(embedding: list[list[float]]) -> list[str]:
+    top = sorted(
+        ((int(index), float(value)) for index, value in embedding),
+        key=lambda item: abs(item[1]),
+        reverse=True,
+    )[:EMBEDDING_LSH_BUCKETS]
+    buckets = [f"d:{index}:{1 if value >= 0 else 0}" for index, value in top]
+    pair_dims = top[:EMBEDDING_LSH_PAIR_BUCKETS]
+    for left_index in range(len(pair_dims)):
+        for right_index in range(left_index + 1, len(pair_dims)):
+            left = pair_dims[left_index]
+            right = pair_dims[right_index]
+            buckets.append(
+                "p:"
+                + ":".join(
+                    [
+                        str(min(left[0], right[0])),
+                        str(max(left[0], right[0])),
+                        str(1 if left[1] >= 0 else 0),
+                        str(1 if right[1] >= 0 else 0),
+                    ]
+                )
+            )
+    return list(dict.fromkeys(buckets))
+
+
+def parse_embedding(raw: str) -> list[list[float]]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    embedding: list[list[float]] = []
+    for item in payload:
+        if isinstance(item, list) and len(item) == 2:
+            try:
+                embedding.append([int(item[0]), float(item[1])])
+            except (TypeError, ValueError):
+                continue
+    return embedding
+
+
 def cosine_dicts(left: dict[int, float], right: dict[int, float]) -> float:
     if not left or not right:
         return 0.0
@@ -949,6 +1052,7 @@ def init_db(db_path: Path, reset: bool = False) -> sqlite3.Connection:
             """
             DROP TABLE IF EXISTS query_cache;
             DROP TABLE IF EXISTS metadata;
+            DROP TABLE IF EXISTS embedding_lsh;
             DROP TABLE IF EXISTS chunks_fts;
             DROP TABLE IF EXISTS chunks;
             DROP TABLE IF EXISTS documents;
@@ -969,6 +1073,7 @@ def init_db(db_path: Path, reset: bool = False) -> sqlite3.Connection:
             file_size INTEGER NOT NULL,
             modified_at TEXT NOT NULL,
             indexed_at TEXT NOT NULL,
+            source_fingerprint TEXT NOT NULL DEFAULT '',
             content_hash TEXT NOT NULL,
             duplicate_of TEXT,
             text TEXT NOT NULL
@@ -980,6 +1085,7 @@ def init_db(db_path: Path, reset: bool = False) -> sqlite3.Connection:
             chunk_index INTEGER NOT NULL,
             text TEXT NOT NULL,
             embedding TEXT NOT NULL,
+            indexed_at TEXT NOT NULL DEFAULT '',
             FOREIGN KEY(doc_id) REFERENCES documents(doc_id)
         );
 
@@ -993,6 +1099,17 @@ def init_db(db_path: Path, reset: bool = False) -> sqlite3.Connection:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS embedding_lsh (
+            bucket TEXT NOT NULL,
+            chunk_id TEXT NOT NULL,
+            doc_id TEXT NOT NULL,
+            indexed_at TEXT NOT NULL,
+            PRIMARY KEY(bucket, chunk_id),
+            FOREIGN KEY(chunk_id) REFERENCES chunks(chunk_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_embedding_lsh_chunk ON embedding_lsh(chunk_id);
+
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
             chunk_id UNINDEXED,
             doc_id UNINDEXED,
@@ -1005,7 +1122,30 @@ def init_db(db_path: Path, reset: bool = False) -> sqlite3.Connection:
         );
         """
     )
+    ensure_schema(conn)
     return conn
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    document_columns = {row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+    if "source_fingerprint" not in document_columns:
+        conn.execute("ALTER TABLE documents ADD COLUMN source_fingerprint TEXT NOT NULL DEFAULT ''")
+    chunk_columns = {row[1] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+    if "indexed_at" not in chunk_columns:
+        conn.execute("ALTER TABLE chunks ADD COLUMN indexed_at TEXT NOT NULL DEFAULT ''")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS embedding_lsh (
+            bucket TEXT NOT NULL,
+            chunk_id TEXT NOT NULL,
+            doc_id TEXT NOT NULL,
+            indexed_at TEXT NOT NULL,
+            PRIMARY KEY(bucket, chunk_id),
+            FOREIGN KEY(chunk_id) REFERENCES chunks(chunk_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_embedding_lsh_chunk ON embedding_lsh(chunk_id);
+        """
+    )
 
 
 def doc_id_for_path(rel_path: str) -> str:
@@ -1017,6 +1157,7 @@ def clear_document(conn: sqlite3.Connection, doc_id: str) -> None:
     chunk_ids = [row[0] for row in conn.execute("SELECT chunk_id FROM chunks WHERE doc_id = ?", (doc_id,)).fetchall()]
     for chunk_id in chunk_ids:
         conn.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (chunk_id,))
+        conn.execute("DELETE FROM embedding_lsh WHERE chunk_id = ?", (chunk_id,))
     conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
     conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
 
@@ -1029,6 +1170,40 @@ def remove_deleted_documents(conn: sqlite3.Connection, current_paths: set[str]) 
             clear_document(conn, row["doc_id"])
             removed += 1
     return removed
+
+
+def insert_embedding_lsh(
+    conn: sqlite3.Connection,
+    chunk_id: str,
+    doc_id: str,
+    embedding: list[list[float]],
+    indexed_at: str,
+) -> None:
+    for bucket in embedding_lsh_buckets(embedding):
+        conn.execute(
+            "INSERT OR IGNORE INTO embedding_lsh(bucket, chunk_id, doc_id, indexed_at) VALUES (?, ?, ?, ?)",
+            (bucket, chunk_id, doc_id, indexed_at),
+        )
+
+
+def backfill_embedding_lsh(conn: sqlite3.Connection) -> int:
+    rows = conn.execute(
+        """
+        SELECT chunks.chunk_id, chunks.doc_id, chunks.embedding, chunks.indexed_at
+        FROM chunks
+        LEFT JOIN embedding_lsh ON embedding_lsh.chunk_id = chunks.chunk_id
+        WHERE embedding_lsh.chunk_id IS NULL
+        """
+    ).fetchall()
+    for row in rows:
+        insert_embedding_lsh(
+            conn,
+            str(row["chunk_id"]),
+            str(row["doc_id"]),
+            parse_embedding(str(row["embedding"])),
+            str(row["indexed_at"] or ""),
+        )
+    return len(rows)
 
 
 def metadata_set(conn: sqlite3.Connection, key: str, value: str) -> None:
@@ -1056,7 +1231,7 @@ def write_processed_files(conn: sqlite3.Connection, processed_dir: Path) -> int:
     doc_rows = conn.execute(
         """
         SELECT doc_id, file_name, file_path, file_type, file_size, modified_at, indexed_at,
-               content_hash, duplicate_of, text
+               source_fingerprint, content_hash, duplicate_of, text
         FROM documents
         ORDER BY file_path
         """
@@ -1118,13 +1293,151 @@ def write_extraction_report(
             report_out.write(json.dumps(report, ensure_ascii=False) + "\n")
 
 
+def chunk_information_quality(text: str) -> float:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if not compact:
+        return 0.0
+    if len(compact) < 40:
+        return 0.35
+    pipe_count = compact.count("|")
+    alpha_numeric = len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]", compact))
+    if pipe_count >= 8 and alpha_numeric / max(len(compact), 1) < 0.45:
+        return 0.45
+    if len(set(compact)) <= 8 and len(compact) > 80:
+        return 0.3
+    return 1.0
+
+
+def fts_quality_queries(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT file_name, text
+        FROM documents
+        WHERE duplicate_of IS NULL
+        ORDER BY file_path
+        LIMIT 8
+        """
+    ).fetchall()
+    queries: list[str] = []
+    for row in rows:
+        stem = Path(str(row["file_name"])).stem
+        if stem:
+            queries.append(stem[:40])
+        words = re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,8}", str(row["text"])[:1200])
+        if words:
+            queries.append(words[0])
+    return list(dict.fromkeys(query for query in queries if query))[:12]
+
+
+def write_retrieval_quality_report(conn: sqlite3.Connection, processed_dir: Path) -> dict[str, Any]:
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    doc_rows = conn.execute(
+        """
+        SELECT documents.doc_id, documents.file_name, documents.file_path, documents.duplicate_of,
+               COUNT(chunks.chunk_id) AS chunk_count,
+               AVG(LENGTH(chunks.text)) AS avg_chunk_length,
+               SUM(CASE WHEN TRIM(chunks.text) = '' THEN 1 ELSE 0 END) AS empty_chunks
+        FROM documents
+        LEFT JOIN chunks ON chunks.doc_id = documents.doc_id
+        GROUP BY documents.doc_id
+        ORDER BY documents.file_path
+        """
+    ).fetchall()
+    chunk_rows = conn.execute(
+        """
+        SELECT chunks.chunk_id, documents.file_path, chunks.text
+        FROM chunks
+        JOIN documents ON documents.doc_id = chunks.doc_id
+        """
+    ).fetchall()
+    low_info = [
+        {
+            "chunk_id": row["chunk_id"],
+            "file_path": row["file_path"],
+            "length": len(str(row["text"])),
+            "quality_score": chunk_information_quality(str(row["text"])),
+        }
+        for row in chunk_rows
+        if chunk_information_quality(str(row["text"])) < 0.6
+    ]
+    quality_queries = fts_quality_queries(conn)
+    fts_tests: list[dict[str, Any]] = []
+    fts_hits = 0
+    for query_text in quality_queries:
+        try:
+            row = conn.execute(
+                """
+                SELECT documents.file_path
+                FROM chunks_fts
+                JOIN chunks ON chunks.chunk_id = chunks_fts.chunk_id
+                JOIN documents ON documents.doc_id = chunks.doc_id
+                WHERE chunks_fts MATCH ?
+                ORDER BY bm25(chunks_fts)
+                LIMIT 1
+                """,
+                (f'"{query_text.replace(chr(34), chr(34) + chr(34))}"',),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        if row:
+            fts_hits += 1
+        fts_tests.append({"query": query_text, "hit": bool(row), "top_source": row["file_path"] if row else None})
+    top_sources = conn.execute(
+        """
+        SELECT documents.file_path, COUNT(chunks.chunk_id) AS chunk_count
+        FROM documents
+        JOIN chunks ON chunks.doc_id = documents.doc_id
+        GROUP BY documents.doc_id
+        ORDER BY chunk_count DESC, documents.file_path
+        LIMIT 10
+        """
+    ).fetchall()
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "documents": [
+            {
+                "file_path": row["file_path"],
+                "file_name": row["file_name"],
+                "chunk_count": int(row["chunk_count"] or 0),
+                "avg_chunk_length": round(float(row["avg_chunk_length"] or 0), 1),
+                "empty_chunks": int(row["empty_chunks"] or 0),
+                "duplicate_of": row["duplicate_of"],
+            }
+            for row in doc_rows
+        ],
+        "summary": {
+            "documents": len(doc_rows),
+            "chunks": len(chunk_rows),
+            "avg_chunk_length": round(
+                sum(len(str(row["text"])) for row in chunk_rows) / max(len(chunk_rows), 1),
+                1,
+            ),
+            "empty_chunks": sum(1 for row in chunk_rows if not str(row["text"]).strip()),
+            "duplicate_documents": sum(1 for row in doc_rows if row["duplicate_of"]),
+            "low_information_chunks": len(low_info),
+            "fts_hit_rate": round(fts_hits / max(len(fts_tests), 1), 3),
+        },
+        "low_information_examples": low_info[:30],
+        "fts_hit_tests": fts_tests,
+        "top_query_hit_sources": [dict(row) for row in top_sources],
+        "vector_index_recommendation": (
+            "Current SQLite scan is acceptable."
+            if len(chunk_rows) < 10000
+            else "Chunk count is above 10000; evaluate FAISS, sqlite-vec, Qdrant, or pgvector."
+        ),
+    }
+    (processed_dir / "retrieval_quality_report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return report["summary"]
+
+
 def source_fingerprint(raw_dir: Path) -> str:
     items: list[str] = []
     for path in sorted(raw_dir.rglob("*")):
         if path.is_file() and not is_ignored_raw_file(path) and path.suffix.lower() in SUPPORTED:
-            rel_path = str(path.relative_to(raw_dir)).replace("\\", "/")
-            stat = path.stat()
-            items.append(f"{rel_path}:{stat.st_size}:{int(stat.st_mtime)}")
+            items.append(raw_file_stat_fingerprint(path, raw_dir))
     return hashlib.sha256("\n".join(items).encode("utf-8")).hexdigest()
 
 
@@ -1143,6 +1456,7 @@ def _ingest_unlocked(
     previous_indexed_at = conn.execute("SELECT value FROM metadata WHERE key = ?", ("indexed_at",)).fetchone()
     metadata_set(conn, "embedding_model", f"local-hash-ngram-{EMBEDDING_DIMS}d")
     metadata_set(conn, "chunk_strategy", "semantic-boundary-local-embedding")
+    metadata_set(conn, "semantic_candidate_strategy", "exact-scan-small-lsh-large")
 
     doc_count = 0
     changed_doc_count = 0
@@ -1168,12 +1482,14 @@ def _ingest_unlocked(
         rel_path = str(path.relative_to(raw_dir)).replace("\\", "/")
         current_paths.add(rel_path)
         stat = path.stat()
+        file_source_fingerprint = raw_file_stat_fingerprint(path, raw_dir)
         modified_at = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds")
         existing = conn.execute(
-            "SELECT modified_at, file_size FROM documents WHERE file_path = ?",
+            "SELECT modified_at, file_size, source_fingerprint FROM documents WHERE file_path = ?",
             (rel_path,),
         ).fetchone()
-        if existing and existing["modified_at"] == modified_at and existing["file_size"] == stat.st_size:
+        existing_fingerprint = existing["source_fingerprint"] if existing else ""
+        if existing and existing_fingerprint == file_source_fingerprint:
             unchanged_count += 1
             continue
 
@@ -1213,7 +1529,13 @@ def _ingest_unlocked(
 
         clear_document(conn, doc_id)
         conn.execute(
-            "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO documents(
+                doc_id, file_name, file_path, file_type, file_size, modified_at,
+                indexed_at, source_fingerprint, content_hash, duplicate_of, text
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 doc_id,
                 path.name,
@@ -1222,6 +1544,7 @@ def _ingest_unlocked(
                 stat.st_size,
                 modified_at,
                 indexed_at,
+                file_source_fingerprint,
                 hash_value,
                 duplicate_of,
                 text,
@@ -1234,14 +1557,20 @@ def _ingest_unlocked(
         for index, chunk in enumerate(chunk_text(text), start=1):
             chunk_count += 1
             chunk_id = f"{doc_id}_{index:04d}"
-            embedding = json.dumps(local_embedding(chunk), separators=(",", ":"))
-            conn.execute("INSERT INTO chunks VALUES (?, ?, ?, ?, ?)", (chunk_id, doc_id, index, chunk, embedding))
+            embedding_values = local_embedding(chunk)
+            embedding = json.dumps(embedding_values, separators=(",", ":"))
+            conn.execute(
+                "INSERT INTO chunks(chunk_id, doc_id, chunk_index, text, embedding, indexed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (chunk_id, doc_id, index, chunk, embedding, indexed_at),
+            )
+            insert_embedding_lsh(conn, chunk_id, doc_id, embedding_values, indexed_at)
             conn.execute(
                 "INSERT INTO chunks_fts VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (chunk_id, doc_id, path.name, rel_path, file_type, chunk, searchable_text(chunk)),
             )
 
     removed_count = remove_deleted_documents(conn, current_paths)
+    lsh_backfilled = backfill_embedding_lsh(conn)
     if changed_doc_count or removed_count:
         conn.execute("DELETE FROM query_cache")
     if changed_doc_count or removed_count or previous_indexed_at is None:
@@ -1251,6 +1580,7 @@ def _ingest_unlocked(
     metadata_set(conn, "source_fingerprint", source_fingerprint(raw_dir))
     write_extraction_report(processed_dir, extraction_reports, current_paths)
     faq_count = write_processed_files(conn, processed_dir)
+    quality_summary = write_retrieval_quality_report(conn, processed_dir)
     totals = conn.execute(
         """
         SELECT
@@ -1273,6 +1603,7 @@ def _ingest_unlocked(
         "removed_documents": removed_count,
         "chunks": int(total_chunks or 0),
         "changed_chunks": chunk_count,
+        "lsh_backfilled_chunks": lsh_backfilled,
         "skipped": skipped_count,
         "duplicates": duplicate_count,
         "duplicate_files": duplicate_files,
@@ -1281,9 +1612,12 @@ def _ingest_unlocked(
         "approved_reviews": approved_review_count,
         "extraction_report": str(processed_dir / "extraction_report.jsonl"),
         "faq_entries": faq_count,
+        "quality_report": str(processed_dir / "retrieval_quality_report.json"),
+        "quality_summary": quality_summary,
         "indexed_at": indexed_at,
         "embedding_model": f"local-hash-ngram-{EMBEDDING_DIMS}d",
         "chunk_strategy": "semantic-boundary-local-embedding",
+        "semantic_candidate_strategy": "exact-scan-small-lsh-large",
         "unsupported_files": unsupported_raw_files(raw_dir),
     }
 

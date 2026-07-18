@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import threading
 
-from query_knowledge_base import grounded_citations, local_translate_to_chinese, synthesize_with_api
+from query_knowledge_base import chinese_grounded_fallback, grounded_citations, local_translate_to_chinese, synthesize_with_api
 
 
 class MockHandler(BaseHTTPRequestHandler):
@@ -43,6 +43,16 @@ def main() -> None:
     }
     citations = grounded_citations(result)
     assert len(citations) == 2
+    fallback = chinese_grounded_fallback(
+        {
+            "source_type": "knowledge_base",
+            "sources": [{"source_id": 1, "citation": "Voilà pourquoi tu me verras quelquefois donner cent sous."}],
+        }
+    )
+    assert "当前缺少可用的本地翻译模型" in fallback["answer"]
+    assert "python -m pip install -r requirements.txt" in fallback["answer"]
+    assert ".\\run-agent.bat translation-setup" in fallback["answer"]
+    assert ".\\run-agent.bat verify" in fallback["answer"]
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), MockHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

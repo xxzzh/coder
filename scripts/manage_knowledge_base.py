@@ -59,6 +59,7 @@ def sources(db_path: Path = DB_PATH) -> dict[str, Any]:
         "index_updated_at": meta.get("indexed_at"),
         "embedding_model": meta.get("embedding_model"),
         "chunk_strategy": meta.get("chunk_strategy"),
+        "semantic_candidate_strategy": meta.get("semantic_candidate_strategy"),
         "documents": len(items),
         "indexed_documents": len([item for item in items if not item.get("duplicate_of")]),
         "duplicates": len(duplicate_items),
@@ -76,6 +77,7 @@ def safe_remove_generated(db_path: Path, processed_dir: Path) -> None:
         processed_dir / "chunks.jsonl",
         processed_dir / "faq.jsonl",
         processed_dir / "extraction_report.jsonl",
+        processed_dir / "retrieval_quality_report.json",
     ]
     allowed_roots = [
         (Path.cwd() / "knowledge_base" / "index").resolve(),

@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -33,6 +34,8 @@ SCRIPTS_DIR = ROOT / "scripts"
 RAW_DIR = ROOT / "knowledge_base" / "raw"
 DB_PATH = ROOT / "knowledge_base" / "index" / "knowledge.db"
 OCR_EVAL_SCRIPT = SCRIPTS_DIR / "evaluate_ocr_test_materials.py"
+WEB_UI_STDERR_LOG = ROOT / "logs" / "web-ui.stderr.log"
+LOG_ROTATE_BYTES = 5 * 1024 * 1024
 
 os.chdir(ROOT)
 if str(SCRIPTS_DIR) not in sys.path:
@@ -134,6 +137,21 @@ def api_config_payload() -> dict[str, Any]:
         "model": env.get("LKA_API_MODEL", ""),
         "providers": provider_options(),
     }
+
+
+def redact_secrets(text: str) -> str:
+    return re.sub(r"(sk-[A-Za-z0-9_-]{8,}|tp-[A-Za-z0-9_-]{8,})", "***", str(text))
+
+
+def rotate_web_ui_logs() -> None:
+    try:
+        if not WEB_UI_STDERR_LOG.exists() or WEB_UI_STDERR_LOG.stat().st_size < LOG_ROTATE_BYTES:
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = WEB_UI_STDERR_LOG.with_name(f"web-ui.stderr.{stamp}.log")
+        WEB_UI_STDERR_LOG.rename(target)
+    except OSError:
+        return
 
 
 def reviews_payload() -> dict[str, Any]:
@@ -441,6 +459,20 @@ def page_html() -> str:
       gap: 10px;
       margin-top: 10px;
     }
+    .guidance {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 6px;
+      border: 1px solid #f3b4ad;
+      background: #fff4f2;
+      color: var(--bad);
+      font-weight: 600;
+      line-height: 1.6;
+      overflow-wrap: anywhere;
+    }
+    .guidance:empty {
+      display: none;
+    }
     .source-item {
       border-left: 3px solid var(--accent);
       padding: 8px 10px;
@@ -522,6 +554,7 @@ def page_html() -> str:
       <div class="panel">
         <h2>答案</h2>
         <div id="answer" class="answer muted">等待查询</div>
+        <div id="guidance" class="guidance"></div>
         <div id="sources" class="source-list"></div>
       </div>
       <div class="panel">
@@ -784,6 +817,7 @@ def page_html() -> str:
       setBusy(true);
       $('answer').className = 'answer muted';
       $('answer').textContent = '正在准备查询...';
+      renderGuidance(null);
       $('sources').textContent = '';
       $('askMeta').textContent = '';
       try {
@@ -822,7 +856,16 @@ def page_html() -> str:
               $('answer').textContent = data.message;
               $('askMeta').textContent = data.elapsed_seconds ? `已等待 ${data.elapsed_seconds} 秒` : '';
             } else if (eventName === 'meta') {
-              $('askMeta').textContent = `${data.source_type || '-'}${data.web_search_provider ? ` · ${data.web_search_provider}` : ''}${data.cache_hit ? ' · cache' : ''}${data.api_used ? ' · api' : ''}`;
+              const parts = [
+                data.source_type || '-',
+                data.web_search_provider || '',
+                data.cache_hit ? 'cache' : '',
+                data.api_used ? 'api' : '',
+                data.index_status === 'updating' ? 'index updating' : ''
+              ].filter(Boolean);
+              $('askMeta').textContent = parts.join(' · ');
+              renderGuidance(data.user_guidance || null);
+              if (data.index_message) log('索引后台更新', {message: data.index_message});
             } else if (eventName === 'sources') {
               renderSources(data.sources || []);
             } else if (eventName === 'answer-start') {
@@ -843,6 +886,7 @@ def page_html() -> str:
       } catch (error) {
         $('answer').className = 'answer muted';
         $('answer').textContent = `查询失败：${error.message}`;
+        renderGuidance(null);
         log('查询失败', {error: error.message});
       } finally {
         setBusy(false);
@@ -869,6 +913,12 @@ def page_html() -> str:
         node.append(title, path, quote);
         $('sources').appendChild(node);
       });
+    }
+    function renderGuidance(guidance) {
+      const node = $('guidance');
+      node.textContent = '';
+      if (!guidance || !guidance.message) return;
+      node.textContent = guidance.message;
     }
     function appendAnswerText(parent, text) {
       const parts = String(text || '').split(/(\\[\\d+\\])/g);
@@ -969,6 +1019,7 @@ def page_html() -> str:
       $('question').value = '';
       $('answer').className = 'answer muted';
       $('answer').textContent = '等待查询';
+      renderGuidance(null);
       $('sources').textContent = '';
       $('askMeta').textContent = '';
     }
@@ -995,12 +1046,14 @@ class AgentHandler(BaseHTTPRequestHandler):
     server_version = "LocalKnowledgeAgent/1.0"
 
     def log_message(self, fmt: str, *args: object) -> None:
-        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+        sys.stderr.write("%s - %s\n" % (self.address_string(), redact_secrets(fmt % args)))
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path in {"/", "/index.html"}:
             self.send_html(page_html())
+        elif parsed.path == "/favicon.ico":
+            self.send_empty(HTTPStatus.NO_CONTENT)
         elif parsed.path == "/api/health":
             self.send_json(health_payload())
         elif parsed.path == "/api/sources":
@@ -1110,7 +1163,12 @@ class AgentHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_error_json(self, message: str, status: HTTPStatus) -> None:
-        self.send_json({"ok": False, "error": message}, status)
+        self.send_json({"ok": False, "error": redact_secrets(message)}, status)
+
+    def send_empty(self, status: HTTPStatus) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def send_stream_event(self, event: str, data: dict[str, Any]) -> None:
         payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
@@ -1164,7 +1222,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                 )
 
         if error_box:
-            self.send_stream_event("error", {"error": str(error_box["error"])})
+            self.send_stream_event("error", {"error": redact_secrets(str(error_box["error"]))})
             return
 
         result = result_box["result"]
@@ -1184,6 +1242,14 @@ class AgentHandler(BaseHTTPRequestHandler):
             + "\n"
         )
         sys.stderr.flush()
+        if result.get("async_update_scheduled"):
+            self.send_stream_event(
+                "status",
+                {
+                    "message": result.get("index_message") or "资料已变化，正在后台更新，稍后重试可得到最新结果。",
+                    "elapsed_seconds": max(0, int(time.monotonic() - started_at)),
+                },
+            )
         self.send_stream_event(
             "status",
             {
@@ -1199,6 +1265,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                 "web_search_reason": result.get("web_search_reason"),
                 "cache_hit": result.get("cache_hit", False),
                 "api_used": result.get("api_used", False),
+                "user_guidance": result.get("user_guidance"),
+                "async_update_scheduled": result.get("async_update_scheduled", False),
+                "index_status": result.get("index_status", "ready"),
+                "index_message": result.get("index_message"),
             },
         )
         self.send_stream_event("sources", {"sources": sources})
@@ -1228,12 +1298,15 @@ def compact_ingest_result(result: dict[str, Any]) -> dict[str, Any]:
         "requires_review",
         "approved_reviews",
         "unsupported_files",
+        "quality_summary",
+        "quality_report",
         "indexed_at",
     )
     return {key: result.get(key) for key in keys if key in result}
 
 
 def main() -> None:
+    rotate_web_ui_logs()
     parser = argparse.ArgumentParser(description="Run the local Web UI for Local Knowledge Base Agent.")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host. Default keeps the UI local-only.")
     parser.add_argument("--port", type=int, default=8765)

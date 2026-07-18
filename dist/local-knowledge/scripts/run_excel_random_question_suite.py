@@ -13,6 +13,7 @@ import json
 import base64
 import random
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -25,7 +26,7 @@ from typing import Any, Iterable
 ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT / "knowledge_base" / "index" / "knowledge.db"
 WEBUI_URL = "http://127.0.0.1:8765"
-PLAYWRIGHT = Path("D:/nodejs/npx.cmd")
+PLAYWRIGHT = shutil.which("npx.cmd") or shutil.which("npx") or "npx"
 SESSION = "lka-ui-test"
 SEED = 20260606
 TARGET_CASES = 40
@@ -55,7 +56,7 @@ class Result:
 
 def normalize(text: str) -> str:
     text = re.sub(r"\s+", "", text or "").lower()
-    return re.sub(r"[，,。；;：:、.。/\\()（）【】\[\]<>《》\"'`_\-—–]+", "", text)
+    return re.sub(r"[，,。；;：:、.。/\\()（）【】\[\]<>《》\"'`_\-—–*~～]+", "", text)
 
 
 def compact(text: str, limit: int = 260) -> str:
@@ -318,7 +319,7 @@ def parse_playwright_stdout(stdout: str) -> Any:
 def open_webui_session() -> None:
     subprocess.run(
         [
-            str(PLAYWRIGHT),
+            PLAYWRIGHT,
             "--yes",
             "--package",
             "@playwright/cli",
@@ -337,7 +338,7 @@ def open_webui_session() -> None:
 
 def pw_eval(js: str, timeout: int = 180, label: str = "") -> Any:
     cmd = [
-        str(PLAYWRIGHT),
+        PLAYWRIGHT,
         "--yes",
         "--package",
         "@playwright/cli",

@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import os
 import sqlite3
 import tempfile
 import zipfile
 
+import ingest_knowledge_base as ingest_module
 import query_knowledge_base as query_module
 from ingest_knowledge_base import read_xlsx
 from query_knowledge_base import (
@@ -56,6 +59,8 @@ def main() -> None:
     ]
 
     assert normalize_search_question(question) == "量子纠缠是什么"
+    assert query_module.normalized_retrieval_question("SR是什么意思") == "SR"
+    assert query_module.abbreviation_query_term("SR是什么意思") == "SR"
     assert web_query(question) == "量子纠缠"
     assert web_query("acwing是什么") == "acwing"
     assert web_query("雷军是谁") == "雷军"
@@ -80,12 +85,66 @@ def main() -> None:
     assert query_module.cache_key("FFT测试", 5, False) == query_module.cache_key("人工功能测试", 5, False)
     assert query_module.cache_key("FFT测试项", 5, False) == query_module.cache_key("FFT测试", 5, False)
     assert query_module.cache_key("本地缓存", 5, False) == query_module.cache_key("本地缓存逻辑", 5, False)
+    assert query_module.query_cache_variant({}, allow_api=False, use_web=False).startswith("local-only:")
+    assert query_module.query_cache_variant({}, allow_api=False, use_web=True).startswith("web-enabled:")
+    assert query_module.query_cache_variant({}, allow_api=False, use_web=False) != query_module.query_cache_variant(
+        {}, allow_api=False, use_web=True
+    )
     assert query_module.station_test_item_question("FFT站位测试")
     assert query_module.canonical_question_for_cache("FFT站位测试") == "station:fft:items"
     assert query_module.canonical_question_for_cache("FFT站位测试项") == "station:fft:items"
     assert query_module.abbreviation_query_term("PR") == "PR"
     assert query_module.abbreviation_query_term("PR是什么") == "PR"
     assert query_module.meaningful_query_terms("GW") == ["gw"]
+    assert query_module.suggested_local_questions("SWDL2")[0] == "SWDL2有哪些测试项"
+    assert query_module.suggested_local_questions("swdl2")[0] == "SWDL2有哪些测试项"
+    assert query_module.suggested_local_questions("hpd test")[0] == "HPD有哪些测试项"
+    assert query_module.suggested_local_questions("电源键测试")[0] == "电源键测试是什么"
+    assert query_module.suggested_local_questions("我的个人密码是")[0] == "个人密码是什么"
+    assert query_module.suggested_local_questions("请问我的个人密码是什么")[0] == "个人密码是什么"
+    if query_module.DB_PATH.exists():
+        assert query_module.suggested_local_questions("SR是什么意思", query_module.DB_PATH)[0] == "SR是什么"
+        assert query_module.suggested_local_questions("SR有哪些测试项?", query_module.DB_PATH)[0] == "SR是什么"
+        assert query_module.suggested_local_questions("ZZZ999有哪些测试项", query_module.DB_PATH) == []
+    guidance = query_module.no_index_user_guidance("SWDL2")
+    assert guidance["severity"] == "error"
+    assert "与「SWDL2」相关的索引和 FAQ" in guidance["message"]
+    assert "SWDL2有哪些测试项" in guidance["message"]
+    assert "HPD有哪些测试项" in query_module.no_index_user_guidance("hpd test")["message"]
+    no_match_guidance = query_module.local_no_match_user_guidance("我的个人密码是")
+    assert no_match_guidance["kind"] == "local_no_match"
+    assert "与「个人密码」相关" in no_match_guidance["message"]
+    assert "个人密码是什么" in no_match_guidance["message"]
+    if query_module.DB_PATH.exists():
+        sr_guidance = query_module.local_no_match_user_guidance("SR是什么意思", query_module.DB_PATH)
+        assert "SR是什么" in sr_guidance["message"]
+        assert "SR有哪些测试项" not in sr_guidance["message"]
+        sr_test_guidance = query_module.local_no_match_user_guidance("SR有哪些测试项?", query_module.DB_PATH)
+        assert "SR是什么" in sr_test_guidance["message"]
+        assert "SR有哪些测试项" not in sr_test_guidance["message"]
+        missing_guidance = query_module.local_no_match_user_guidance("ZZZ999有哪些测试项", query_module.DB_PATH)
+        assert missing_guidance["suggested_questions"] == []
+        assert "你是否想问" not in missing_guidance["message"]
+    original_processed_dir = query_module.PROCESSED_DIR
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            query_module.PROCESSED_DIR = Path(temp_dir) / "processed"
+            missing_index_result = query_module.query(Path(temp_dir) / "missing.db", "SWDL2", use_web=False, allow_api=False)
+            assert missing_index_result["degrade_reason"] == "local_index_missing"
+            assert missing_index_result["user_guidance"]["kind"] == "no_index_no_faq"
+            assert "SWDL2有哪些测试项" in missing_index_result["user_guidance"]["message"]
+    finally:
+        query_module.PROCESSED_DIR = original_processed_dir
+    with tempfile.TemporaryDirectory() as temp_dir:
+        raw_dir = Path(temp_dir)
+        sample = raw_dir / "same-size.txt"
+        fixed_ns = 1_700_000_000_123_456_789
+        sample.write_text("alpha", encoding="utf-8")
+        os.utime(sample, ns=(fixed_ns, fixed_ns))
+        first_fingerprint = ingest_module.source_fingerprint(raw_dir)
+        sample.write_text("omega", encoding="utf-8")
+        os.utime(sample, ns=(fixed_ns, fixed_ns))
+        assert ingest_module.source_fingerprint(raw_dir) != first_fingerprint
     dictionary_text = (
         "P | P | PR | | Pilot Run | | | | | | | 试运行 | | | | | | | Back\n"
         "P | P | PR | | Public Relations | | | | | | | 公共关系 | | | | | | | Back\n"
@@ -293,6 +352,53 @@ AcWing 是一个算法交流平台。
         {"text": "LogMsgType 枚举 | 值 | 颜色 | 用途 |\n| INFO | 蓝色 | 正常信息 |\n| WARNING | 黄色 | 警告 |"},
         "LogMsgType有那些值",
     )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO metadata VALUES ('indexed_at', 'test-index');
+        CREATE TABLE documents(doc_id TEXT PRIMARY KEY, file_name TEXT, file_path TEXT, file_type TEXT);
+        CREATE TABLE chunks(
+            chunk_id TEXT PRIMARY KEY,
+            doc_id TEXT,
+            chunk_index INTEGER,
+            text TEXT,
+            embedding TEXT,
+            indexed_at TEXT
+        );
+        CREATE TABLE embedding_lsh(bucket TEXT, chunk_id TEXT, doc_id TEXT, indexed_at TEXT);
+        """
+    )
+    conn.executemany(
+        "INSERT INTO documents VALUES (?, ?, ?, ?)",
+        [
+            ("doc-physics", "physics.md", "physics.md", "md"),
+            ("doc-cooking", "cooking.md", "cooking.md", "md"),
+        ],
+    )
+
+    def insert_lsh_chunk(chunk_id: str, doc_id: str, text: str) -> None:
+        embedding = query_module.local_embedding(text)
+        raw_embedding = [[index, value] for index, value in sorted(embedding.items())]
+        conn.execute("INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?)", (chunk_id, doc_id, 1, text, json.dumps(raw_embedding), "test-index"))
+        for bucket in query_module.embedding_lsh_buckets(embedding):
+            conn.execute("INSERT INTO embedding_lsh VALUES (?, ?, ?, ?)", (bucket, chunk_id, doc_id, "test-index"))
+
+    insert_lsh_chunk("physics-1", "doc-physics", "量子纠缠是量子力学中的关联现象，多个粒子的状态之间存在关联。")
+    insert_lsh_chunk("cooking-1", "doc-cooking", "番茄炒蛋需要番茄、鸡蛋和少量盐。")
+    original_vector_threshold = query_module.VECTOR_INDEX_THRESHOLD_CHUNKS
+    original_vector_fallback_min = query_module.VECTOR_CANDIDATE_FALLBACK_MIN
+    try:
+        query_module.VECTOR_INDEX_THRESHOLD_CHUNKS = 1
+        query_module.VECTOR_CANDIDATE_FALLBACK_MIN = 1
+        semantic_rows = query_module.semantic_candidates(conn, "量子纠缠是什么", 5, {"indexed_at": "test-index"})
+    finally:
+        query_module.VECTOR_INDEX_THRESHOLD_CHUNKS = original_vector_threshold
+        query_module.VECTOR_CANDIDATE_FALLBACK_MIN = original_vector_fallback_min
+        conn.close()
+    assert semantic_rows[0]["chunk_id"] == "physics-1"
+    assert semantic_rows[0]["semantic_candidate_mode"] == "lsh"
     title, page_text = query_module.extract_webpage_text(
         """
         <html><head><title>量子纠缠说明</title><script>ignore()</script></head>
@@ -387,6 +493,28 @@ AcWing 是一个算法交流平台。
                 <c r="C1" t="inlineStr"><is><t>C</t></is></c></row></sheetData></worksheet>""",
             )
         assert read_xlsx(xlsx_path) == "工作表 Ordered Sheet\nA |  | C"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        pdf_path = Path(temp_dir) / "sample.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n")
+        original_find_pdftotext = ingest_module.find_pdftotext
+        original_subprocess_run = ingest_module.subprocess.run
+
+        def fake_run(command, **kwargs):
+            Path(command[-1]).write_text("4.2 HPD (Human Presence Detection) Test", encoding="utf-8")
+
+            class Completed:
+                returncode = 0
+
+            return Completed()
+
+        try:
+            ingest_module.find_pdftotext = lambda: "pdftotext"
+            ingest_module.subprocess.run = fake_run
+            assert ingest_module._read_pdf_with_pdftotext(pdf_path) == "4.2 HPD (Human Presence Detection) Test"
+        finally:
+            ingest_module.find_pdftotext = original_find_pdftotext
+            ingest_module.subprocess.run = original_subprocess_run
 
     providers = (
         "jina_baidu_search",
@@ -608,7 +736,7 @@ AcWing 是一个算法交流平台。
         db_path = Path(temp_dir) / "knowledge.db"
         sqlite3.connect(db_path).close()
         try:
-            query_module.trigger_async_update = lambda *args, **kwargs: False
+            query_module.trigger_async_update = lambda *args, **kwargs: True
             query_module.search = lambda *args, **kwargs: (
                 [
                     {
@@ -629,6 +757,9 @@ AcWing 是一个算法交流平台。
             local_first = query_module.query(db_path, "FAT站位有哪些测试项", use_web=True, allow_api=False)
             assert local_first["source_type"] == "knowledge_base"
             assert local_first["web_search_used"] is False
+            assert local_first["async_update_scheduled"] is True
+            assert local_first["index_status"] == "updating"
+            assert "后台更新" in local_first["index_message"]
         finally:
             query_module.search = original_search
             query_module.trigger_async_update = original_trigger_async_update
