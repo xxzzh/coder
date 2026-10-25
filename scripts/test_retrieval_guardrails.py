@@ -806,7 +806,52 @@ AcWing 是一个算法交流平台。
             query_module.trigger_async_update = original_trigger_async_update
             query_module.web_search = original_web_search
     check_embedding_cache()
+    check_block_citations()
     print("retrieval guardrails: ok")
+
+
+def check_block_citations() -> None:
+    """Top evidence is cited as a whole section or table, not as its two best-scoring sentences."""
+    for question in ("FAI是什么的缩写", "FAI的全称是什么", "FAI是哪个词的简称", "缩写FAI"):
+        assert query_module.abbreviation_query_term(question) == "FAI", question
+    assert query_module.abbreviation_query_term("试运行的英文缩写是什么") is None
+
+    section = (
+        "return result; }\n---\n### 3.1 示例流程\n```\nRunDemo(mode=true)\n"
+        "  ├── 1. 准备环境\n  │\n  ├── 2. 检查电源（若 CheckPower=true）\n  └── 3. 网络连接\n```"
+    )
+    cited = query_module.block_citation(section, "示例流程依次做了哪些事", 1500)
+    assert cited.splitlines()[0] == "3.1 示例流程", cited  # lead-in from the previous section dropped
+    assert "2. 检查电源（若 CheckPower=true）" in cited and "3. 网络连接" in cited
+    assert "```" not in cited and "return result" not in cited and "│" not in cited.replace("├──", "")
+
+    table = "| 对比项 | 方案 A | 方案 B |\n|---|---|---|\n| 接口协议 | HTTP JSON | 本地进程 |\n| 请求次数 | 1 次 | 3-5 次 |\n| | | |"
+    cited = query_module.block_citation(table, "方案A和方案B有什么区别", 1500)
+    assert cited.splitlines() == ["对比项 | 方案 A | 方案 B", "接口协议 | HTTP JSON | 本地进程", "请求次数 | 1 次 | 3-5 次"]
+
+    long_rows = "\n".join(f"| {index} | 测试项{index} | " + "很长的测试方案描述" * 30 + " |" for index in range(1, 13))
+    cited = query_module.block_citation(long_rows, "包含哪些测试项", 1500)
+    assert all(f"测试项{index}" in cited for index in range(1, 13)) and len(cited) <= 1500  # rows shortened, none dropped
+
+    steps = "## 十一、添加新测试项\n" + "".join(f"### 步骤 {index}：第{index}步\n" + "代码行内容\n" * 40 for index in range(1, 6))
+    cited = query_module.block_citation(steps, "如何添加一个新测试项", 600)
+    assert len(cited) <= 600 and cited.endswith("步骤 5：第5步"), cited[-80:]
+    assert "本节其余部分：" in cited and "本节其余部分" not in query_module.block_citation(steps, "x", 300, outline=False)
+
+    kept = query_module.local_translate_to_chinese("场景 6：服务连接失败\n1. 检查 **EnableRemote**\n2. 检查 ServerAddress")
+    assert kept.splitlines() == ["场景 6：服务连接失败", "1. 检查 EnableRemote", "2. 检查 ServerAddress"]
+
+    # A short quote already contained in the whole-section quote must not take a citation slot.
+    deduped = query_module.grounded_citations(
+        {
+            "sources": [
+                {"source_id": 1, "citation": "参数甲电压，[1.0,2.0]，V\n示例测试，参数乙电压，[3.0,4.0]，V\n参数丙电压，[5.0,6.0]，V"},
+                {"source_id": 2, "citation": "示例测试，参数乙电压，[3.0,4.0]，V"},
+                {"source_id": 3, "citation": "示例测试，Voltage，[7.0,8.0]，V"},
+            ]
+        }
+    )
+    assert [item["source_id"] for item in deduped] == [1, 3]
 
 
 def check_embedding_cache() -> None:

@@ -71,6 +71,11 @@ NEGATIVE_CACHE_TTL_SECONDS = 120
 DEFAULT_API_TIMEOUT_SECONDS = 20
 SECTION_CONTEXT_FORWARD_CHUNKS = 4
 SECTION_CONTEXT_MAX_CHARS = 3200
+# Evidence budgets for local answers built without an LLM.
+PRIMARY_CITATION_MAX_CHARS = 1500
+SECONDARY_BLOCK_MAX_CHARS = 300
+TABLE_ROW_MAX_CHARS = 120
+SECTION_SCAN_MAX_CHUNKS = 40
 CACHE_VARIANT_VERSION = "retrieval-v53:subject-coverage-gate-no-canned-answers"
 ITERATIVE_RETRIEVAL_LIMIT = 12
 EMBEDDING_CACHE: dict[str, Any] = {"key": None, "rows": []}
@@ -1304,6 +1309,128 @@ def citation_for_text(text: str, question: str, max_len: int = 360) -> str:
     return human_text(text, max_len=max_len)
 
 
+def evidence_lines(text: str) -> list[tuple[str, int]]:
+    """Readable lines of a chunk as (text, heading level or 0).
+
+    Markdown markers, code-fence lines, rules, table separators and empty table cells are
+    removed; line structure, numbering and code are kept.
+    """
+    lines: list[tuple[str, int]] = []
+    for raw_line in unescape(text).splitlines():
+        line = raw_line.strip()
+        if not line or re.fullmatch(r"```[\w+-]*|[-*_=]{3,}|\|?[\s:|-]*-{3,}[\s:|-]*\|?", line):
+            continue
+        heading = re.match(r"(#{1,6})\s+", line)
+        level = len(heading.group(1)) if heading else 0
+        line = re.sub(r"^#{1,6}\s+|^>\s*|^[-*+]\s+", "", line)
+        line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
+        line = strip_markdown_emphasis(line)
+        if "|" in line:
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            line = " | ".join(cell for cell in cells if cell)
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        # Drop lines with no letters or digits: tree glyphs, braces, empty table rows.
+        if re.search(r"\w", line):
+            lines.append((line, level))
+    return lines
+
+
+def block_citation(text: str, question: str, max_chars: int, outline: bool = True) -> str:
+    """A whole section or table as cited evidence, kept within max_chars.
+
+    Lead-in lines that belong to the previous section are dropped. When the section is
+    longer than the budget and outline is set, the sub-headings that did not fit are listed
+    so a step-by-step answer still shows every step.
+    """
+    lines = evidence_lines(text)
+    if not lines:
+        return citation_for_text(text, question)
+    terms = candidate_terms(question)
+    first_heading = next((index for index, (_, level) in enumerate(lines) if level), None)
+    if first_heading and not any(sentence_score(line, terms) for line, _ in lines[:first_heading]):
+        lines = lines[first_heading:]
+    top_level = min((level for _, level in lines if level), default=0)
+    is_table = len(lines) >= 2 and sum(" | " in line for line, _ in lines) >= len(lines) * 0.5
+    if is_table:
+        rows = [line for line, _ in lines]
+        if sum(len(row) + 1 for row in rows) > max_chars:
+            # Shorten rows before dropping any: leading cells (number, item, sub-item) identify a row,
+            # long procedure descriptions come later.
+            rows = [row if len(row) <= TABLE_ROW_MAX_CHARS else row[: TABLE_ROW_MAX_CHARS - 1] + "…" for row in rows]
+        if sum(len(row) + 1 for row in rows) <= max_chars:
+            return "\n".join(rows)
+        # Still too long: rows matching the question first, original order otherwise.
+        order = sorted(range(len(rows)), key=lambda index: (sentence_score(rows[index], terms) == 0, index))
+        kept: set[int] = set()
+        used = 0
+        for index in order:
+            if used + len(rows[index]) + 1 <= max_chars:
+                kept.add(index)
+                used += len(rows[index]) + 1
+        return "\n".join(row for index, row in enumerate(rows) if index in kept)
+
+    selected: list[str] = []
+    used = 0
+    cut_at = None
+    for index, (line, _) in enumerate(lines):
+        if used + len(line) + 1 > max_chars:
+            cut_at = index
+            break
+        selected.append(line)
+        used += len(line) + 1
+    if cut_at is None:
+        return "\n".join(selected)
+    remaining_headings = [line for line, level in lines[cut_at:] if level and level > top_level] if outline else []
+    if remaining_headings:
+        outline = "本节其余部分：" + "；".join(remaining_headings)
+        while selected and used + len(outline) > max_chars:
+            used -= len(selected.pop()) + 1
+        selected.append(outline)
+    elif selected:
+        selected[-1] = selected[-1] + "…"
+    else:
+        selected.append(lines[0][0][: max_chars - 1] + "…")
+    return "\n".join(selected)
+
+
+def full_section_text(db_path: Path, row: dict[str, Any]) -> str:
+    """The row's Markdown section through to the next heading of the same or a higher level."""
+    text = str(row.get("text", ""))
+    level = first_markdown_heading_level(text)
+    if (
+        str(row.get("file_type", "")).lower() not in {"md", "markdown"}
+        or level is None
+        or row.get("doc_id") is None
+        or row.get("chunk_index") is None
+        or markdown_table_of_contents(text)
+    ):
+        return text
+    last_index = int(row["chunk_index"]) + max(0, len(row.get("context_chunk_ids") or [row.get("chunk_id")]) - 1)
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            neighbors = conn.execute(
+                "SELECT text FROM chunks WHERE doc_id = ? AND chunk_index > ? AND chunk_index <= ? ORDER BY chunk_index",
+                (row["doc_id"], last_index, last_index + SECTION_SCAN_MAX_CHUNKS),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return text
+    parts = [text]
+    for (neighbor_text,) in neighbors:
+        neighbor_level = first_markdown_heading_level(str(neighbor_text))
+        if neighbor_level is not None and neighbor_level <= level:
+            break
+        parts.append(str(neighbor_text))
+    return "\n\n".join(parts)
+
+
+def primary_citation(db_path: Path, row: dict[str, Any], question: str) -> str:
+    """Citation for the top-ranked evidence: its whole section or table, not two sentences."""
+    return block_citation(full_section_text(db_path, row), question, PRIMARY_CITATION_MAX_CHARS)
+
+
 def citation_for_retrieval_row(row: dict[str, Any], question: str) -> str:
     text = str(row["text"])
     if row.get("context_expanded") or re.search(
@@ -1311,7 +1438,7 @@ def citation_for_retrieval_row(row: dict[str, Any], question: str) -> str:
         text,
         flags=re.IGNORECASE | re.MULTILINE,
     ):
-        return human_text(text, max_len=1800)
+        return block_citation(text, question, SECONDARY_BLOCK_MAX_CHARS, outline=False)
     return citation_for_text(text, question)
 
 
@@ -1368,7 +1495,12 @@ def abbreviation_query_term(question: str) -> str | None:
     normalized = normalized_retrieval_question(question)
     normalized = re.sub(r"\s+", " ", normalize_search_question(normalized)).strip()
     normalized = re.sub(r"^(?:缩写|简称)\s*", "", normalized)
-    normalized = re.sub(r"\s*(?:缩写|简称)$", "", normalized)
+    # 「FAI是什么的缩写」「FAI的全称是什么」「FAI是哪个词的简称」 all ask about FAI.
+    normalized = re.sub(
+        r"\s*(?:(?:是|为)?(?:什么|哪个词|哪个单词)?的)?(?:英文)?(?:缩写|简称|全称)(?:是什么|是啥|是)?$",
+        "",
+        normalized,
+    )
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9/._+-]{1,15}", normalized):
         return normalized.upper()
     return None
@@ -3382,7 +3514,9 @@ def grounded_citations(result: dict[str, Any]) -> list[dict[str, Any]]:
         normalized_quote = re.sub(r"\W+", "", str(quote).lower())
         if any(
             normalized_quote == existing
-            or (min(len(normalized_quote), len(existing)) >= 40 and (normalized_quote in existing or existing in normalized_quote))
+            # A quote already shown inside an earlier (e.g. whole-section) quote adds nothing.
+            or (len(normalized_quote) >= 12 and normalized_quote in existing)
+            or (min(len(normalized_quote), len(existing)) >= 40 and existing in normalized_quote)
             or SequenceMatcher(None, normalized_quote, existing).ratio() >= 0.86
             for existing in seen_quotes
         ):
@@ -3676,11 +3810,14 @@ def apply_citation_validation(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def local_translate_to_chinese(text: str) -> str:
+    if re.search(r"[\u4e00-\u9fff]", str(text or "")):
+        # Chinese evidence needs no translation: keep its line structure and full length
+        # (citations are already budgeted) instead of flattening it into 520 characters.
+        lines = (re.sub(r"[ \t]+", " ", line).strip() for line in to_simplified(unescape(str(text))).splitlines())
+        return "\n".join(strip_markdown_emphasis(line) for line in lines if line)
     text = human_text(text, max_len=520, simplify=True)
     if not text:
         return ""
-    if re.search(r"[\u4e00-\u9fff]", text):
-        return text
     french_markers = (
         " à ",
         " au ",
@@ -3735,17 +3872,18 @@ def chinese_grounded_fallback(result: dict[str, Any]) -> dict[str, Any]:
         result["api_used"] = False
         return result
     source_type = result.get("source_type")
-    translated_citations: list[str] = []
     citations = synthesis_citations(result)
     summary_source_ids = set(result.get("summary_source_ids") or [])
     if summary_source_ids:
         citations = [citation for citation in citations if citation.get("source_id") in summary_source_ids]
     citation_limit = 2 if source_type == "web_search" else 3
+    pieces: list[tuple[str, Any]] = []
     for citation in citations[:citation_limit]:
         translated = local_translate_to_chinese(str(citation.get("quote", "")))
         if translated:
             translated = strip_native_reference_markers(translated)
-            translated_citations.append(f"{trim_terminal_punctuation(translated)} [{citation['source_id']}]")
+            pieces.append((trim_terminal_punctuation(translated), citation["source_id"]))
+    translated_citations = [f"{' '.join(text.splitlines())} [{source_id}]" for text, source_id in pieces]
     if translated_citations:
         if source_type == "web_search":
             prefix = "根据联网搜索资料，"
@@ -3753,7 +3891,15 @@ def chinese_grounded_fallback(result: dict[str, Any]) -> dict[str, Any]:
             prefix = "根据本地知识库和联网资料，"
         else:
             prefix = "根据本地知识库，"
-        result["answer"] = prefix + "；".join(translated_citations) + "。"
+        lead_text, lead_id = pieces[0]
+        if "\n" in lead_text:
+            # A whole section or table: one bullet per line so the Web UI renders a list.
+            answer = prefix.rstrip("，") + "：\n\n" + "\n".join(f"- {line}" for line in lead_text.splitlines()) + f" [{lead_id}]"
+            if len(translated_citations) > 1:
+                answer += "\n\n补充：" + "；".join(translated_citations[1:]) + "。"
+            result["answer"] = answer
+        else:
+            result["answer"] = prefix + "；".join(translated_citations) + "。"
         result["answer_mode"] = "local_translation_grounded_summary"
     elif source_type == "web_search":
         result["answer"] = (
@@ -4117,7 +4263,7 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
     sources: list[dict[str, Any]] = []
     citations: list[dict[str, Any]] = []
     for index, row in enumerate(rows, start=1):
-        citation = citation_for_retrieval_row(row, question)
+        citation = primary_citation(db_path, row, question) if index == 1 else citation_for_retrieval_row(row, question)
         source = {
             "source_id": index,
             "file": row["file_name"],
