@@ -805,7 +805,76 @@ AcWing 是一个算法交流平台。
             query_module.search = original_search
             query_module.trigger_async_update = original_trigger_async_update
             query_module.web_search = original_web_search
+    check_embedding_cache()
     print("retrieval guardrails: ok")
+
+
+def check_embedding_cache() -> None:
+    """Unchanged chunk texts are never re-embedded; vectors never leak across models."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        vector_dir = Path(temp_dir)
+        cache = vector_store.EmbeddingCache("test|model", vector_dir)
+        cache.put_many([("a", [0.5, 0.25]), ("b", [1.0, 0.0])])
+        assert cache.get_many(["a", "missing"]) == {"a": [0.5, 0.25]}
+        assert cache.prune(["a"]) == 1 and cache.count() == 1
+        cache.close()
+        other_model = vector_store.EmbeddingCache("other|model", vector_dir)
+        assert other_model.get_many(["a"]) == {}
+        other_model.close()
+
+        calls: list[list[str]] = []
+
+        def fake_embed(texts: list[str], config: dict | None = None, **kwargs: object) -> dict:
+            calls.append(list(texts))
+            return {"ok": True, "vectors": [[float(len(text)), 1.0] for text in texts]}
+
+        original_embed = model_capabilities.embed_texts
+        original_vector_dir = vector_store.VECTOR_DIR
+        try:
+            model_capabilities.embed_texts = fake_embed
+            vector_store.VECTOR_DIR = vector_dir / "index"
+            embedding = {"provider": "openai-compatible", "model": "fake", "base_url": "", "requested_dimensions": 2}
+            first = ingest_module.embed_records_with_cache([{"text": "alpha"}, {"text": "beta"}, {"text": "alpha"}], embedding, {})
+            assert first["ok"] and first["embedded_chunks"] == 3 and first["reused_chunks"] == 0
+            assert calls == [["alpha", "beta"]], calls  # a repeated chunk text is embedded once
+            second = ingest_module.embed_records_with_cache([{"text": "alpha"}, {"text": "gammas"}], embedding, {})
+            assert calls[-1] == ["gammas"], calls  # only the new chunk reaches the model
+            assert second["embedded_chunks"] == 1 and second["reused_chunks"] == 1
+            assert second["vectors"] == [[5.0, 1.0], [6.0, 1.0]]
+            third = ingest_module.embed_records_with_cache([{"text": "alpha"}, {"text": "gammas"}], embedding, {})
+            assert len(calls) == 2 and third["reused_chunks"] == 2  # fully cached: no model call at all
+            other = ingest_module.embed_records_with_cache([{"text": "alpha"}], {**embedding, "model": "other"}, {})
+            assert calls[-1] == ["alpha"] and other["embedded_chunks"] == 1  # another model never reuses vectors
+
+            if vector_store.faiss_dependency_status()["available"]:
+                index_dir = vector_dir / "faiss"
+                records = [
+                    {"chunk_id": f"c{index}", "doc_id": "d", "file_name": "f.md", "file_path": "f.md", "file_type": "md", "chunk_index": index}
+                    for index in range(2)
+                ]
+                vector_store.build_vector_index(records, [[1.0, 0.0], [0.0, 1.0]], {}, vector_dir=index_dir)
+                first_load = vector_store.load_index(index_dir)
+                assert vector_store.load_index(index_dir)[0] is first_load[0]  # served from memory
+                assert vector_store.search_vector_index([1.0, 0.0], 1, vector_dir=index_dir)["rows"][0]["chunk_id"] == "c0"
+                vector_store.build_vector_index(records, [[0.0, 1.0], [1.0, 0.0]], {}, vector_dir=index_dir)
+                assert vector_store.load_index(index_dir)[0] is not first_load[0]  # rewritten files reload
+                assert vector_store.search_vector_index([1.0, 0.0], 1, vector_dir=index_dir)["rows"][0]["chunk_id"] == "c1"
+
+                vector_store.VECTOR_DIR = index_dir
+                conn = sqlite3.connect(":memory:")
+                conn.execute("CREATE TABLE chunks(chunk_id TEXT, text TEXT)")
+                conn.executemany("INSERT INTO chunks VALUES (?, ?)", [("c0", "zero"), ("c1", "one")])
+                metadata = {"model": "seeded", "provider": "openai-compatible", "indexed_at": "t1", "chunk_count": 2}
+                seeded_embedding = {**embedding, "model": "seeded"}
+                assert ingest_module.seed_embedding_cache_from_index(conn, seeded_embedding, "t0", metadata) == 0  # stale index
+                assert ingest_module.seed_embedding_cache_from_index(conn, seeded_embedding, "t1", metadata) == 2
+                calls.clear()
+                reused = ingest_module.embed_records_with_cache([{"text": "zero"}, {"text": "one"}], seeded_embedding, {})
+                assert calls == [] and reused["vectors"] == [[0.0, 1.0], [1.0, 0.0]]
+                conn.close()
+        finally:
+            model_capabilities.embed_texts = original_embed
+            vector_store.VECTOR_DIR = original_vector_dir
 
 
 if __name__ == "__main__":

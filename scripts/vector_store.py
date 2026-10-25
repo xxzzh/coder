@@ -4,10 +4,14 @@
 
 from __future__ import annotations
 
+from array import array
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
-from typing import Any
+import sqlite3
+import threading
+from typing import Any, Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +19,79 @@ VECTOR_DIR = ROOT / "knowledge_base" / "vector"
 FAISS_PATH = VECTOR_DIR / "chunks.faiss"
 MAP_PATH = VECTOR_DIR / "chunks_map.json"
 METADATA_PATH = VECTOR_DIR / "vector_metadata.json"
+# Not removed by reset_vector_index() or `rebuild`: re-embedding unchanged chunks with a local
+# model such as BGE-M3 costs over half an hour on CPU for ~1500 chunks.
+EMBEDDING_CACHE_FILE = "embedding_cache.sqlite"
+SQLITE_BATCH = 500
+
+_INDEX_CACHE: dict[str, Any] = {"key": None, "index": None, "mapping": None}
+_INDEX_CACHE_LOCK = threading.Lock()
+
+
+def text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class EmbeddingCache:
+    """Chunk vectors keyed by (embedding model key, sha256 of the exact chunk text)."""
+
+    def __init__(self, model_key: str, vector_dir: Path | None = None) -> None:
+        vector_dir = vector_dir or VECTOR_DIR
+        vector_dir.mkdir(parents=True, exist_ok=True)
+        self.model_key = model_key
+        self.conn = sqlite3.connect(vector_dir / EMBEDDING_CACHE_FILE)
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vectors (
+                model_key TEXT NOT NULL,
+                text_hash TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                vector BLOB NOT NULL,
+                PRIMARY KEY (model_key, text_hash)
+            )
+            """
+        )
+
+    def count(self) -> int:
+        return int(self.conn.execute("SELECT COUNT(*) FROM vectors WHERE model_key = ?", (self.model_key,)).fetchone()[0])
+
+    def get_many(self, hashes: Iterable[str]) -> dict[str, list[float]]:
+        wanted = list(dict.fromkeys(hashes))
+        found: dict[str, list[float]] = {}
+        for start in range(0, len(wanted), SQLITE_BATCH):
+            batch = wanted[start : start + SQLITE_BATCH]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.conn.execute(
+                f"SELECT text_hash, dimension, vector FROM vectors WHERE model_key = ? AND text_hash IN ({placeholders})",
+                (self.model_key, *batch),
+            ).fetchall()
+            for digest, dimension, blob in rows:
+                values = array("f")
+                values.frombytes(blob)
+                if len(values) == dimension:
+                    found[digest] = values.tolist()
+        return found
+
+    def put_many(self, items: Iterable[tuple[str, list[float]]]) -> int:
+        rows = [(self.model_key, digest, len(vector), array("f", vector).tobytes()) for digest, vector in items]
+        self.conn.executemany("INSERT OR REPLACE INTO vectors VALUES (?, ?, ?, ?)", rows)
+        self.conn.commit()
+        return len(rows)
+
+    def prune(self, keep_hashes: Iterable[str]) -> int:
+        """Drop this model's vectors for chunk texts that no longer exist, so the file stays index-sized."""
+        keep = set(keep_hashes)
+        stale = [
+            (self.model_key, digest)
+            for (digest,) in self.conn.execute("SELECT text_hash FROM vectors WHERE model_key = ?", (self.model_key,))
+            if digest not in keep
+        ]
+        self.conn.executemany("DELETE FROM vectors WHERE model_key = ? AND text_hash = ?", stale)
+        self.conn.commit()
+        return len(stale)
+
+    def close(self) -> None:
+        self.conn.close()
 
 
 def faiss_dependency_status() -> dict[str, Any]:
@@ -154,16 +231,40 @@ def build_vector_index(
     return payload
 
 
+def load_index(vector_dir: Path | None = None) -> tuple[Any, list[dict[str, Any]]]:
+    """FAISS index and chunk map, kept in memory until either file changes on disk."""
+    import faiss  # type: ignore
+
+    vector_dir = vector_dir or VECTOR_DIR
+    faiss_path = vector_dir / "chunks.faiss"
+    map_path = vector_dir / "chunks_map.json"
+    faiss_stat = faiss_path.stat()
+    map_stat = map_path.stat()
+    key = (str(faiss_path.resolve()), faiss_stat.st_mtime_ns, faiss_stat.st_size, map_stat.st_mtime_ns, map_stat.st_size)
+    with _INDEX_CACHE_LOCK:
+        if _INDEX_CACHE["key"] == key:
+            return _INDEX_CACHE["index"], _INDEX_CACHE["mapping"]
+        index = faiss.read_index(str(faiss_path))
+        mapping = json.loads(map_path.read_text(encoding="utf-8"))
+        _INDEX_CACHE.update(key=key, index=index, mapping=mapping)
+        return index, mapping
+
+
+def index_vectors(vector_dir: Path | None = None) -> tuple[list[dict[str, Any]], list[list[float]]]:
+    """All stored vectors with their chunk map rows, in FAISS id order."""
+    index, mapping = load_index(vector_dir)
+    vectors = index.reconstruct_n(0, index.ntotal).tolist() if index.ntotal else []
+    return mapping, vectors
+
+
 def search_vector_index(query_vector: list[float], limit: int, vector_dir: Path = VECTOR_DIR) -> dict[str, Any]:
     status = vector_status(vector_dir=vector_dir)
     if not status["ready"]:
         return {"ok": False, "rows": [], "status": status}
     try:
-        import faiss  # type: ignore
         import numpy as np  # type: ignore
 
-        index = faiss.read_index(str(vector_dir / "chunks.faiss"))
-        mapping = json.loads((vector_dir / "chunks_map.json").read_text(encoding="utf-8"))
+        index, mapping = load_index(vector_dir)
         vector = np.array([query_vector], dtype="float32")
         scores, ids = index.search(vector, max(1, limit))
     except Exception as exc:  # noqa: BLE001

@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import hashlib
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -150,6 +152,55 @@ def embedding_status(config: dict[str, str] | None = None) -> dict[str, Any]:
     return {**public, "ready": True, "reason": "ready"}
 
 
+def local_model_revision(model_name: str, cache_folder: Path) -> str:
+    """Snapshot commit of a cached Hub model ("local-path" for a directory, "unknown" if not cached)."""
+    if Path(model_name).is_dir():
+        return "local-path"
+    try:
+        from huggingface_hub import try_to_load_from_cache  # type: ignore
+
+        cached = try_to_load_from_cache(model_name, "config.json", cache_dir=str(cache_folder))
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    return Path(cached).parent.name if isinstance(cached, str) else "unknown"
+
+
+def embedding_model_key(cfg: dict[str, Any]) -> str:
+    """Identifies which model produced a vector, so cached vectors are never mixed across models."""
+    provider = str(cfg.get("provider", ""))
+    model = str(cfg.get("model", ""))
+    if is_local_embedding_provider(provider):
+        revision = local_model_revision(model, project_runtime.CACHE_DIR / "huggingface")
+        return f"local|{model}|{revision}|normalized"
+    return f"api|{provider}|{cfg.get('base_url', '')}|{model}|{cfg.get('requested_dimensions', '')}"
+
+
+QUERY_EMBEDDING_CACHE: "OrderedDict[tuple[str, str], list[float]]" = OrderedDict()
+QUERY_EMBEDDING_CACHE_SIZE = 256
+QUERY_EMBEDDING_LOCK = threading.Lock()
+
+
+def embed_query(text: str, config: dict[str, str] | None = None) -> dict[str, Any]:
+    """Embed one question, reusing the vector when the same question is embedded again in this process.
+
+    A refused question is searched twice (answer attempt, then suggestion check); each local
+    BGE-M3 encode costs ~0.1 s on CPU.
+    """
+    cfg = embedding_config(config)
+    key = (embedding_model_key(cfg), text)
+    with QUERY_EMBEDDING_LOCK:
+        if key in QUERY_EMBEDDING_CACHE:
+            QUERY_EMBEDDING_CACHE.move_to_end(key)
+            return {"ok": True, "vectors": [QUERY_EMBEDDING_CACHE[key]], "cached": True}
+    result = embed_texts([text], config)
+    if result.get("ok") and result.get("vectors"):
+        with QUERY_EMBEDDING_LOCK:
+            QUERY_EMBEDDING_CACHE[key] = result["vectors"][0]
+            while len(QUERY_EMBEDDING_CACHE) > QUERY_EMBEDDING_CACHE_SIZE:
+                QUERY_EMBEDDING_CACHE.popitem(last=False)
+    return result
+
+
 def stable_text_hash(text: str) -> str:
     return hashlib.sha256(re.sub(r"\s+", " ", text).strip().encode("utf-8")).hexdigest()
 
@@ -217,6 +268,18 @@ def embed_texts(
     }
 
 
+def local_model_is_cached(model_name: str, cache_folder: Path) -> bool:
+    """True when the model's files are already in the project cache (or model_name is a local path)."""
+    if Path(model_name).is_dir():
+        return True
+    try:
+        from huggingface_hub import try_to_load_from_cache  # type: ignore
+
+        return isinstance(try_to_load_from_cache(model_name, "config.json", cache_dir=str(cache_folder)), str)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def embed_texts_local(texts: list[str], cfg: dict[str, Any]) -> dict[str, Any]:
     global LOCAL_EMBEDDING_MODEL
     project_runtime.apply_project_runtime_env()
@@ -225,9 +288,14 @@ def embed_texts_local(texts: list[str], cfg: dict[str, Any]) -> dict[str, Any]:
 
         model_name = str(cfg["model"])
         if LOCAL_EMBEDDING_MODEL is None or getattr(LOCAL_EMBEDDING_MODEL, "_lka_model_name", "") != model_name:
+            cache_folder = project_runtime.CACHE_DIR / "huggingface"
+            # Once cached, never touch the Hub: offline machines would stall here, and transformers
+            # otherwise starts a background download of a safetensors conversion (~2.3 GB for bge-m3)
+            # that also keeps the process from exiting.
             LOCAL_EMBEDDING_MODEL = SentenceTransformer(
                 model_name,
-                cache_folder=str(project_runtime.CACHE_DIR / "huggingface"),
+                cache_folder=str(cache_folder),
+                local_files_only=local_model_is_cached(model_name, cache_folder),
             )
             setattr(LOCAL_EMBEDDING_MODEL, "_lka_model_name", model_name)
         vectors_raw = LOCAL_EMBEDDING_MODEL.encode(

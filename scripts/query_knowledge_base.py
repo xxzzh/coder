@@ -903,7 +903,7 @@ def external_vector_candidates(
     status = vector_store.vector_status(sqlite_chunk_count=sqlite_chunk_count)
     if not status.get("ready"):
         return []
-    embedded = model_capabilities.embed_texts([question], config)
+    embedded = model_capabilities.embed_query(question, config)
     if not embedded.get("ok") or not embedded.get("vectors"):
         return []
     vector_rows = vector_store.search_vector_index(embedded["vectors"][0], max(limit * 20, 100))

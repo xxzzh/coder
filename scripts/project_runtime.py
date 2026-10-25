@@ -34,6 +34,9 @@ def apply_project_runtime_env() -> dict[str, str]:
     for key, value in paths.items():
         os.environ.setdefault(key, value)
         Path(value).mkdir(parents=True, exist_ok=True) if key.endswith(("DIR", "HOME", "CACHE", "PATH")) else None
+    # transformers otherwise starts a background download of a safetensors conversion whenever a
+    # .bin-only model such as BAAI/bge-m3 loads (~2.3 GB), and the process cannot exit until it ends.
+    os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "true")
     return paths
 
 
