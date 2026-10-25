@@ -8,6 +8,8 @@ knowledge_base/vector/
 logs/
 output/
 tmp/
+eval/results/
+eval/eval_set.jsonl
 tools/cache/
 
 .env

@@ -71,7 +71,7 @@ NEGATIVE_CACHE_TTL_SECONDS = 120
 DEFAULT_API_TIMEOUT_SECONDS = 20
 SECTION_CONTEXT_FORWARD_CHUNKS = 4
 SECTION_CONTEXT_MAX_CHARS = 3200
-CACHE_VARIANT_VERSION = "retrieval-v52:validated-guidance-candidates"
+CACHE_VARIANT_VERSION = "retrieval-v53:subject-coverage-gate-no-canned-answers"
 ITERATIVE_RETRIEVAL_LIMIT = 12
 EMBEDDING_CACHE: dict[str, Any] = {"key": None, "rows": []}
 EMBEDDING_CACHE_LOCK = threading.Lock()
@@ -178,6 +178,29 @@ CHINESE_QUERY_STOP_PHRASES = (
     "作用",
     "一下",
 )
+# Words that only express the kind of question (how / what / difference / steps / translation),
+# never its subject. The local relevance gate ignores them when measuring how much of the
+# question's subject a retrieved chunk covers. Longest phrases are removed first.
+QUESTION_FUNCTION_PHRASES = tuple(
+    sorted(
+        {
+            *CHINESE_QUERY_STOP_PHRASES,
+            "请介绍", "介绍", "说明一下", "解释一下", "请问", "请",
+            "什么是", "什么样", "什么", "怎么办", "怎么说", "怎么", "怎样", "为何",
+            "是不是", "有没有", "能不能", "可不可以", "能否",
+            "都有哪些", "有那些", "哪些", "那些", "哪几个", "哪几种", "哪几", "哪个", "哪种", "哪儿",
+            "有几", "几个", "几种", "分别", "区别", "差别", "差异", "不同", "对比", "比较",
+            "一个", "一些", "具体", "主要", "包括", "包含",
+            "原因", "用途", "意思", "含义", "定义", "方法", "办法", "方式", "步骤", "流程", "过程",
+            "机制", "原理", "逻辑", "规则", "英文", "中文", "英语", "全称", "缩写", "简称",
+            "需要", "应该", "以及", "或者", "还是",
+            "的", "了", "吗", "呢", "吧", "啊", "呀", "么", "和", "与", "及", "是", "都", "也",
+        },
+        key=len,
+        reverse=True,
+    )
+)
+LOCAL_CONTENT_COVERAGE_THRESHOLD = 0.5
 TRAD_TO_SIMP = str.maketrans(
     {
         "與": "与",
@@ -243,6 +266,14 @@ def to_simplified(text: str) -> str:
         return text.translate(TRAD_TO_SIMP)
 
 
+def strip_markdown_emphasis(text: str) -> str:
+    """Drop Markdown emphasis/code markers but keep identifiers such as GetWorkOrderData_V20 or 接口*2."""
+    text = text.replace("**", "").replace("~~", "").replace("`", "")
+    # Single-underscore/star emphasis only when it wraps a whole phrase at word boundaries.
+    text = re.sub(r"(?<![\w*])\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?![\w*])", r"\1", text)
+    return re.sub(r"(?<![\w])_(?=[^\s_])([^_\n]+?)(?<=[^\s_])_(?![\w])", r"\1", text)
+
+
 def human_text(text: str, max_len: int | None = None, simplify: bool = False) -> str:
     if simplify:
         text = to_simplified(text)
@@ -251,7 +282,7 @@ def human_text(text: str, max_len: int | None = None, simplify: bool = False) ->
     text = re.sub(r"^[ \t]*#{1,6}[ \t]*", "", text, flags=re.MULTILINE)
     text = re.sub(r"^[ \t]*[-*+]\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"^[ \t]*\d+[.)]\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"[*_`]+|~~", "", text)
+    text = strip_markdown_emphasis(text)
     text = re.sub(r"\s+", " ", text).strip()
     text = text.strip(" -#\t\r\n")
     if max_len is not None and len(text) > max_len:
@@ -265,8 +296,7 @@ def strip_markdown_preserve_lines(text: str) -> str:
     text = re.sub(r"^[ \t]*#{1,6}[ \t]*", "", text, flags=re.MULTILINE)
     text = re.sub(r"^[ \t]*[-*+]\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"^[ \t]*\d+[.)]\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"[*_`]+|~~", "", text)
-    return text
+    return strip_markdown_emphasis(text)
 
 
 def trim_terminal_punctuation(text: str) -> str:
@@ -1011,13 +1041,19 @@ def enumeration_or_list_question(question: str) -> bool:
 
 
 def fft_manual_function_question(question: str) -> bool:
-    normalized = normalized_retrieval_question(question)
-    return bool(re.search(r"人工功能测试|FFT\s*测试|MES[:：]\s*FFT", normalized, flags=re.IGNORECASE))
+    """Only a request for the item list itself, e.g. 「人工功能测试」 or 「FFT测试包含哪些测试项」.
 
-
-def local_cache_question(question: str) -> bool:
-    normalized = normalized_retrieval_question(question)
-    return "本地缓存" in normalized
+    A narrower question such as 「人工功能测试的 IR Camera 判定标准」 must go through
+    normal retrieval instead of receiving the whole list.
+    """
+    normalized = normalized_retrieval_question(question).strip()
+    return bool(
+        re.fullmatch(
+            r"(?:人工功能测试|FFT\s*测试|MES[:：]\s*FFT)\s*(?:都?(?:包含|包括|有))?\s*(?:哪些|那些)?\s*(?:测试项目?|项目?|内容)?",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def expand_fft_manual_table_context(
@@ -1295,14 +1331,20 @@ def polish_internal_answer_text(text: str) -> str:
     text = unescape(text)
     text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
     text = re.sub(r"\[([^\]]+)\]\((?:https?|file|#)[^)]+\)", r"\1", text)
-    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
-    text = re.sub(r"[*_`~]+", "", text)
+    # Keep code inside fences; only the fence markers are noise in a plain-text answer.
+    text = re.sub(r"(?m)^[ \t]*```[\w+-]*[ \t]*$\n?", "", text)
+    text = strip_markdown_emphasis(text)
     text = re.sub(r"[┌┬┐├┼┤└┴┘│┃╭╮╰╯╔╦╗╠╬╣╚╩╝]+", " ", text)
     text = re.sub(r"[─━—]{2,}", " ", text)
-    text = re.sub(r"\s*[|/\\]+\s*", "，", text)
+    # Markdown table separator rows such as |----|:---:| carry no content.
+    text = re.sub(r"(?:\|\s*:?-{3,}:?\s*)+\|?", "|", text)
+    text = re.sub(r"(?<![\w-])-{3,}(?![\w-])", " ", text)
+    # Table cell pipes become commas; slashes and backslashes belong to paths and identifiers.
+    text = re.sub(r"\s*\|+\s*", "，", text)
     text = re.sub(r"[<>《》]{2,}", " ", text)
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffd]+", "", text)
-    text = re.sub(r"\s*,\s*", "，", text)
+    # Only commas next to Chinese text are prose; [4.75,5.26] or f(a,b) must stay intact.
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s*,\s*|\s*,\s*(?=[\u4e00-\u9fff])", "，", text)
     text = re.sub(r"，{2,}", "，", text)
     text = re.sub(r"[ \t]+([，。；：、！？])", r"\1", text)
     text = re.sub(r"([，；：、])[ \t]+", r"\1", text)
@@ -1462,9 +1504,7 @@ def canonical_question_for_cache(question: str) -> str:
     abbreviation = abbreviation_query_term(normalized)
     if abbreviation:
         return f"abbreviation:{abbreviation.lower()}"
-    if local_cache_question(normalized):
-        return "topic:local-cache-recovery"
-    if re.search(r"FFT\s*测试|人工功能测试|MES[:：]\s*FFT", normalized, flags=re.IGNORECASE):
+    if fft_manual_function_question(normalized):
         return "test-item:fft-manual-function"
     station_name = requested_station_name(normalized)
     if station_name and station_test_item_question(normalized):
@@ -1991,60 +2031,6 @@ def structured_n972_excel_result(
     }
 
 
-def structured_work_order_flow_answer(question: str, sources: list[dict[str, Any]]) -> str | None:
-    normalized = normalized_retrieval_question(question)
-    if "工单数据" not in normalized or not re.search(r"获取|流程|路径", normalized):
-        return None
-    source = next(
-        (
-            item
-            for item in sources
-            if "mWoNoteItemList" in str(item.get("citation", ""))
-            and ("路径 A" in str(item.get("citation", "")) or "2 大入口方法" in str(item.get("citation", "")))
-        ),
-        sources[0] if sources else None,
-    )
-    source_id = int(source.get("source_id", 1)) if source else 1
-    return (
-        "工单数据获取流程如下：\n"
-        "- 数据最终存入 `mWoNoteItemList` 静态字典，测试项通过 key 读取工单数据。\n"
-        "- 路径 A：离线模式（MES 不在线）从 `C:\\ProgramData\\WONOTELIST.txt` 读取 `key:value`。\n"
-        "- 路径 B：MES 1.0 在线模式走 `GetWorkOrderData()`，包含 B1 `IMESAPI.GetMaterialData()` 获取 `TBMATERALEXTENDDATA`，B2 `GetSpeicalMaterialList()` 获取 `TBMATERIALSPEICAL`（仅 SFT 站），B3 `IMESAPI.GetSNBindInfo()` 获取 `TBLCUSTOMIZATIONDATA`（仅整机 SN）。\n"
-        "- 路径 C：MES 2.0 在线模式走 `GetWorkOrderData_V20()`，从 JSON 中填充 C1 `MAIN` 主数据，C2 `MAIN.MATERIALEXTEND[0]` 物料扩展，C3 `MAIN.MATERIALSPECIAL` 特殊物料，C4 `MAIN.ERP_WO_CONFIG` 定制化配置。\n"
-        "- 在执行阶段，各子测试项再通过 `mWoNoteItemList` 字典读取这些工单数据。"
-        f"[{source_id}]"
-    )
-
-
-def structured_local_cache_answer(question: str, sources: list[dict[str, Any]]) -> str | None:
-    if not local_cache_question(question):
-        return None
-    source = next(
-        (
-            item
-            for item in sources
-            if "EnableReadLocalStatus" in str(item.get("citation", ""))
-            or "Output/LocalData" in str(item.get("citation", ""))
-            or "LocalData" in str(item.get("citation", ""))
-        ),
-        sources[0] if sources else None,
-    )
-    if not source:
-        return None
-    source_id = int(source.get("source_id", 1))
-    return (
-        "本地缓存逻辑如下：\n"
-        "- 用途：支持断点续测。测试因重启（如 ColdBoot、S3/S4）中断后，已通过的测试项不需要重复执行。\n"
-        "- 缓存位置：`Output/LocalData/`。\n"
-        "- 状态缓存文件：`{站点}testitemlocalstate.dat`，保存每个测试项的通过/失败状态，JSON 序列化。\n"
-        "- 结果缓存文件：`{站点}LocalTestResult.dat`，保存每个测试项的完整子项结果，JSON 序列化。\n"
-        "- 状态值：`-1` 表示等待测试，`0` 表示测试失败，`1` 表示测试通过。\n"
-        "- 恢复逻辑：启动时如果 `EnableReadLocalStatus = true`，则逐个测试项读取 `LocalData` 中该 SN 与测试项的状态；状态为 `1` 时直接标记 PASS 并跳过执行，状态为 `0` 或 `-1` 时正常执行测试。\n"
-        "- MES/工单缓存：在线获取成功后会把 `mWoNoteItemList` 写入本地缓存，后续可由 MainWindow 读取本地缓存上报 MES。"
-        f"[{source_id}]"
-    )
-
-
 def extract_fft_manual_items(text: str) -> list[str]:
     records: list[str] = []
     current_parent = ""
@@ -2252,12 +2238,6 @@ def structured_local_answer(db_path: Path, question: str, sources: list[dict[str
     fft_manual_answer = structured_fft_manual_function_answer(db_path, question, sources)
     if fft_manual_answer:
         return fft_manual_answer
-    work_order_answer = structured_work_order_flow_answer(question, sources)
-    if work_order_answer:
-        return work_order_answer
-    local_cache_answer = structured_local_cache_answer(question, sources)
-    if local_cache_answer:
-        return local_cache_answer
     result = structured_station_result(db_path, question)
     if not result:
         return None
@@ -3321,17 +3301,72 @@ def lexical_query_coverage(question: str, text: str) -> float:
     return matched / len(terms)
 
 
+def query_content_units(question: str) -> list[tuple[str, str, float]]:
+    """Weighted subject units of a question as (kind, term, weight).
+
+    Each ASCII term (identifier, abbreviation, English word) weighs 1. Each Chinese
+    content span left after removing question-function words also weighs 1 in total,
+    spread over its distinct bigrams, so 「添加一个新测试项」 still mostly matches the
+    source wording 「添加新测试项」 instead of requiring the whole span verbatim.
+    """
+    normalized = normalized_retrieval_question(question)
+    abbreviation = abbreviation_query_term(normalized)
+    if abbreviation:
+        return [("ascii", abbreviation.lower(), 1.0)]
+    units: list[tuple[str, str, float]] = []
+    seen: set[str] = set()
+    for word in re.findall(r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_]*", normalized):
+        lowered = word.lower()
+        if len(lowered) < 2 or lowered in ENGLISH_QUERY_STOP_WORDS or lowered in seen:
+            continue
+        seen.add(lowered)
+        units.append(("ascii", lowered, 1.0))
+    chinese_text = normalized
+    for phrase in QUESTION_FUNCTION_PHRASES:
+        chinese_text = chinese_text.replace(phrase, " ")
+    for span in re.findall(r"[\u4e00-\u9fff]{2,}", chinese_text):
+        bigrams = [gram for gram in dict.fromkeys(span[index : index + 2] for index in range(len(span) - 1)) if gram not in seen]
+        if not bigrams:
+            continue
+        seen.update(bigrams)
+        units.extend(("cjk", gram, 1.0 / len(bigrams)) for gram in bigrams)
+    return units
+
+
+def content_coverage(units: list[tuple[str, str, float]], text: str) -> float:
+    """Share of the question's subject weight found in text (0..1)."""
+    total = sum(weight for _, _, weight in units)
+    if not total:
+        return 0.0
+    lowered = text.lower()
+    compact = re.sub(r"\s+", "", text)
+    matched = 0.0
+    for kind, term, weight in units:
+        if kind == "ascii":
+            # Short terms (PR, GW, AC) need a full word boundary; longer ones may prefix
+            # a compound such as Camera -> CameraTest.
+            pattern = rf"(?<![a-z0-9]){re.escape(term)}" + (r"(?![a-z0-9])" if len(term) < 3 else "")
+            if re.search(pattern, lowered):
+                matched += weight
+        elif term in compact:
+            matched += weight
+    return matched / total
+
+
 def local_result_is_relevant(rows: list[dict[str, Any]], question: str) -> bool:
     if not rows or rows[0].get("rerank_score", 0.0) < LOCAL_SCORE_THRESHOLD:
         return False
-    terms = meaningful_query_terms(question)
-    minimum_coverage = 1.0 if len(terms) <= 2 else 0.5
+    units = query_content_units(question)
+    if not units:
+        return False
     candidate_count = min(len(rows), 8 if iterative_retrieval_question(question) else 3)
     for row in rows[:candidate_count]:
         if row.get("rerank_score", 0.0) < LOCAL_SCORE_THRESHOLD * 0.8:
             continue
         has_lexical_score = float(row.get("keyword_score", 0.0) or 0.0) > 0 or float(row.get("fts_score", 0.0) or 0.0) > 0
-        if has_lexical_score and lexical_query_coverage(question, str(row.get("text", ""))) >= minimum_coverage:
+        # Strictly more than half: a chunk that only shares the subject (N972) but not the
+        # asked attribute (售价) must not count as evidence.
+        if has_lexical_score and content_coverage(units, str(row.get("text", ""))) > LOCAL_CONTENT_COVERAGE_THRESHOLD:
             return True
     return False
 

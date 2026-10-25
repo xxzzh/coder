@@ -317,6 +317,16 @@ knowledge_base/processed/extraction_report.jsonl
 
 当 `verify` 中 `extraction_report.requires_review` 为 `0` 时，说明当前导入没有发现明显的未抽取风险。若大于 `0`，不要把该索引当作完整知识库使用；应先处理报告中的文件。
 
+## 检索与问答评测
+
+改动检索、门槛或答案生成逻辑后，用评测集量化效果，并把结果追加到 `eval/experiment_log.md`：
+
+```bat
+.\run-agent.bat eval --log "这次改了什么"
+```
+
+评测不联网、不调用 API、关闭查询缓存，判分只用规则不用模型。指标定义、评测集格式和出题要求见 `eval/README.md`。
+
 ## 项目内本地审计
 
 本项目不依赖外部审计目录即可完成日常审计。解压后在项目根目录执行：

@@ -13,6 +13,7 @@ set "TRANSLATION_SETUP=%ROOT%scripts\install_translation_model.py"
 set "API_SETUP=%ROOT%scripts\configure_api.py"
 set "EMBEDDING_SETUP=%ROOT%scripts\configure_embedding.py"
 set "INSTALL_DEPS=%ROOT%scripts\install_project_dependencies.py"
+set "EVAL=%ROOT%eval\run_eval.py"
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 set "LKA_PROJECT_ROOT=%ROOT%"
@@ -50,6 +51,7 @@ if /I "%~1"=="ask" goto ask
 if /I "%~1"=="sources" goto sources
 if /I "%~1"=="rebuild" goto rebuild
 if /I "%~1"=="rebuild-strict" goto rebuild_strict
+if /I "%~1"=="eval" goto eval
 goto direct
 
 :usage
@@ -69,6 +71,7 @@ echo   .\run-agent.bat update
 echo   .\run-agent.bat sources
 echo   .\run-agent.bat rebuild
 echo   .\run-agent.bat rebuild-strict
+echo   .\run-agent.bat eval --log "change description"
 echo.
 echo Direct questions query the local knowledge base first. If local evidence is insufficient, web search is used automatically and source_type is web_search.
 exit /b 1
@@ -116,6 +119,11 @@ exit /b %ERRORLEVEL%
 
 :rebuild
 "%PY%" "%MANAGE%" rebuild "%ROOT%knowledge_base\raw"
+exit /b %ERRORLEVEL%
+
+:eval
+shift
+"%PY%" "%EVAL%" %1 %2 %3 %4 %5 %6 %7 %8 %9
 exit /b %ERRORLEVEL%
 
 :rebuild_strict

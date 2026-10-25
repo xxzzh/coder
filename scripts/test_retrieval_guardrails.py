@@ -70,10 +70,30 @@ def main() -> None:
     polished = polish_internal_answer_text(
         "根据本地知识库，├── STPM.sln / STPM.exe.config | USB2.0/USB3.2 \\ ProgramData ![Image 1](x) [1]。"
     )
-    assert "/" not in polished and "\\" not in polished and "|" not in polished
+    assert "|" not in polished
     assert "├" not in polished and "Image" not in polished
-    assert "STPM.sln，STPM.exe.config" in polished
+    assert "STPM.sln / STPM.exe.config" in polished and "USB2.0/USB3.2" in polished
     assert "[1]" in polished
+    # Identifiers, paths and numeric ranges must survive answer polishing.
+    polished = polish_internal_answer_text(
+        "缓存 `Output/LocalData/`，**EnableReadLocalStatus**，GetWorkOrderData_V20()，"
+        "C:\\ProgramData\\WONOTELIST.txt，SAMPLE_ENUM_VALUE，[4.75,5.26]，接口*2，90%*设计容量 [1]"
+    )
+    for fragment in (
+        "Output/LocalData/",
+        "EnableReadLocalStatus",
+        "GetWorkOrderData_V20()",
+        "C:\\ProgramData\\WONOTELIST.txt",
+        "SAMPLE_ENUM_VALUE",
+        "[4.75,5.26]",
+        "接口*2",
+        "90%*设计容量",
+    ):
+        assert fragment in polished, (fragment, polished)
+    assert "**" not in polished and "`" not in polished
+    polished = polish_internal_answer_text("LogMsgType 枚举 | 值 | 颜色 | |----|------| | INFO | 蓝色 |")
+    assert "---" not in polished and "INFO，蓝色" in polished
+    assert human_text("public enum EnumSample { SAMPLE_ENUM_VALUE, // 示例值 }").count("SAMPLE_ENUM_VALUE") == 1
     assert query_module.requested_station_name("FRT站位有哪些测试项") == "FRT"
     assert query_module.requested_station_name("FRT有哪些测试项") == "FRT"
     assert query_module.requested_station_name("FRT测试项有哪些") == "FRT"
@@ -86,7 +106,18 @@ def main() -> None:
     assert query_module.meaningful_query_terms("LogMsgType有那些值") == ["logmsgtype"]
     assert query_module.cache_key("FFT测试", 5, False) == query_module.cache_key("人工功能测试", 5, False)
     assert query_module.cache_key("FFT测试项", 5, False) == query_module.cache_key("FFT测试", 5, False)
-    assert query_module.cache_key("本地缓存", 5, False) == query_module.cache_key("本地缓存逻辑", 5, False)
+    # Different questions that merely share a topic word must not share one cached answer.
+    assert query_module.cache_key("本地缓存的配置开关", 5, False) != query_module.cache_key("本地缓存的完整生命周期", 5, False)
+    assert query_module.cache_key("人工功能测试的IR Camera判定标准", 5, False) != query_module.cache_key("人工功能测试", 5, False)
+    # Relevance gate: a paraphrase of a section title passes, a known subject with an unknown attribute does not.
+    assert query_module.local_result_is_relevant(
+        [{"rerank_score": 0.48, "keyword_score": 1.0, "fts_score": 0.1, "text": "十一、添加新测试项完整步骤 共需修改 5 处"}],
+        "如何添加一个新测试项",
+    )
+    assert not query_module.local_result_is_relevant(
+        [{"rerank_score": 0.6, "keyword_score": 1.0, "fts_score": 0.3, "text": "N972装备测试计划 测试流程图 SMT单板测试"}],
+        "N972的售价是多少",
+    )
     assert query_module.query_cache_variant({}, allow_api=False, use_web=False).startswith("local-only:")
     assert query_module.query_cache_variant({}, allow_api=False, use_web=True).startswith("web-enabled:")
     assert query_module.query_cache_variant({}, allow_api=False, use_web=False) != query_module.query_cache_variant(
