@@ -807,7 +807,83 @@ AcWing 是一个算法交流平台。
             query_module.web_search = original_web_search
     check_embedding_cache()
     check_block_citations()
+    check_structured_xlsx()
     print("retrieval guardrails: ok")
+
+
+def check_structured_xlsx() -> None:
+    """Excel chunks: merged cells filled, every value titled, no empty rows or padding columns."""
+
+    def cell(ref: str, value: str) -> str:
+        return f'<c r="{ref}" t="inlineStr"><is><t>{value}</t></is></c>'
+
+    table = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+        f'<row r="1">{cell("A1", "#")}{cell("B1", "测试项目")}{cell("D1", "测试门限")}{cell("E1", "单位")}</row>'
+        f'<row r="2">{cell("B2", "测试项")}{cell("C2", "测试子项")}</row>'
+        f'<row r="3">{cell("A3", "1")}{cell("B3", "风扇测试")}{cell("C3", "低速")}{cell("D3", "1000±100")}{cell("E3", "rpm")}</row>'
+        f'<row r="4">{cell("A4", "2")}{cell("C4", "高速")}{cell("D4", "3000±100")}{cell("E4", "rpm")}</row>'
+        '<row r="5"></row>'
+        f'<row r="6">{cell("Z6", "备注X")}</row>'
+        f'<row r="7">{cell("A7", "3")}{cell("B7", "电压测试")}{cell("C7", "Voltage")}{cell("D7", "[1.0,2.0]")}{cell("E7", "V")}</row>'
+        f'<row r="8">{cell("A8", "4")}{cell("C8", "Resolution")}{cell("D8", "1080P")}{cell("E8", "NA")}</row>'
+        '</sheetData><mergeCells count="6"><mergeCell ref="A1:A2"/><mergeCell ref="B1:C1"/>'
+        '<mergeCell ref="D1:D2"/><mergeCell ref="E1:E2"/><mergeCell ref="B3:B4"/><mergeCell ref="B7:B8"/></mergeCells></worksheet>'
+    )
+    cover = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+        f'<row r="1">{cell("A1", "文件名称")}{cell("B1", "示例装备测试计划")}</row>'
+        f'<row r="2">{cell("A2", "责任部门")}{cell("B2", "示例部门-测试组")}{cell("C2", "创建时间")}{cell("D2", "2025-11-18")}</row>'
+        "</sheetData></worksheet>"
+    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        xlsx_path = Path(temp_dir) / "plan.xlsx"
+        with zipfile.ZipFile(xlsx_path, "w") as archive:
+            archive.writestr(
+                "xl/workbook.xml",
+                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
+                '<sheet name="门限" sheetId="1" r:id="rId1"/><sheet name="封面" sheetId="2" r:id="rId2"/></sheets></workbook>',
+            )
+            archive.writestr(
+                "xl/_rels/workbook.xml.rels",
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="worksheet"/>'
+                '<Relationship Id="rId2" Target="worksheets/sheet2.xml" Type="worksheet"/></Relationships>',
+            )
+            archive.writestr("xl/worksheets/sheet1.xml", table)
+            archive.writestr("xl/worksheets/sheet2.xml", cover)
+        records = ingest_module.read_xlsx_records(xlsx_path)
+        # Rows under one merged item form one block; the overview lists every group's items.
+        assert records.split("\n\n") == [
+            "## 工作表 门限 / 风扇测试",
+            "门限 | #：1 | 测试项目/测试项：风扇测试 | 测试项目/测试子项：低速 | 测试门限：1000±100 | 单位：rpm",
+            "门限 | #：2 | 测试项目/测试项：风扇测试 | 测试项目/测试子项：高速 | 测试门限：3000±100 | 单位：rpm",
+            "## 工作表 门限",
+            "门限 | 备注X",
+            "## 工作表 门限 / 电压测试",
+            "门限 | #：3 | 测试项目/测试项：电压测试 | 测试项目/测试子项：Voltage | 测试门限：[1.0,2.0] | 单位：V",
+            "门限 | #：4 | 测试项目/测试项：电压测试 | 测试项目/测试子项：Resolution | 测试门限：1080P | 单位：NA",
+            "## 工作表 门限 概览",
+            "门限 概览 | 风扇测试：\n低速 1000±100\n高速 3000±100",
+            "门限 概览 | 电压测试：\nVoltage [1.0,2.0]\nResolution 1080P",
+            "## 工作表 封面",
+            "封面 | 文件名称 | 示例装备测试计划",
+            "封面 | 责任部门 | 示例部门-测试组 | 创建时间 | 2025-11-18",
+        ], records
+        legacy, report = ingest_module.read_xlsx_with_report(xlsx_path)
+        # documents.text keeps the old positional layout (padding columns included) for the table parsers.
+        assert legacy.startswith("工作表 门限\n# | 测试项目 |") and legacy.splitlines()[-6].count(" | ") == 25, legacy
+        assert report[ingest_module.CHUNK_TEXT_REPORT_KEY] == records
+
+    # A list question prefers the overview chunk that holds every item over one row of the group.
+    candidates = [
+        {"chunk_id": "row", "text": "表 | 测试项：A | 测试子项：B", "semantic_score": 0.70, "term_score": 1},
+        {"chunk_id": "overview", "text": "表 概览 | 组一：\nA B\nC D\nE F", "semantic_score": 0.66, "term_score": 1},
+    ]
+    assert query_module.enumeration_or_list_question("SFT主板功能测试包含哪些测试项")
+    assert [row["chunk_id"] for row in query_module.rerank(candidates, "组一包含哪些测试项", 2, {})] == ["overview", "row"]
+    assert [row["chunk_id"] for row in query_module.rerank(candidates, "组一的测试门限", 2, {})] == ["row", "overview"]
 
 
 def check_block_citations() -> None:

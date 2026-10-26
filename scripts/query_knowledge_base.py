@@ -76,6 +76,9 @@ PRIMARY_CITATION_MAX_CHARS = 1500
 SECONDARY_BLOCK_MAX_CHARS = 300
 TABLE_ROW_MAX_CHARS = 120
 SECTION_SCAN_MAX_CHUNKS = 40
+# Excel import writes per-group item lists as "<sheet> 概览 | <group>：" chunks.
+TABLE_OVERVIEW_MARKER = " 概览 | "
+OVERVIEW_LIST_BOOST = 1.1
 CACHE_VARIANT_VERSION = "retrieval-v53:subject-coverage-gate-no-canned-answers"
 ITERATIVE_RETRIEVAL_LIMIT = 12
 EMBEDDING_CACHE: dict[str, Any] = {"key": None, "rows": []}
@@ -1042,7 +1045,13 @@ def section_context_question(question: str) -> bool:
 
 
 def enumeration_or_list_question(question: str) -> bool:
-    return bool(re.search(r"有哪些|有那些|取值|枚举|列表|清单|有啥|有.*值|what\s+are|enum|values", question, flags=re.IGNORECASE))
+    return bool(
+        re.search(
+            r"哪些|那些|包含|包括|都有|几个|几种|几项|取值|枚举|列表|清单|有啥|有.*值|what\s+are|enum|values|list",
+            question,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def fft_manual_function_question(question: str) -> bool:
@@ -1167,6 +1176,7 @@ def expand_section_context(
 def rerank(rows: list[dict[str, Any]], question: str, limit: int, config: dict[str, str] | None = None) -> list[dict[str, Any]]:
     terms = candidate_terms(question)
     query_embedding = local_embedding(question)
+    list_question = enumeration_or_list_question(question)
     merged: dict[str, dict[str, Any]] = {}
 
     for row in rows:
@@ -1198,6 +1208,10 @@ def rerank(rows: list[dict[str, Any]], question: str, limit: int, config: dict[s
         semantic_score = max(0.0, float(item.get("semantic_score", 0.0)))
         quality_score = chunk_information_quality(item["text"])
         item["rerank_score"] = round((0.48 * semantic_score + 0.34 * term_score + 0.18 * fts_score) * quality_score, 6)
+        if list_question and TABLE_OVERVIEW_MARKER in str(item["text"]):
+            # A table overview lists every item of a group in one chunk; for "which items" questions
+            # it beats any single row of that group.
+            item["rerank_score"] = round(item["rerank_score"] * OVERVIEW_LIST_BOOST, 6)
         item["semantic_score"] = round(semantic_score, 6)
         item["keyword_score"] = round(term_score, 6)
         item["fts_score"] = round(fts_score, 6)
@@ -2240,6 +2254,40 @@ def extract_fft_station_items(text: str) -> list[str]:
     return records
 
 
+def legacy_xlsx_region(
+    db_path: Path,
+    required: tuple[str, ...],
+    start_terms: tuple[str, ...],
+) -> tuple[dict[str, Any], str] | None:
+    """A sheet region of the flattened workbook text in documents.text.
+
+    Returns the first sheet holding every required string, from its first line containing
+    every start term to the end of that sheet. Parsers that read cells by column position use
+    this instead of chunks, whose layout is built for retrieval and may change.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            documents = conn.execute(
+                "SELECT doc_id, file_name, file_path, file_type, text FROM documents "
+                "WHERE file_type = 'xlsx' AND duplicate_of IS NULL ORDER BY file_path"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    for document in documents:
+        for sheet in re.split(r"(?m)^(?=工作表 )", str(document["text"])):
+            if not all(term in sheet for term in required):
+                continue
+            lines = sheet.splitlines()
+            start = next((index for index, line in enumerate(lines) if all(term in line for term in start_terms)), None)
+            if start is not None:
+                return dict(document), "\n".join(lines[start:])
+    return None
+
+
 def structured_fft_station_result(
     db_path: Path,
     question: str,
@@ -2249,64 +2297,35 @@ def structured_fft_station_result(
     station_name = requested_station_name(question)
     if not station_name or station_name.lower() != "fft" or not station_test_item_question(question):
         return None
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        anchor = conn.execute(
-            """
-            SELECT chunks.doc_id, chunks.chunk_index, documents.file_name, documents.file_path, documents.file_type
-            FROM chunks
-            JOIN documents ON documents.doc_id = chunks.doc_id
-            WHERE documents.file_type = 'xlsx'
-              AND chunks.text LIKE '%测试项目%'
-              AND chunks.text LIKE '%工具信息%'
-              AND chunks.text LIKE '%Test Coverage%'
-              AND chunks.text LIKE '%FFT 工具打开前%'
-            ORDER BY chunks.chunk_index
-            LIMIT 1
-            """
-        ).fetchone()
-        if not anchor:
-            conn.close()
-            return None
-        rows = conn.execute(
-            """
-            SELECT chunk_id, text
-            FROM chunks
-            WHERE doc_id = ? AND chunk_index >= ? AND chunk_index <= ?
-            ORDER BY chunk_index
-            """,
-            (anchor["doc_id"], anchor["chunk_index"], anchor["chunk_index"] + 12),
-        ).fetchall()
-        conn.close()
-    except sqlite3.Error:
+    region = legacy_xlsx_region(
+        db_path,
+        required=("测试项目", "工具信息", "Test Coverage", "FFT 工具打开前"),
+        start_terms=("测试项目", "工具信息"),
+    )
+    if region is None:
         return None
-    if not rows:
-        return None
-    context = "\n".join(str(row["text"]) for row in rows)
-    context = context.split("\n工作表 老化", 1)[0]
+    document, context = region
     records = extract_fft_station_items(context)
     if len(records) < 10:
         return None
     lines = "\n".join(f"- {record}" for record in records)
-    excerpt = structured_cell_text("\n".join(str(row["text"]) for row in rows[:3]), max_len=900)
+    excerpt = structured_cell_text("\n".join(context.splitlines()[:3]), max_len=900)
     metadata = metadata or {}
     source = {
         "source_id": 1,
-        "file": anchor["file_name"],
-        "file_path": anchor["file_path"],
-        "file_type": anchor["file_type"],
-        "chunk_id": f"{anchor['doc_id']}:structured:station:fft",
+        "file": document["file_name"],
+        "file_path": document["file_path"],
+        "file_type": document["file_type"],
+        "chunk_id": f"{document['doc_id']}:structured:station:fft",
         "excerpt": excerpt,
         "citation": excerpt,
-        "context_chunk_ids": [str(row["chunk_id"]) for row in rows],
     }
     return {
         "answer": f"根据本地知识库，FFT 站位测试项如下：\n{lines}\n[1]",
         "answer_mode": "local_structured_table_summary",
         "source_type": "knowledge_base",
         "sources": [source],
-        "citations": [{"source_id": 1, "file": anchor["file_name"], "chunk_id": source["chunk_id"], "quote": excerpt}],
+        "citations": [{"source_id": 1, "file": document["file_name"], "chunk_id": source["chunk_id"], "quote": excerpt}],
         "need_web_search": False,
         "web_search_used": False,
         "index_updated_at": metadata.get("indexed_at"),
@@ -2323,44 +2342,14 @@ def structured_fft_manual_function_answer(db_path: Path, question: str, sources:
         return None
     if not db_path.exists():
         return None
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        anchor = conn.execute(
-            """
-            SELECT chunks.doc_id, chunks.chunk_index
-            FROM chunks
-            JOIN documents ON documents.doc_id = chunks.doc_id
-            WHERE documents.file_type = 'xlsx'
-              AND chunks.text LIKE '%人工功能测试%MES%FFT%'
-              AND chunks.text LIKE '%IR CameraTest%'
-            ORDER BY chunks.chunk_index
-            LIMIT 1
-            """
-        ).fetchone()
-        if not anchor:
-            conn.close()
-            return None
-        rows = conn.execute(
-            """
-            SELECT chunk_id, text
-            FROM chunks
-            WHERE doc_id = ? AND chunk_index >= ? AND chunk_index <= ?
-            ORDER BY chunk_index
-            """,
-            (anchor["doc_id"], anchor["chunk_index"], anchor["chunk_index"] + 5),
-        ).fetchall()
-        conn.close()
-    except sqlite3.Error:
+    region = legacy_xlsx_region(db_path, required=("人工功能测试", "IR CameraTest"), start_terms=("人工功能测试", "IR CameraTest"))
+    if region is None:
         return None
-    if not rows:
-        return None
-    context = "\n".join(str(row["text"]) for row in rows)
+    document, context = region
     records = extract_fft_manual_items(context)
     if len(records) < 6:
         return None
-    chunk_ids = {str(row["chunk_id"]) for row in rows}
-    source = next((item for item in sources if str(item.get("chunk_id")) in chunk_ids), sources[0] if sources else {"source_id": 1})
+    source = next((item for item in sources if item.get("file") == document["file_name"]), sources[0] if sources else {"source_id": 1})
     source_id = int(source.get("source_id", 1))
     lines = "\n".join(f"- {record}" for record in records)
     return f"人工功能测试 / FFT测试包含以下测试项：\n{lines}[{source_id}]"
