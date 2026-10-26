@@ -145,10 +145,13 @@ def main() -> None:
     assert query_module.suggested_local_questions("电源键测试")[0] == "电源键测试是什么"
     assert query_module.suggested_local_questions("我的个人密码是")[0] == "个人密码是什么"
     assert query_module.suggested_local_questions("请问我的个人密码是什么")[0] == "个人密码是什么"
+    # These checks need an index that contains the abbreviation SR; other users' indexes skip them.
+    index_has_sr = query_module.DB_PATH.exists() and query_module.structured_abbreviation_result(query_module.DB_PATH, "SR") is not None
     if query_module.DB_PATH.exists():
+        assert query_module.suggested_local_questions("ZZZ999有哪些测试项", query_module.DB_PATH) == []
+    if index_has_sr:
         assert query_module.suggested_local_questions("SR是什么意思", query_module.DB_PATH)[0] == "SR是什么"
         assert query_module.suggested_local_questions("SR有哪些测试项?", query_module.DB_PATH)[0] == "SR是什么"
-        assert query_module.suggested_local_questions("ZZZ999有哪些测试项", query_module.DB_PATH) == []
     guidance = query_module.no_index_user_guidance("SWDL2")
     assert guidance["severity"] == "error"
     assert "与「SWDL2」相关的索引和 FAQ" in guidance["message"]
@@ -158,13 +161,14 @@ def main() -> None:
     assert no_match_guidance["kind"] == "local_no_match"
     assert "与「个人密码」相关" in no_match_guidance["message"]
     assert "个人密码是什么" in no_match_guidance["message"]
-    if query_module.DB_PATH.exists():
+    if index_has_sr:
         sr_guidance = query_module.local_no_match_user_guidance("SR是什么意思", query_module.DB_PATH)
         assert "SR是什么" in sr_guidance["message"]
         assert "SR有哪些测试项" not in sr_guidance["message"]
         sr_test_guidance = query_module.local_no_match_user_guidance("SR有哪些测试项?", query_module.DB_PATH)
         assert "SR是什么" in sr_test_guidance["message"]
         assert "SR有哪些测试项" not in sr_test_guidance["message"]
+    if query_module.DB_PATH.exists():
         missing_guidance = query_module.local_no_match_user_guidance("ZZZ999有哪些测试项", query_module.DB_PATH)
         assert missing_guidance["suggested_questions"] == []
         assert "你是否想问" not in missing_guidance["message"]

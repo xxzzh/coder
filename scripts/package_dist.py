@@ -24,12 +24,20 @@ ROOT_FILES = [
 ]
 
 ROOT_DIRS = [
-    ".codex",
     "docs",
+    "eval",
     "scripts",
     "test_materials",
     "tools",
 ]
+
+# Copied when present: project-local Codex skills are developer tooling and are not in the repository.
+OPTIONAL_ROOT_DIRS = [
+    ".codex",
+]
+
+# The evaluation set and its results describe the indexed documents; they stay on this machine.
+EVAL_LOCAL_ONLY = {"results", "eval_set.jsonl"}
 
 RAW_SUBDIRS = [
     "excel",
@@ -55,6 +63,8 @@ def ignore_generated(directory: str, names: list[str]) -> set[str]:
     for name in names:
         path = Path(name)
         if Path(directory).name == "tools" and name == "cache":
+            ignored.add(name)
+        if Path(directory).name == "eval" and name in EVAL_LOCAL_ONLY:
             ignored.add(name)
         if name in EXCLUDED_DIR_NAMES or name in EXCLUDED_FILE_NAMES or path.suffix in EXCLUDED_SUFFIXES:
             ignored.add(name)
@@ -93,6 +103,9 @@ def build() -> None:
         copy_file(relative_path)
     for relative_path in ROOT_DIRS:
         copy_dir(relative_path)
+    for relative_path in OPTIONAL_ROOT_DIRS:
+        if (ROOT / relative_path).exists():
+            copy_dir(relative_path)
 
     raw_dir = package_dir / "knowledge_base" / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)

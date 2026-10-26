@@ -42,6 +42,8 @@ git clone -b codex/agent-delivery-hardening https://github.com/xxzzh/coder.git
 cd coder
 ```
 
+不用 git 的话，可以在 GitHub 仓库的 Releases 页面下载打包好的 `local-knowledge.zip`，解压后进入 `local-knowledge` 目录，从下面第 1 步开始。
+
 1. 安装依赖：在项目内创建 `.venv`，下载缓存放在 `tools\cache`。
 
    ```bat
@@ -429,6 +431,8 @@ Web UI 端到端验证：先启动 Web UI，再运行下面的命令。17 道提
 | 评测集 | `eval/eval_set.jsonl` | 按 `eval/README.md` 自己出题，可选 |
 
 建好后运行 `.\audit-local.bat` 可以做一次完整的本地审计。资料更新后再运行 `.\run-agent.bat update`，或者直接提问，系统会检测 raw 文件变化并在后台更新。
+
+打包发布（维护者）：运行 `.\package-dist.bat` 生成 `dist/local-knowledge/` 和 `dist/local-knowledge.zip`。`dist/` 不提交到仓库，zip 作为附件发布到 GitHub Releases。包里不含 `.env`、索引、模型缓存和本地评测集。
 
 ## 常见问题
 
