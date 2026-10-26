@@ -813,8 +813,83 @@ AcWing 是一个算法交流平台。
     check_unknown_names()
     check_agent_loop()
     check_ocr_pipeline()
+    check_xlsx_drawings()
     print("retrieval guardrails: ok")
 
+
+def check_xlsx_drawings() -> None:
+    """Text boxes, charts and SmartArt are extracted with their sheet; only what cannot be read needs review."""
+    main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
+    xdr = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+    a = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    c = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+
+    def text_body(*paragraphs: str) -> str:
+        return "".join(f"<a:p><a:r><a:t>{text}</a:t></a:r></a:p>" for text in paragraphs)
+
+    def points(*values: str) -> str:
+        return "".join(f'<c:pt idx="{index}"><c:v>{value}</c:v></c:pt>' for index, value in enumerate(values))
+
+    drawing = (
+        f'<xdr:wsDr xmlns:xdr="{xdr}" xmlns:a="{a}" xmlns:c="{c}" xmlns:r="{rel}">'
+        f"<xdr:twoCellAnchor><xdr:sp><xdr:txBody>{text_body('示例文本框', '第二段说明')}</xdr:txBody></xdr:sp></xdr:twoCellAnchor>"
+        '<xdr:twoCellAnchor><xdr:sp><xdr:nvSpPr><xdr:cNvPr id="3" name="Object 1" hidden="1"/></xdr:nvSpPr></xdr:sp></xdr:twoCellAnchor>'
+        '<xdr:twoCellAnchor><xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic>'
+        "</xdr:graphicFrame></xdr:twoCellAnchor></xdr:wsDr>"
+    )
+    chart = (
+        f'<c:chartSpace xmlns:c="{c}" xmlns:a="{a}"><c:chart>'
+        f"<c:title><c:tx><c:rich>{text_body('月度良率')}</c:rich></c:tx></c:title><c:plotArea><c:barChart><c:ser>"
+        f"<c:tx><c:strRef><c:strCache>{points('良率')}</c:strCache></c:strRef></c:tx>"
+        f"<c:cat><c:strRef><c:strCache>{points('1月', '2月')}</c:strCache></c:strRef></c:cat>"
+        f"<c:val><c:numRef><c:numCache>{points('98', '97')}</c:numCache></c:numRef></c:val>"
+        f"</c:ser></c:barChart><c:valAx><c:title><c:tx><c:rich>{text_body('百分比')}</c:rich></c:tx></c:title></c:valAx>"
+        "</c:plotArea></c:chart></c:chartSpace>"
+    )
+    diagram = f'<dgm:dataModel xmlns:dgm="d" xmlns:a="{a}"><dgm:ptLst><dgm:pt><dgm:t>{text_body("步骤一", "步骤二")}</dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>'
+
+    def workbook(path: Path, chart_xml: str = chart, attachment: bool = False) -> None:
+        ole = f'<oleObjects><oleObject progId="Package" shapeId="1025" r:id="rId9"/></oleObjects>' if attachment else ""
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("xl/workbook.xml", f'<workbook xmlns="{main}" xmlns:r="{rel}"><sheets><sheet name="示例" sheetId="1" r:id="rId1"/></sheets></workbook>')
+            archive.writestr("xl/_rels/workbook.xml.rels", f'<Relationships xmlns="{pkg}"><Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="{rel}/worksheet"/></Relationships>')
+            archive.writestr(
+                "xl/worksheets/sheet1.xml",
+                f'<worksheet xmlns="{main}" xmlns:r="{rel}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>表头</t></is></c></row></sheetData>{ole}</worksheet>',
+            )
+            archive.writestr("xl/worksheets/_rels/sheet1.xml.rels", f'<Relationships xmlns="{pkg}"><Relationship Id="rId2" Target="../drawings/drawing1.xml" Type="{rel}/drawing"/></Relationships>')
+            archive.writestr("xl/drawings/drawing1.xml", drawing)
+            archive.writestr(
+                "xl/drawings/_rels/drawing1.xml.rels",
+                f'<Relationships xmlns="{pkg}"><Relationship Id="rId1" Target="../charts/chart1.xml" Type="{rel}/chart"/>'
+                f'<Relationship Id="rId3" Target="../diagrams/data1.xml" Type="{rel}/diagramData"/></Relationships>',
+            )
+            archive.writestr("xl/charts/chart1.xml", chart_xml)
+            archive.writestr("xl/diagrams/data1.xml", diagram)
+            if attachment:
+                archive.writestr("xl/embeddings/oleObject1.bin", b"\xd0\xcf\x11\xe0")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        readable = Path(temp_dir) / "drawings.xlsx"
+        workbook(readable)
+        text, report = ingest_module.read_xlsx_with_report(readable)
+        assert "[工作表 示例 文本框] 示例文本框 第二段说明" in text, text
+        assert "[工作表 示例 图表] 标题：月度良率；数值轴：百分比；良率：1月=98，2月=97" in text, text
+        assert "[工作表 示例 SmartArt] 步骤一 步骤二" in text, text
+        assert "drawing_text" in report["method"] and not report["requires_review"] and not report["warnings"], report
+        assert "示例文本框" in report[ingest_module.CHUNK_TEXT_REPORT_KEY]  # chunks get the drawing text too
+        # An attached file and an unreadable chart are what still needs a person to look.
+        attached = Path(temp_dir) / "attached.xlsx"
+        workbook(attached, attachment=True)
+        _, report = ingest_module.read_xlsx_with_report(attached)
+        assert report["requires_review"] and "1 embedded object(s) not extracted (attached file on sheet 示例)" in report["warnings"][0], report
+        broken = Path(temp_dir) / "broken.xlsx"
+        workbook(broken, chart_xml="<c:chartSpace")
+        text, report = ingest_module.read_xlsx_with_report(broken)
+        assert report["requires_review"] and "1 chart/drawing part(s) could not be read" in report["warnings"][0], report
+        assert "示例文本框" in text  # the rest of the drawing is still extracted
 
 def check_ocr_pipeline() -> None:
     """Scanned PDFs render without Poppler, and OCR keeps the page-segmentation mode Tesseract is surest of."""

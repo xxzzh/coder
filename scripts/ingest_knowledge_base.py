@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import posixpath
 import re
 import shutil
 import sqlite3
@@ -456,6 +457,162 @@ def _xlsx_sheets(zf: zipfile.ZipFile) -> list[tuple[str, str]]:
     return sheets
 
 
+XLSX_DRAWING_NS = {
+    "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
+}
+OFFICE_RELATIONSHIP_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PACKAGE_RELATIONSHIP_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+CHART_POINTS_MAX = 60
+# Package objects wrap an attached file; Excel localises their progId (Chinese Excel writes 包装程序外壳对象).
+PACKAGE_PROG_IDS = {"package", "包装程序外壳对象"}
+
+
+def _zip_part_relationships(zf: zipfile.ZipFile, part: str) -> list[tuple[str, str, str]]:
+    """(relationship type, target part, relationship id) for the internal relationships of an OOXML part."""
+    folder, name = posixpath.split(part)
+    rels_path = posixpath.join(folder, "_rels", f"{name}.rels")
+    if rels_path not in zf.namelist():
+        return []
+    relationships: list[tuple[str, str, str]] = []
+    for relationship in ET.fromstring(zf.read(rels_path)).findall(f"{{{PACKAGE_RELATIONSHIP_NS}}}Relationship"):
+        if relationship.attrib.get("TargetMode") == "External":
+            continue
+        target = relationship.attrib.get("Target", "")
+        resolved = target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join(folder, target))
+        relationships.append((relationship.attrib.get("Type", "").rsplit("/", 1)[-1], resolved, relationship.attrib.get("Id", "")))
+    return relationships
+
+
+def _drawingml_text(element: ET.Element | None) -> str:
+    """The paragraphs of a DrawingML text body (shape, title, SmartArt node), joined by spaces."""
+    if element is None:
+        return ""
+    paragraphs = []
+    for paragraph in element.iter(f"{{{XLSX_DRAWING_NS['a']}}}p"):
+        line = "".join(node.text or "" for node in paragraph.iter(f"{{{XLSX_DRAWING_NS['a']}}}t")).strip()
+        if line:
+            paragraphs.append(line)
+    return " ".join(paragraphs)
+
+
+def _chart_values(node: ET.Element | None) -> list[str]:
+    """Cached labels or numbers of a chart series part (name, categories, values), in point order."""
+    if node is None:
+        return []
+    points = node.findall(".//c:pt", XLSX_DRAWING_NS)
+    if points:
+        ordered = sorted(points, key=lambda point: int(point.attrib.get("idx", "0") or 0))
+        return [str(point.findtext("c:v", default="", namespaces=XLSX_DRAWING_NS)).strip() for point in ordered]
+    text = _drawingml_text(node) or str(node.findtext(".//c:v", default="", namespaces=XLSX_DRAWING_NS)).strip()
+    return [text] if text else []
+
+
+def _xlsx_chart_text(root: ET.Element) -> str:
+    """Title, axis titles and each series with its data points, as one line of text."""
+    chart = root.find("c:chart", XLSX_DRAWING_NS)
+    if chart is None:
+        return ""
+
+    def title_of(node: ET.Element | None) -> str:
+        title = node.find("c:title", XLSX_DRAWING_NS) if node is not None else None
+        return " ".join(_chart_values(title)) if title is not None else ""
+
+    pieces: list[str] = []
+    if title_of(chart):
+        pieces.append(f"标题：{title_of(chart)}")
+    for axis_tag, label in (("catAx", "横轴"), ("dateAx", "横轴"), ("valAx", "数值轴")):
+        for axis in chart.iter(f"{{{XLSX_DRAWING_NS['c']}}}{axis_tag}"):
+            if title_of(axis):
+                pieces.append(f"{label}：{title_of(axis)}")
+    for index, series in enumerate(chart.iter(f"{{{XLSX_DRAWING_NS['c']}}}ser"), start=1):
+        name = " ".join(_chart_values(series.find("c:tx", XLSX_DRAWING_NS))) or f"系列{index}"
+        categories = _chart_values(series.find("c:cat", XLSX_DRAWING_NS)) or _chart_values(series.find("c:xVal", XLSX_DRAWING_NS))
+        values = _chart_values(series.find("c:val", XLSX_DRAWING_NS)) or _chart_values(series.find("c:yVal", XLSX_DRAWING_NS))
+        if categories and values:
+            points = [f"{category}={value}" for category, value in zip(categories, values)]
+        else:
+            points = categories or values
+        pieces.append(f"{name}：{'，'.join(points[:CHART_POINTS_MAX])}" if points else name)
+    return "；".join(pieces)
+
+
+def _xlsx_drawing_contents(zf: zipfile.ZipFile) -> dict[str, list[str]]:
+    """Text a workbook keeps outside its cells, tagged with the worksheet it sits on.
+
+    texts: text boxes and shapes, charts (title, axes, series with data points) and SmartArt.
+    unreadable: drawing or chart parts that could not be parsed.
+    embedded: embedded objects (OLE); their contents are not extracted.
+    Pictures are not covered here: they go through OCR.
+    """
+    names = set(zf.namelist())
+    sheets = _xlsx_sheets(zf)
+    drawing_sheets: dict[str, str] = {}
+    for sheet_name, sheet_part in sheets:
+        for relationship_type, target, _ in _zip_part_relationships(zf, sheet_part):
+            if relationship_type == "drawing":
+                drawing_sheets[target] = sheet_name
+    texts: list[str] = []
+    unreadable: list[str] = []
+    for part in sorted(name for name in names if re.fullmatch(r"xl/drawings/drawing\d+\.xml", name)):
+        sheet = drawing_sheets.get(part)
+        prefix = f"[工作表 {sheet} " if sheet else "["
+        try:
+            root = ET.fromstring(zf.read(part))
+            relationships = {rid: (kind, target) for kind, target, rid in _zip_part_relationships(zf, part)}
+        except ET.ParseError:
+            unreadable.append(part)
+            continue
+        seen: set[str] = set()
+        # A shape can appear twice (mc:AlternateContent keeps a fallback copy).
+        for shape in root.iter(f"{{{XLSX_DRAWING_NS['xdr']}}}sp"):
+            shape_text = _drawingml_text(shape)
+            if shape_text and shape_text not in seen:
+                seen.add(shape_text)
+                texts.append(f"{prefix}文本框] {shape_text}")
+        for kind, target in relationships.values():
+            if kind == "chart":
+                try:
+                    chart_text = _xlsx_chart_text(ET.fromstring(zf.read(target))) if target in names else ""
+                except ET.ParseError:
+                    chart_text = ""
+                if chart_text:
+                    texts.append(f"{prefix}图表] {chart_text}")
+                else:
+                    unreadable.append(target)
+            elif kind == "diagramData" and target in names:
+                try:
+                    diagram_text = _drawingml_text(ET.fromstring(zf.read(target)))
+                except ET.ParseError:
+                    unreadable.append(target)
+                    continue
+                if diagram_text:
+                    texts.append(f"{prefix}SmartArt] {diagram_text}")
+            elif kind == "chartEx":
+                unreadable.append(target)  # newer chart types (waterfall, treemap ...) are not parsed
+    embedded: list[str] = []
+    if any(name.startswith("xl/embeddings/") for name in names):
+        seen_objects: set[tuple[str, str]] = set()
+        for sheet_name, sheet_part in sheets:
+            if sheet_part not in names:
+                continue
+            for match in re.finditer(rb"<oleObject\b[^>]*>", zf.read(sheet_part)):
+                tag = match.group(0).decode("utf-8", errors="ignore")
+                prog_match = re.search(r'progId="([^"]*)"', tag)
+                id_match = re.search(r'r:id="([^"]*)"', tag)
+                prog_id = prog_match.group(1) if prog_match else ""
+                relationship_id = id_match.group(1) if id_match else match.group(0).decode("latin-1")
+                if (sheet_part, relationship_id) in seen_objects:
+                    continue  # mc:AlternateContent repeats the object tag
+                seen_objects.add((sheet_part, relationship_id))
+                kind = "attached file" if prog_id.strip().lower() in PACKAGE_PROG_IDS else (prog_id or "object")
+                embedded.append(f"{kind} on sheet {sheet_name}")
+        if not embedded:
+            embedded = [f"object {posixpath.basename(name)}" for name in sorted(names) if name.startswith("xl/embeddings/")]
+    return {"texts": texts, "unreadable": unreadable, "embedded": embedded}
+
+
 def read_xlsx(path: Path) -> str:
     ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     lines: list[str] = []
@@ -746,38 +903,41 @@ def read_xlsx_with_report(path: Path) -> tuple[str, dict[str, Any]]:
     except (ET.ParseError, KeyError, zipfile.BadZipFile):
         structured = ""
     image_texts: list[str] = []
+    drawing = {"texts": [], "unreadable": [], "embedded": []}
+    media_files: list[str] = []
     try:
         with zipfile.ZipFile(path) as zf:
-            drawings = [
-                name
-                for name in zf.namelist()
-                if name.startswith("xl/media/") or name.startswith("xl/drawings/") or name.startswith("xl/charts/")
-            ]
             media_files = [name for name in zf.namelist() if name.startswith("xl/media/")]
             for media_file in media_files:
                 media_text = ocr_image_bytes(media_file, zf.read(media_file))
                 if media_text:
                     image_texts.append(f"[embedded image {Path(media_file).name}]\n{media_text}")
-    except zipfile.BadZipFile:
-        drawings = []
-        media_files = []
+            drawing = _xlsx_drawing_contents(zf)
+    except (zipfile.BadZipFile, ET.ParseError, KeyError):
+        pass
+    extra_texts = [*drawing["texts"], *image_texts]
+    if extra_texts:
+        text = "\n\n".join(part for part in [text, *extra_texts] if part).strip()
+    if drawing["texts"]:
+        report["method"].append("drawing_text")
     if image_texts:
-        text = "\n\n".join(part for part in [text, *image_texts] if part).strip()
         report["method"].append("embedded_image_ocr")
     if structured:
         # Carried to the ingest loop, which chunks it and removes it before the report is written.
-        report[CHUNK_TEXT_REPORT_KEY] = "\n\n".join(part for part in [structured, *image_texts] if part).strip()
+        report[CHUNK_TEXT_REPORT_KEY] = "\n\n".join(part for part in [structured, *extra_texts] if part).strip()
         report["method"].append("structured_rows")
-    if drawings:
-        non_media_drawings = [name for name in drawings if not name.startswith("xl/media/")]
-        if non_media_drawings:
-            report["warnings"].append(
-                "XLSX contains drawings or charts; cell values are extracted but visual-only chart labels may need review."
-            )
-            report["requires_review"] = True
-        elif media_files and not image_texts:
-            report["warnings"].append("XLSX contains embedded image(s), but OCR returned no image text.")
-            report["requires_review"] = True
+    # Review is needed only for content that could not be extracted: text boxes, charts and SmartArt
+    # are read above and pictures go through OCR.
+    not_extracted: list[str] = []
+    if drawing["unreadable"]:
+        not_extracted.append(f"{len(drawing['unreadable'])} chart/drawing part(s) could not be read")
+    if drawing["embedded"]:
+        not_extracted.append(f"{len(drawing['embedded'])} embedded object(s) not extracted ({'; '.join(drawing['embedded'])})")
+    if media_files and not image_texts:
+        not_extracted.append("embedded image(s) returned no OCR text")
+    if not_extracted:
+        report["warnings"].append("XLSX content not extracted: " + ", ".join(not_extracted) + ".")
+        report["requires_review"] = True
     report["text_chars"] = len(text)
     return text, report
 
