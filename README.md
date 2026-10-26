@@ -2,7 +2,7 @@
 
 一个可本地运行的知识库问答 Agent。用户把原始资料放入 `knowledge_base/raw`，运行索引更新命令后，就可以通过命令行直接提问。
 
-当前定位：可交付给普通用户试用的本地 RAG 工具。它已经具备一键菜单、本地 Web UI、状态面板、安装配置、健康检查、多格式资料导入、OCR 抽取、语义分块、混合检索、缓存、增量索引和降级兜底能力；同时开始接入“大模型能力层”，用于 embedding、FAISS 向量召回、查询分类、rerank 和答案质量检查。它仍不是带多租户权限隔离和分布式向量数据库的生产级平台。
+当前定位：可交付给普通用户试用的本地 RAG 工具。它已经具备一键菜单、本地 Web UI、状态面板、安装配置、健康检查、多格式资料导入、OCR 抽取、语义分块、混合检索、缓存、增量索引和降级兜底能力；本地 `BAAI/bge-m3` 向量模型 + FAISS 负责语义召回。配置 DeepSeek 等大模型 API 后，由智能检索 Agent 判断证据够不够回答、必要时换成文档的说法再检索，并生成带引用的答案；不配置 API 也能纯本地运行。它仍不是带多租户权限隔离和分布式向量数据库的生产级平台。
 
 ## 支持格式
 
@@ -25,37 +25,66 @@ knowledge_base/raw/
 
 ## 快速开始
 
-普通用户推荐直接双击：
+### 环境要求
+
+- Windows 10/11（命令脚本是 `.bat`）。
+- Python 3.10 或更高版本，安装时勾选 “Add python.exe to PATH”。
+- 磁盘预留约 4 GB：依赖约 1 GB，本地向量模型 `BAAI/bge-m3` 约 2.2 GB，都放在项目目录内。
+- 安装依赖和下载模型时需要联网；之后本地检索可以离线运行（大模型 API 和联网兜底除外）。
+
+### 第一次安装
+
+获取代码（当前功能在 `codex/agent-delivery-hardening` 分支）：
 
 ```bat
-start.bat
+git clone -b codex/agent-delivery-hardening https://github.com/xxzzh/coder.git
+cd coder
 ```
 
-菜单会提供初始化、Web UI、打开资料目录、严格建库、健康检查、提问、查看来源和 OCR 测试。
+1. 安装依赖：在项目内创建 `.venv`，下载缓存放在 `tools\cache`。
 
-最简单的使用方式：
+   ```bat
+   .\run-agent.bat install-deps
+   ```
 
-1. 双击 `start.bat`。
-2. 选择 `1` 完成首次配置。
-3. 选择 `3` 打开资料目录，把原始资料放入 `knowledge_base/raw`。
-4. 选择 `4` 严格重建索引。
-5. 选择 `2` 启动 Web UI，在浏览器里查看状态并提问。
+2. 生成配置文件 `.env`。会询问是否配置大模型 API，可以先选否，第 5 步再配。
 
-也可以直接启动浏览器界面：
+   ```bat
+   .\run-agent.bat setup
+   ```
 
-```bat
-.\run-agent.bat web --open
-```
+3. 启用本地向量检索。首次运行会把 `BAAI/bge-m3`（约 2.2 GB）下载到 `tools\cache\huggingface`，提示输入时直接回车用默认值。
 
-默认地址是：
+   ```bat
+   .\run-agent.bat embedding-setup
+   ```
 
-```text
-http://127.0.0.1:8765/
-```
+4. 把资料放进 `knowledge_base\raw`（支持格式和子目录见上文），然后严格建库并检查。`verify` 输出 `"ok": true` 即可使用；如果 `requires_review` 大于 0，见下文「扫描件、图片表格和复杂版式」。
+
+   ```bat
+   .\run-agent.bat rebuild-strict
+   .\run-agent.bat verify
+   ```
+
+5. （推荐）配置大模型 API，开启智能检索 Agent，详见「API 配置」。
+
+   ```bat
+   .\run-agent.bat api-setup
+   ```
+
+6. 启动 Web UI，在浏览器里提问。默认地址 `http://127.0.0.1:8765/`，只监听本机。
+
+   ```bat
+   .\run-agent.bat web --open
+   ```
+
+不习惯命令行可以双击 `start.bat`，菜单编号对应：`13` 安装依赖、`1` 初始化、`14` 配置向量模型、`3` 打开资料目录、`4` 严格建库、`6` 健康检查、`12` 配置 API、`2` 启动 Web UI、`7` 命令行提问。
+
+### 日常使用
 
 Web UI 当前提供：流式提问进度、答案逐段输出、引用来源展示、健康状态、OCR 状态、embedding/FAISS/rerank 状态、抽取待复核数量、增量更新、严格重建、向量索引重建、embedding API 验证、向量索引验证、检索诊断、OCR 评测、来源列表和 API 精炼配置。
 
-如果资料或联网搜索结果包含英文，安装一次离线英文到中文模型：
+如果资料或联网搜索结果包含英文、又没有配置大模型 API，安装一次离线英文到中文模型（配置了 API 时由模型直接用中文作答，不需要这一步）：
 
 ```bat
 .\run-agent.bat install-deps
@@ -64,58 +93,33 @@ Web UI 当前提供：流式提问进度、答案逐段输出、引用来源展�
 
 安装后，无论资料和搜索结果使用什么语言，最终回答都会以中文输出；引用来源仍保留原始文字，便于核对。当前离线模型支持英文到中文转换，其他外语在无法可靠翻译时会返回中文提示并保留原始引用。
 
-首次使用：
-
-```bat
-.\run-agent.bat setup
-```
-
-安装配置会询问是否有大模型 API：
-
-- 如果有 API key，会写入 `.env`，后续答案会在本地检索证据基础上调用 API 做受控总结。
-- 如果没有 API key，会保持纯本地命令行回答，不影响索引、检索和引用输出。
-
-检查环境：
-
-```bat
-.\run-agent.bat verify
-```
-
-更新索引：
-
-```bat
-.\run-agent.bat update
-```
-
-提问：
+命令行提问（本地资料不足时默认允许联网兜底）：
 
 ```bat
 .\run-agent.bat "What is Ohm's law?"
 ```
 
-兼容旧式 ask 命令：
-
-```bat
-.\run-agent.bat ask "加强针有什么作用？"
-```
-
-只使用本地知识库、不联网：
+只查本地知识库、不联网：
 
 ```bat
 .\run-agent.bat ask "加强针有什么作用？" --no-web
 ```
 
-彻底重建索引：
+资料增删改后增量更新（直接提问时也会检测 `knowledge_base\raw` 的变化并在后台更新）：
+
+```bat
+.\run-agent.bat update
+```
+
+彻底重建索引、查看索引来源、检查环境：
 
 ```bat
 .\run-agent.bat rebuild
-```
-
-查看索引来源：
-
-```bat
 .\run-agent.bat sources
+.\run-agent.bat verify
 ```
+
+没有配置 API 时是纯本地回答，不影响索引、检索和引用输出；配置后答案由智能检索 Agent 生成。
 
 ## 命令说明
 
@@ -130,22 +134,34 @@ Web UI 当前提供：流式提问进度、答案逐段输出、引用来源展�
 | `verify` / `healthcheck` | 检查 Python、SQLite FTS5、raw 文件、索引、API 配置 |
 | `update` | 增量更新知识库，只处理新增、修改、删除的资料 |
 | `rebuild` | 清理生成索引并从 raw 目录重新导入 |
+| `rebuild-strict` | 同 `rebuild`，但发现可能漏抽的文件就不入库 |
 | `sources` | 列出当前索引中的资料来源 |
+| `eval` | 运行检索与问答评测，见「检索与问答评测」 |
 | 直接输入问题 | 查询本地知识库；本地不足时默认允许联网兜底 |
 | `ask "问题" --no-web` | 只查本地知识库 |
 
 ## API 配置
 
-`.env` 示例：
+推荐用命令配置：输入 Key 时不回显，会读取可用模型，并在真实调用验证通过后才保存。也可以在 Web UI 的 `API 精炼` 面板中配置，或直接编辑 `.env`。
+
+```bat
+.\run-agent.bat api-setup
+```
+
+DeepSeek 的 `.env` 示例（Key 在 https://platform.deepseek.com/api_keys 申请）：
 
 ```env
 LKA_USE_API=true
-LKA_API_PROVIDER=openai-compatible
-LKA_API_BASE_URL=https://api.openai.com/v1
-LKA_API_KEY=your_api_key_here
-LKA_API_MODEL=gpt-5.2
-LKA_API_TIMEOUT_SECONDS=20
+LKA_API_PROVIDER=deepseek
+LKA_API_BASE_URL=https://api.deepseek.com
+LKA_API_KEY=你的 Key
+LKA_API_MODEL=deepseek-flash
+LKA_API_TIMEOUT_SECONDS=60
 ```
+
+`deepseek-flash` 便宜、快；需要更强推理时可以改成 `deepseek-v4-pro`。用 OpenAI 或其他 OpenAI 兼容接口时，把 `LKA_API_PROVIDER`、`LKA_API_BASE_URL`、`LKA_API_MODEL` 换成对应值即可（例如 `openai-compatible`、`https://api.openai.com/v1`）。
+
+`.env` 已在 `.gitignore` 中，不会被提交。Key 只写在 `.env` 里，不要写进其他文件或截图分享。
 
 不使用 API：
 
@@ -153,11 +169,15 @@ LKA_API_TIMEOUT_SECONDS=20
 LKA_USE_API=false
 ```
 
-API 默认用于“基于已召回引用的答案总结”。如果启用大模型能力层，系统可以使用本地 `BAAI/bge-m3` 或 OpenAI-compatible embedding API 生成 dense embedding，并把结果写入本地 FAISS 索引；查询时优先合并 FAISS、SQLite FTS5、领域 retriever 和本地 hash embedding 候选，再进行 rerank。联网兜底不会让 API 脱离来源直接回答：系统会先搜索网页、抓取公开网页正文、对正文分块并做轻量 RAG 排序，再把整理后的引用交给 API 去重、精炼和生成中文答案。没有 API 时，系统会优先使用本地离线翻译生成中文答案。
+> 数据外发说明：启用 API 后，每次提问会把问题和检索到的资料片段（最多约 10 段完整章节或表格）发给 API 提供商。资料涉密时请保持 `LKA_USE_API=false`，或改用自己部署的 OpenAI 兼容服务。
+
+参考成本与速度：2026 年 10 月在本项目 79 题评测上实测，`deepseek-flash`、思考模式关闭，中位延迟约 1.7 秒，每千次提问约 0.3–1.2 美元（命中提供商缓存时低）。价格以提供商官网为准。
+
+启用 API 后，本地检索到的证据交给智能检索 Agent（见下文）判断并生成带引用的答案。如果启用大模型能力层，系统可以使用本地 `BAAI/bge-m3` 或 OpenAI-compatible embedding API 生成 dense embedding，并把结果写入本地 FAISS 索引；查询时优先合并 FAISS、SQLite FTS5、领域 retriever 和本地 hash embedding 候选，再进行 rerank。联网兜底不会让 API 脱离来源直接回答：系统会先搜索网页、抓取公开网页正文、对正文分块并做轻量 RAG 排序，再把整理后的引用交给 API 去重、精炼和生成中文答案。没有 API 时，系统会优先使用本地离线翻译生成中文答案。
 
 ### 大模型能力层
 
-可选配置：
+可选配置（`embedding-setup` 会写好前几项）：
 
 ```env
 LKA_EMBEDDING_ENABLED=true
@@ -167,10 +187,12 @@ LKA_EMBEDDING_API_KEY=
 LKA_EMBEDDING_MODEL=BAAI/bge-m3
 LKA_EMBEDDING_DIMENSIONS=1024
 LKA_VECTOR_BACKEND=faiss
-LKA_RERANK_ENABLED=true
-LKA_LLM_CHUNKING_ENABLED=true
-LKA_LLM_QUERY_ROUTING_ENABLED=true
+LKA_RERANK_ENABLED=false
+LKA_LLM_CHUNKING_ENABLED=false
+LKA_LLM_QUERY_ROUTING_ENABLED=false
 ```
+
+`LKA_RERANK_ENABLED`、`LKA_LLM_CHUNKING_ENABLED`、`LKA_LLM_QUERY_ROUTING_ENABLED` 这三项大模型功能还没有经过评测验证，建议保持 `false`；智能检索 Agent 已经由模型挑选证据，不需要再开模型 rerank。
 
 行为规则：
 
@@ -195,14 +217,6 @@ LKA_LLM_QUERY_ROUTING_ENABLED=true
 - DeepSeek：默认地址 `https://api.deepseek.com`
 - OpenAI：默认地址 `https://api.openai.com/v1`
 - 自定义 OpenAI 兼容接口
-
-配置方式：
-
-```bat
-.\run-agent.bat api-setup
-```
-
-也可以在 Web UI 的 `API 精炼` 面板中选择提供商、粘贴 API key、读取可用模型、选择模型并保存。系统会在保存前执行一次真实模型调用验证。
 
 MiMo Token Plan 的 `tp-` key 仅限编程工具使用，不能配置为本应用后端。需要调用大模型总结时，请使用允许应用后端调用的 API key；没有合规 API 时，系统会使用本地离线翻译。
 
@@ -238,6 +252,7 @@ python scripts\query_knowledge_base.py "What is ACID?" --no-api
 - 查询分类：缩写、Excel 表格、站位测试、代码/文档说明、普通 RAG
 - 语义分块
 - FAISS + FTS + semantic cosine + keyword score 混合 rerank
+- 智能检索 Agent：大模型判断证据是否足够、按文档写法再检索、生成带引用的答案（配置 API 后启用）
 - 可选大模型 rerank 和答案质量检查
 - 联网网页正文抽取、分块和轻量 RAG rerank
 - 热门 Query 缓存
@@ -343,6 +358,8 @@ knowledge_base/processed/extraction_report.jsonl
 
 评测不联网、不调用 API、关闭查询缓存，判分只用规则不用模型。指标定义、评测集格式和出题要求见 `eval/README.md`。
 
+评测集 `eval/eval_set.jsonl` 依赖具体资料内容，不随仓库提供（已在 `.gitignore` 中）。换成自己的资料后，按 `eval/README.md` 的格式为它出题，并先运行 `.venv\Scripts\python.exe eval\validate_set.py` 检查题目和资料是否对得上。
+
 评测智能检索 Agent 时加 `--allow-api`，会按 `.env` 调用模型（产生少量 API 费用），检索指标不变，只有作答、通过和拒答会变化：
 
 ```bat
@@ -361,25 +378,27 @@ knowledge_base/processed/extraction_report.jsonl
 
 ## 交付给别人使用
 
-对方只需要：
+对方按上文「快速开始」操作即可。仓库里不包含以下内容，需要各自准备：
 
-1. 安装 Python 3.10 或更高版本。
-2. 解压/拉取本项目。
-3. 双击 `start.bat`。
-4. 选择 `1` 完成初始化。
-5. 选择 `3` 打开资料目录，把资料放进 `knowledge_base/raw`。
-6. 选择 `4` 严格构建索引。
-7. 选择 `6` 健康检查，看到 `"ok": true` 后即可使用。
-8. 如需完整本地审计，运行 `.\audit-local.bat`。
-9. 选择 `2` 启动 Web UI，通过浏览器提问；或选择 `7` 在命令行输入问题。
+| 内容 | 位置 | 怎么得到 |
+|---|---|---|
+| 依赖环境 | `.venv/` | `.\run-agent.bat install-deps` |
+| 配置和 API Key | `.env` | `.\run-agent.bat setup`，再 `api-setup` |
+| 向量模型 | `tools/cache/huggingface/` | `.\run-agent.bat embedding-setup` 首次自动下载 |
+| 原始资料 | `knowledge_base/raw/` | 自己放入 |
+| 索引和向量 | `knowledge_base/index/`、`knowledge_base/vector/` | `.\run-agent.bat rebuild-strict` |
+| 评测集 | `eval/eval_set.jsonl` | 按 `eval/README.md` 自己出题，可选 |
 
-如果资料更新了，只需要再次运行：
+建好后运行 `.\audit-local.bat` 可以做一次完整的本地审计。资料更新后再运行 `.\run-agent.bat update`，或者直接提问，系统会检测 raw 文件变化并在后台更新。
 
-```bat
-.\run-agent.bat update
-```
+## 常见问题
 
-或者直接提问，系统会检测 raw 文件变化并异步触发更新。
+- **命令行提问每次要等 15–20 秒**：每条命令都要重新加载本地向量模型。Web UI 常驻运行，只有第一次提问慢，之后每题一般 1–4 秒（含 API 调用），日常使用推荐 Web UI。
+- **回答“本地知识库中没有出现「某名称」”**：问题里的英文名称或“名称+版本”在资料中一次都没出现，系统直接拒答。确认名称写法，或把相关资料放进 `knowledge_base\raw` 后更新索引。
+- **回答“本地知识库没有找到足够依据：……”**：智能检索 Agent 读过检索到的资料，认为其中没有这项信息，冒号后面写了缺什么。
+- **API 失败或超时**：系统会自动退回本地答案，返回结果里的 `agent_error` 字段记录原因。请检查 Key、余额和网络；这类退回的答案不会写入缓存，恢复后重新提问即可。
+- **`embedding-setup` 下载很慢或失败**：模型来自 Hugging Face。网络受限时可以先设置镜像再运行，cmd 用 `set HF_ENDPOINT=https://hf-mirror.com`，PowerShell 用 `$env:HF_ENDPOINT="https://hf-mirror.com"`；下载完成后不再需要联网。
+- **`verify` 显示 `requires_review` 大于 0**：有文件可能没有完整抽取（扫描件、图片表格等），见上文「扫描件、图片表格和复杂版式」。
 
 ## 限制
 
