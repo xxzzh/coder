@@ -79,10 +79,11 @@ SECTION_SCAN_MAX_CHUNKS = 40
 # Excel import writes per-group item lists as "<sheet> 概览 | <group>：" chunks.
 TABLE_OVERVIEW_MARKER = " 概览 | "
 OVERVIEW_LIST_BOOST = 1.1
-# Hybrid rerank weights, chosen with eval/tune_weights.py (two-fold validation on the local eval set;
-# previously 0.48 / 0.34 / 0.18): MRR 0.759 -> 0.788, Hit@5 0.836 -> 0.909, Hit@1 unchanged.
-RERANK_WEIGHTS = {"semantic": 0.70, "keyword": 0.25, "fts": 0.05}
-CACHE_VARIANT_VERSION = "retrieval-v54:query-terms-tuned-weights"
+# Hybrid rerank weights, chosen with eval/tune_weights.py (two-fold validation on the local eval set,
+# with the corrected bm25 normalisation): MRR 0.759 -> 0.813, Hit@1 0.727 -> 0.764, Hit@5 0.836 -> 0.927
+# against the original 0.48 / 0.34 / 0.18.
+RERANK_WEIGHTS = {"semantic": 0.80, "keyword": 0.15, "fts": 0.05}
+CACHE_VARIANT_VERSION = "retrieval-v55:bm25-fix-table-focus-unknown-names"
 ITERATIVE_RETRIEVAL_LIMIT = 12
 EMBEDDING_CACHE: dict[str, Any] = {"key": None, "rows": []}
 EMBEDDING_CACHE_LOCK = threading.Lock()
@@ -212,6 +213,12 @@ QUESTION_FUNCTION_PHRASES = tuple(
     )
 )
 LOCAL_CONTENT_COVERAGE_THRESHOLD = 0.5
+# A name followed by a version: MES 3.0, USB 4.0, WIFI 6E, .NET 6, MES3.0. A version without a
+# dot (6, 6E) must be separated by a space, so model codes such as AB123 are not split.
+VERSIONED_NAME_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]*?)(?:\s*(\d+\.\d+(?:\.\d+)*[A-Za-z]?)|\s+(\d+[A-Za-z]?))(?![A-Za-z0-9]|\.\d)"
+)
+KNOWLEDGE_TEXT_CACHE: dict[str, tuple[str, str]] = {}
 # Question words and particles that never help locate evidence. Aspect words such as 流程,
 # 步骤, 区别 stay: they often appear in the section titles that hold the answer.
 RETRIEVAL_STOP_PHRASES = tuple(
@@ -1226,12 +1233,16 @@ def rerank(rows: list[dict[str, Any]], question: str, limit: int, config: dict[s
     for item in merged.values():
         item["term_score"] = item.get("term_score", sentence_score(item["text"], terms))
         max_term = max(max_term, item["term_score"])
+    # SQLite bm25() is negative and more negative means a better match, so score each match
+    # relative to the best one for this query (best = 1.0). The former 1 / (1 + |bm25|) gave the
+    # best matches the lowest scores.
+    best_bm25 = max((abs(float(item["fts_rank"])) for item in merged.values() if item.get("fts_rank") is not None), default=0.0)
 
     for item in merged.values():
         if "semantic_score" not in item:
             item["semantic_score"] = cosine(query_embedding, parse_embedding(item.get("embedding", "")))
         fts_rank = item.get("fts_rank")
-        fts_score = 0.0 if fts_rank is None else 1.0 / (1.0 + abs(float(fts_rank)))
+        fts_score = abs(float(fts_rank)) / best_bm25 if fts_rank is not None and best_bm25 else 0.0
         term_score = item["term_score"] / max_term
         semantic_score = max(0.0, float(item.get("semantic_score", 0.0)))
         quality_score = chunk_information_quality(item["text"])
@@ -1385,6 +1396,32 @@ def evidence_lines(text: str) -> list[tuple[str, int]]:
     return lines
 
 
+def focus_table_rows(lines: list[tuple[str, int]], question: str, terms: list[str]) -> list[str]:
+    """Table rows to cite: all of them, unless a few rows clearly answer a non-list question.
+
+    Rows are scored on their values only, because column titles such as 「测试门限：」 repeat in
+    every row. Filtering needs a distinctive best row (score >= 3) whose peers are at most half
+    the table, so a comparison table that weakly mentions the subject everywhere stays whole.
+    Headings and a Markdown table's header row are always kept.
+    """
+    rows = [line for line, _ in lines]
+    if enumeration_or_list_question(question):
+        return rows
+    body = [index for index, (line, level) in enumerate(lines) if not level and " | " in line]
+    scores = {index: sentence_score(re.sub(r"(^|\| )[^|：]{1,24}：", r"\1", lines[index][0]), terms) for index in body}
+    best = max(scores.values(), default=0)
+    if best < 3:
+        return rows
+    standing_out = {index for index, score in scores.items() if score >= best * 0.6}
+    if len(standing_out) > len(body) / 2:
+        return rows
+    labelled = any("：" in lines[index][0] for index in body)
+    keep = standing_out | {index for index, (_, level) in enumerate(lines) if level}
+    if body and not labelled:
+        keep.add(body[0])  # Markdown header row: 方法 | 签名 | 说明
+    return [line for index, (line, _) in enumerate(lines) if index in keep]
+
+
 def block_citation(text: str, question: str, max_chars: int, outline: bool = True) -> str:
     """A whole section or table as cited evidence, kept within max_chars.
 
@@ -1402,7 +1439,7 @@ def block_citation(text: str, question: str, max_chars: int, outline: bool = Tru
     top_level = min((level for _, level in lines if level), default=0)
     is_table = len(lines) >= 2 and sum(" | " in line for line, _ in lines) >= len(lines) * 0.5
     if is_table:
-        rows = [line for line, _ in lines]
+        rows = focus_table_rows(lines, question, terms)
         if sum(len(row) + 1 for row in rows) > max_chars:
             # Shorten rows before dropping any: leading cells (number, item, sub-item) identify a row,
             # long procedure descriptions come later.
@@ -3500,21 +3537,79 @@ def content_coverage(units: list[tuple[str, str, float]], text: str) -> float:
     matched = 0.0
     for kind, term, weight in units:
         if kind == "ascii":
-            # Short terms (PR, GW, AC) need a full word boundary; longer ones may prefix
-            # a compound such as Camera -> CameraTest.
-            pattern = rf"(?<![a-z0-9]){re.escape(term)}" + (r"(?![a-z0-9])" if len(term) < 3 else "")
-            if re.search(pattern, lowered):
+            if ascii_term_pattern(term).search(lowered):
                 matched += weight
         elif term in compact:
             matched += weight
     return matched / total
 
 
-def local_result_is_relevant(rows: list[dict[str, Any]], question: str) -> bool:
+def ascii_term_pattern(term: str) -> re.Pattern[str]:
+    # Short terms (PR, GW, AC) need a full word boundary; longer ones may prefix
+    # a compound such as Camera -> CameraTest.
+    return re.compile(rf"(?<![a-z0-9]){re.escape(term)}" + (r"(?![a-z0-9])" if len(term) < 3 else ""))
+
+
+def knowledge_text(db_path: Path) -> str | None:
+    """All chunk text of the index, lower-cased; reloaded whenever the index is rebuilt."""
+    key = str(Path(db_path).resolve())
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute("SELECT value FROM metadata WHERE key = 'indexed_at'").fetchone()
+            stamp = str(row[0]) if row else ""
+            cached = KNOWLEDGE_TEXT_CACHE.get(key)
+            if cached and cached[0] == stamp:
+                return cached[1]
+            text = "\n".join(str(value) for (value,) in conn.execute("SELECT text FROM chunks")).lower()
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        return None
+    KNOWLEDGE_TEXT_CACHE[key] = (stamp, text)
+    return text
+
+
+def unknown_names(question: str, db_path: Path) -> list[str]:
+    """Names in a Chinese question that occur nowhere in the knowledge base.
+
+    In a Chinese question, Latin-script terms are names and identifiers (Jenkins, FATAL,
+    LogMsgType), and a word followed by a version (MES 3.0, Windows 7) names one release.
+    If the index never mentions such a name it holds no evidence about it, however well
+    the rest of the question matches: MES 2.0 chunks do not answer a question about MES 3.0.
+    Chinese words are not checked this way: users' wording (记事本, 连不上) is often absent
+    from the documents even when the documents answer the question.
+    """
+    if not re.search(r"[\u4e00-\u9fff]", question):
+        return []
+    corpus = knowledge_text(db_path)
+    if corpus is None:
+        return []
+    unknown: list[str] = []
+    normalized = normalized_retrieval_question(question)
+    for match in VERSIONED_NAME_PATTERN.finditer(normalized):
+        word, version = match.group(1), match.group(2) or match.group(3)
+        dotted = "." if normalized[max(match.start(1) - 1, 0) : match.start(1)] == "." else ""  # .NET 6
+        pattern = rf"(?<![a-z0-9]){re.escape(word.lower())}\s*{re.escape(version.lower())}(?![a-z0-9]|\.\d)"
+        if not re.search(pattern, corpus):
+            unknown.append(f"{dotted}{word} {version}")
+    versioned = [name.lower().replace(" ", "") for name in unknown]
+    for kind, term, _ in query_content_units(question):
+        if kind != "ascii" or ascii_term_pattern(term).search(corpus) or any(term in name for name in versioned):
+            continue
+        # Report the name as the user wrote it (FATAL, not fatal).
+        written = re.search(re.escape(term), question, re.IGNORECASE)
+        unknown.append(written.group(0) if written else term)
+    return unknown
+
+
+def local_result_is_relevant(rows: list[dict[str, Any]], question: str, db_path: Path | None = None) -> bool:
     if not rows or rows[0].get("rerank_score", 0.0) < LOCAL_SCORE_THRESHOLD:
         return False
     units = query_content_units(question)
     if not units:
+        return False
+    if db_path is not None and unknown_names(question, db_path):
         return False
     candidate_count = min(len(rows), 8 if iterative_retrieval_question(question) else 3)
     for row in rows[:candidate_count]:
@@ -3694,7 +3789,7 @@ def local_candidate_has_answer(db_path: Path | None, question: str) -> bool:
         rows, _metadata = search(db_path, question, 5)
     except sqlite3.DatabaseError:
         return False
-    return local_result_is_relevant(rows, question)
+    return local_result_is_relevant(rows, question, db_path)
 
 
 def suggested_local_questions(question: str, db_path: Path | None = None) -> list[str]:
@@ -4258,11 +4353,12 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
             result = augment_with_web(question, result, limit)
         return finalize_answer(question, result, config, allow_api)
 
-    if not local_result_is_relevant(rows, question):
+    if not local_result_is_relevant(rows, question, db_path):
+        missing = unknown_names(question, db_path)
         result = no_local_answer(
             use_web,
             question,
-            "本地知识库没有找到足够依据。",
+            f"本地知识库中没有出现「{'、'.join(missing)}」，没有找到足够依据。" if missing else "本地知识库没有找到足够依据。",
             metadata,
             config,
             allow_api,

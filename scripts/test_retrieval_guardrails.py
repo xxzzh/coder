@@ -810,7 +810,42 @@ AcWing 是一个算法交流平台。
     check_block_citations()
     check_structured_xlsx()
     check_query_terms()
+    check_unknown_names()
     print("retrieval guardrails: ok")
+
+
+def check_unknown_names() -> None:
+    """A name or name + version the index never mentions makes the gate refuse."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "knowledge.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE chunks(chunk_id TEXT, text TEXT);
+            INSERT INTO metadata VALUES ('indexed_at', 'first');
+            INSERT INTO chunks VALUES ('a', 'Widget 2.0 接口列表：查询、上传'), ('b', 'LogLevel 级别：Info、Warn、Error'),
+                                      ('c', '型号 AB123 的接口说明');
+            """
+        )
+        conn.commit()
+        assert query_module.unknown_names("Widget 3.0的接口有哪些", db_path) == ["Widget 3.0"]
+        assert query_module.unknown_names("Widget3.0的接口有哪些", db_path) == ["Widget 3.0"]
+        assert query_module.unknown_names("Widget 2.0的接口有哪些", db_path) == []
+        assert query_module.unknown_names("怎么迁移到.NET 6", db_path) == [".NET 6"]
+        assert query_module.unknown_names("LogLevel有没有FATAL级别", db_path) == ["FATAL"]
+        assert query_module.unknown_names("AB123的接口有哪些", db_path) == []  # a model code is not word + version
+        assert query_module.unknown_names("What is FATAL", db_path) == []  # English words are not names
+        rows = [{"rerank_score": 0.7, "keyword_score": 1.0, "fts_score": 0.5, "text": "Widget 2.0 接口列表：查询、上传"}]
+        assert query_module.local_result_is_relevant(rows, "Widget 3.0的接口有哪些")
+        assert not query_module.local_result_is_relevant(rows, "Widget 3.0的接口有哪些", db_path)
+        assert query_module.local_result_is_relevant(rows, "Widget 2.0的接口有哪些", db_path)
+        # A rebuilt index is read again.
+        conn.execute("INSERT INTO chunks VALUES ('d', 'Widget 3.0 新增接口：下载')")
+        conn.execute("UPDATE metadata SET value = 'second' WHERE key = 'indexed_at'")
+        conn.commit()
+        conn.close()
+        assert query_module.unknown_names("Widget 3.0的接口有哪些", db_path) == []
 
 
 def check_query_terms() -> None:
@@ -891,8 +926,8 @@ def check_structured_xlsx() -> None:
 
     # A list question prefers the overview chunk that holds every item over one row of the group.
     candidates = [
-        {"chunk_id": "row", "text": "表 | 测试项：A | 测试子项：B", "semantic_score": 0.70, "term_score": 1},
-        {"chunk_id": "overview", "text": "表 概览 | 组一：\nA B\nC D\nE F", "semantic_score": 0.66, "term_score": 1},
+        {"chunk_id": "row", "text": "表 | 组一 | 测试项：A", "semantic_score": 0.70},
+        {"chunk_id": "overview", "text": "表 概览 | 组一：\n测试项 A\n测试项 B", "semantic_score": 0.66},
     ]
     assert query_module.enumeration_or_list_question("SFT主板功能测试包含哪些测试项")
     assert [row["chunk_id"] for row in query_module.rerank(candidates, "组一包含哪些测试项", 2, {})] == ["overview", "row"]
