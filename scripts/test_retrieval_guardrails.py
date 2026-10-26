@@ -15,6 +15,7 @@ import zipfile
 import ingest_knowledge_base as ingest_module
 import model_capabilities
 import query_knowledge_base as query_module
+from kb import web as web_module  # the web search code looks its providers and fetchers up here
 import vector_store
 from ingest_knowledge_base import read_xlsx
 from query_knowledge_base import (
@@ -289,9 +290,9 @@ def main() -> None:
     ]
     assert web_evidence_quality_score("雷军是谁", lei_sources[0]) > web_evidence_quality_score("雷军是谁", lei_sources[1])
     assert best_summary_source_ids("雷军是谁", lei_sources) == [1]
-    original_fetch_url_text = query_module.fetch_url_text
+    original_fetch_url_text = web_module.fetch_url_text
     try:
-        query_module.fetch_url_text = lambda request: """
+        web_module.fetch_url_text = lambda request: """
 ### [App](http://www.baidu.com/link?url=app)
 
 acwing 是一款同名校园工具 app。
@@ -303,7 +304,7 @@ AcWing 是一个算法交流平台。
         baidu_sources = query_module.jina_baidu_search("acwing", 5)
         assert [source["title"] for source in baidu_sources] == ["AcWing 百度百科"]
     finally:
-        query_module.fetch_url_text = original_fetch_url_text
+        web_module.fetch_url_text = original_fetch_url_text
     assert filter_web_sources(question, industrial_sources, 5) == []
     filtered = filter_web_sources(question, quantum_sources, 5)
     assert [source["title"] for source in filtered] == ["量子纠缠"]
@@ -456,9 +457,9 @@ AcWing 是一个算法交流平台。
     assert "ignore" not in page_text
     assert "导航文字" not in page_text
     assert "版权信息" not in page_text
-    original_fetch_public_webpage_text = query_module.fetch_public_webpage_text
+    original_fetch_public_webpage_text = web_module.fetch_public_webpage_text
     try:
-        query_module.fetch_public_webpage_text = lambda *args, **kwargs: (
+        web_module.fetch_public_webpage_text = lambda *args, **kwargs: (
             "<main><p>量子纠缠是量子力学中的一种现象，多个粒子的状态之间存在关联。</p></main>",
             "https://example.com/entanglement",
             "text/html",
@@ -468,7 +469,7 @@ AcWing 是一个算法交流平台。
         assert researched["content_source"] == "webpage"
         assert "多个粒子的状态之间存在关联" in researched["citation"]
     finally:
-        query_module.fetch_public_webpage_text = original_fetch_public_webpage_text
+        web_module.fetch_public_webpage_text = original_fetch_public_webpage_text
     assert [citation["source_id"] for citation in query_module.synthesis_citations(
         {
             "source_type": "web_search",
@@ -568,13 +569,13 @@ AcWing 是一个算法交流平台。
         "jina_bing_search",
         "bing_rss_search",
     )
-    originals = {name: getattr(query_module, name) for name in providers}
+    originals = {name: getattr(web_module, name) for name in providers}
     try:
-        setattr(query_module, "duckduckgo_search", lambda question, limit: quantum_sources[:1])
-        setattr(query_module, "jina_baidu_search", lambda question, limit: [])
-        setattr(query_module, "bing_china_search", lambda question, limit: [])
+        setattr(web_module, "duckduckgo_search", lambda question, limit: quantum_sources[:1])
+        setattr(web_module, "jina_baidu_search", lambda question, limit: [])
+        setattr(web_module, "bing_china_search", lambda question, limit: [])
         setattr(
-            query_module,
+            web_module,
             "wikipedia_search",
             lambda question, limit: [
                 quantum_sources[0],
@@ -585,8 +586,8 @@ AcWing 是一个算法交流平台。
                 },
             ],
         )
-        setattr(query_module, "jina_bing_search", lambda question, limit: [])
-        setattr(query_module, "bing_rss_search", lambda question, limit: [])
+        setattr(web_module, "jina_bing_search", lambda question, limit: [])
+        setattr(web_module, "bing_rss_search", lambda question, limit: [])
         result = query_module.web_search(question, 5)
         assert len(result["sources"]) == 2
         assert set(result["web_search_providers"]) == {"duckduckgo", "wikipedia"}
@@ -615,7 +616,7 @@ AcWing 是一个算法交流平台。
 
         irrelevant = lambda question, limit: industrial_sources  # noqa: E731
         for name in providers:
-            setattr(query_module, name, irrelevant)
+            setattr(web_module, name, irrelevant)
         result = query_module.web_search(question, 5)
         assert result["web_search_reason"] == "no_relevant_results"
         assert "没有找到与问题足够相关的可信结果" in result["answer"]
@@ -624,13 +625,13 @@ AcWing 是一个算法交流平台。
             raise RuntimeError("offline")
 
         for name in providers:
-            setattr(query_module, name, unavailable)
+            setattr(web_module, name, unavailable)
         result = query_module.web_search(question, 5)
         assert result["web_search_reason"] == "providers_unavailable"
         assert "搜索源暂时无法访问" in result["answer"]
     finally:
         for name, provider in originals.items():
-            setattr(query_module, name, provider)
+            setattr(web_module, name, provider)
 
     api_config = {
         "LKA_USE_API": "true",
