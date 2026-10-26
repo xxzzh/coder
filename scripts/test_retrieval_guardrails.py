@@ -814,8 +814,43 @@ AcWing 是一个算法交流平台。
     check_agent_loop()
     check_ocr_pipeline()
     check_xlsx_drawings()
+    check_offline_translation_setup()
     print("retrieval guardrails: ok")
 
+
+def check_offline_translation_setup() -> None:
+    """Stanza pipelines started for translation reuse local resources instead of re-downloading them."""
+    import sys
+    import types
+
+    import project_runtime
+
+    calls: list[dict] = []
+    fake_stanza = types.ModuleType("stanza")
+    fake_pipeline_package = types.ModuleType("stanza.pipeline")
+    fake_core = types.ModuleType("stanza.pipeline.core")
+    fake_core.DownloadMethod = types.SimpleNamespace(REUSE_RESOURCES="reuse", DOWNLOAD_RESOURCES="download")
+    fake_stanza.Pipeline = lambda *args, **kwargs: calls.append(kwargs) or "pipeline"
+    saved = {name: sys.modules.get(name) for name in ("stanza", "stanza.pipeline", "stanza.pipeline.core")}
+    sys.modules.update({"stanza": fake_stanza, "stanza.pipeline": fake_pipeline_package, "stanza.pipeline.core": fake_core})
+    try:
+        project_runtime.reuse_local_stanza_resources()
+        project_runtime.reuse_local_stanza_resources()  # applying twice does not wrap twice
+        assert fake_stanza.Pipeline(lang="en", processors="tokenize") == "pipeline"
+        assert calls == [{"lang": "en", "processors": "tokenize", "download_method": "reuse"}], calls
+        fake_stanza.Pipeline(lang="en", download_method="download")  # an explicit choice is kept
+        assert calls[-1]["download_method"] == "download"
+        # Code is never machine-translated (it comes back garbled); English prose is.
+        assert query_module.looks_like_code("ShowStatus(_status). Ready = (_status == Status.OK).")
+        assert query_module.looks_like_code("if (x > 0) { return y; }")
+        assert not query_module.looks_like_code("The item is retried when RetryCount is greater than zero.")
+        assert query_module.local_translate_to_chinese("Ready = (_status == Status.OK);") == ""
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 def check_xlsx_drawings() -> None:
     """Text boxes, charts and SmartArt are extracted with their sheet; only what cannot be read needs review."""

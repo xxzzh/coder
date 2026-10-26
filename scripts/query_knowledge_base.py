@@ -3956,6 +3956,22 @@ def apply_citation_validation(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+# The offline English-to-Chinese model was trained on Wikipedia and sometimes appends this
+# citation boilerplate to garbled output; such a translation is not used.
+MACHINE_TRANSLATION_ARTIFACT = "原始内容存档"
+
+
+def looks_like_code(text: str) -> bool:
+    """Source code reads the same in every language; machine translation only garbles it."""
+    tokens = text.split()
+    code_tokens = [
+        token
+        for token in tokens
+        if re.search(r"[(){}\[\];=<>]|::|->|\w\.\w|[a-z][A-Z]|(?:^|\W)_\w", token)
+    ]
+    return len(code_tokens) >= max(2, len(tokens) * 0.4)
+
+
 def local_translate_to_chinese(text: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", str(text or "")):
         # Chinese evidence needs no translation: keep its line structure and full length
@@ -3987,10 +4003,15 @@ def local_translate_to_chinese(text: str) -> str:
     lowered = f" {text.lower()} "
     if re.search(r"[àâçéèêëîïôùûüÿœæ]", lowered) or sum(marker in lowered for marker in french_markers) >= 2:
         return ""
+    if looks_like_code(text):
+        return ""
     try:
         from argostranslate import translate  # type: ignore
 
+        project_runtime.reuse_local_stanza_resources()
         translated = human_text(translate.translate(text, "en", "zh"), max_len=520, simplify=True)
+        if MACHINE_TRANSLATION_ARTIFACT in translated:
+            return ""
         replacements = {
             "Ohm的定律": "欧姆定律",
             "Ohm定律": "欧姆定律",
