@@ -138,7 +138,34 @@ def main() -> None:
     finally:
         server.shutdown()
         server.server_close()
+    check_chat_payload()
     print("api providers: ok")
+
+
+def check_chat_payload() -> None:
+    """JSON mode and max_tokens reach every provider; the thinking switch only DeepSeek."""
+    import api_providers
+
+    captured: list[dict] = []
+    original = api_providers.api_request
+
+    def fake_request(method, url, provider, api_key, payload=None, timeout=20):  # noqa: ANN001
+        captured.append(payload or {})
+        return {"choices": [{"message": {"content": " {} "}}], "usage": {"total_tokens": 7}}
+
+    api_providers.api_request = fake_request
+    try:
+        reply = api_providers.chat_completion_detailed(
+            "deepseek", "https://api.deepseek.com", "key", "deepseek-flash", [], json_output=True, max_tokens=100, thinking="disabled"
+        )
+        assert reply == {"content": "{}", "usage": {"total_tokens": 7}}
+        assert captured[-1]["thinking"] == {"type": "disabled"}
+        assert captured[-1]["response_format"] == {"type": "json_object"} and captured[-1]["max_tokens"] == 100
+        api_providers.chat_completion_detailed("openai-compatible", "http://127.0.0.1:9/v1", "key", "m", [], thinking="disabled")
+        assert "thinking" not in captured[-1] and "response_format" not in captured[-1]
+        assert api_providers.chat_completion("deepseek", "https://api.deepseek.com", "key", "deepseek-flash", []) == "{}"
+    finally:
+        api_providers.api_request = original
 
 
 if __name__ == "__main__":

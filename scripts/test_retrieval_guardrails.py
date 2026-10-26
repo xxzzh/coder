@@ -811,7 +811,112 @@ AcWing 是一个算法交流平台。
     check_structured_xlsx()
     check_query_terms()
     check_unknown_names()
+    check_agent_loop()
     print("retrieval guardrails: ok")
+
+
+def check_agent_loop() -> None:
+    """The agent answers from cited evidence, searches again when asked, and never ends a last round searching."""
+    import agentic_retrieval as agent
+
+    corpus = {
+        "开机流程": [{"chunk_id": "a", "file_name": "guide.md", "evidence": "开机流程：先自检，再加载配置"}],
+        "BootUp": [{"chunk_id": "b", "file_name": "guide.md", "evidence": "BootUp() 依次调用 HardwareCheck() 和 LoadSettings()"}],
+    }
+
+    def retrieve(query_text: str, limit: int) -> list[dict]:
+        return [dict(row) for row in corpus.get(query_text, [])]
+
+    def scripted(*replies: dict) -> tuple:
+        pending = list(replies)
+        payloads: list[dict] = []
+
+        def complete(messages: list[dict]) -> dict:
+            payloads.append(json.loads(messages[-1]["content"]))
+            return {"content": json.dumps(pending.pop(0), ensure_ascii=False), "usage": {"total_tokens": 10}}
+
+        return complete, payloads
+
+    complete, _ = scripted({"decision": "answer", "answer": "先自检再加载配置。\n- 自检 [#1]", "evidence_ids": [1]})
+    outcome = agent.run_agent("开机流程", retrieve, complete)
+    assert outcome.decision == "answer" and outcome.cited_ids == [1] and outcome.rounds == 1
+    assert outcome.usage == {"total_tokens": 10}
+    # A follow-up search adds evidence; the second round is the last one and is told so.
+    complete, payloads = scripted(
+        {"decision": "search", "queries": ["BootUp", "开机流程"]},
+        {"decision": "answer", "answer": "开机时调用 BootUp()。\n- 依次自检和加载配置 [#2]", "evidence_ids": [2]},
+    )
+    outcome = agent.run_agent("开机流程", retrieve, complete)
+    assert outcome.queries == ["BootUp"] and [item["id"] for item in outcome.evidence] == [1, 2]
+    assert [payload["final_round"] for payload in payloads] == [False, True]
+    # Still searching in the last round means the evidence is not there.
+    complete, _ = scripted({"decision": "search", "queries": ["x"]}, {"decision": "search", "queries": ["y"]})
+    assert agent.run_agent("开机流程", retrieve, complete).decision == "refuse"
+    # Replies that cannot be trusted raise, so the caller answers locally instead.
+    for bad in ("not json", json.dumps({"decision": "answer", "answer": "没有引用"}), json.dumps({"decision": "answer", "answer": "见 [#9]"})):
+        try:
+            agent.run_agent("开机流程", retrieve, lambda messages, bad=bad: {"content": bad})
+        except agent.AgentError:
+            pass
+        else:
+            raise AssertionError(bad)
+    # An empty reply (DeepSeek's JSON mode occasionally returns one) or a server error gets one retry.
+    complete, _ = scripted({"decision": "answer", "answer": "先自检。\n- 自检 [#1]"})
+    replies = iter([{"content": ""}, None])
+    flaky = lambda messages: next(replies) or complete(messages)  # noqa: E731
+    assert agent.run_agent("开机流程", retrieve, flaky).decision == "answer"
+    busy = iter([RuntimeError("HTTP 503: busy"), None])
+
+    def overloaded(messages: list[dict]) -> dict:
+        error = next(busy)
+        if error:
+            raise error
+        return complete(messages)
+
+    complete, _ = scripted({"decision": "refuse", "reason": "没有"})
+    assert agent.run_agent("开机流程", retrieve, overloaded).decision == "refuse"
+    for failure in ([{"content": ""}, {"content": ""}], [RuntimeError("HTTP 401: bad key")]):
+        pending = iter(failure)
+
+        def failing(messages: list[dict], pending=pending) -> dict:
+            item = next(pending)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        try:
+            agent.run_agent("开机流程", retrieve, failing)
+        except (agent.AgentError, RuntimeError):
+            pass
+        else:
+            raise AssertionError(failure)
+    assert agent.cited_ids("a [#3] b [#1, #3] c [#2]") == [3, 1, 2]
+    assert agent.renumber_citations("a [#3] b [#1, #3] c [#2]", [3, 1, 2]) == "a [1] b [2][1] c [3]"
+    # Bracketed data from the documents is never a citation.
+    assert agent.cited_ids("门限 [10,20] 和 [-3,-7]，见 args[0] [#2]") == [2]
+    assert agent.renumber_citations("门限 [10,20] [#2]", [2]) == "门限 [10,20] [1]"
+    evidence: list[dict] = []
+    agent.add_evidence(evidence, [{"evidence": "整段：甲乙丙"}, {"evidence": "甲乙丙"}, {"evidence": "丁"}])
+    assert [item["text"] for item in evidence] == ["整段：甲乙丙", "丁"]  # contained evidence is shown once
+    # Sources follow citation order and the answer is renumbered to match.
+    outcome = agent.AgentOutcome(
+        decision="answer",
+        answer="结论 [#2]，另见 [#1]",
+        reason="",
+        evidence=[
+            {"id": 1, "file": "a.md", "text": "甲", "row": {"file_name": "a.md", "chunk_id": "c1"}},
+            {"id": 2, "file": "b.md", "text": "乙", "row": {"file_name": "b.md", "chunk_id": "c2"}},
+        ],
+        cited_ids=[2, 1],
+        rounds=1,
+        queries=[],
+    )
+    result = query_module.agent_answer_result("问", outcome, {}, {}, False)
+    assert result["answer"] == "结论 [1]，另见 [2]" and [source["chunk_id"] for source in result["sources"]] == ["c2", "c1"]
+    api_config = {"LKA_USE_API": "true", "LKA_API_KEY": "test", "LKA_API_MODEL": "m"}
+    assert query_module.agent_enabled(api_config)
+    assert not query_module.agent_enabled({**api_config, "LKA_AGENT_ENABLED": "false"})
+    assert not query_module.agent_enabled({**api_config, "LKA_API_KEY": ""})
 
 
 def check_unknown_names() -> None:

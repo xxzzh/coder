@@ -921,6 +921,7 @@ def page_html() -> str:
                 data.web_search_provider || '',
                 data.cache_hit ? 'cache' : '',
                 data.api_used ? 'api' : '',
+                data.agent_rounds ? `agent ${data.agent_rounds} 轮` : '',
                 data.index_status === 'updating' ? 'index updating' : ''
               ].filter(Boolean);
               $('askMeta').textContent = parts.join(' · ');
@@ -1026,19 +1027,31 @@ def page_html() -> str:
       }
       normalized.split(/\\n{2,}/).forEach((block) => {
         const lines = block.split('\\n').map((line) => line.trim()).filter(Boolean);
-        const bulletLines = lines.filter((line) => /^[-*•]\\s+/.test(line));
-        if (bulletLines.length === lines.length && lines.length > 0) {
-          const list = document.createElement('ul');
-          list.className = 'answer-list';
-          lines.forEach((line) => {
+        // Runs of bullet lines become lists; the other lines of the block stay paragraphs, so
+        // a lead sentence followed by bullets renders as a sentence and then a list.
+        let paragraph = [];
+        let list = null;
+        const flush = () => {
+          if (paragraph.length) addAnswerParagraph(container, paragraph.join(' '));
+          paragraph = [];
+        };
+        lines.forEach((line) => {
+          if (/^[-*•]\\s+/.test(line)) {
+            flush();
+            if (!list) {
+              list = document.createElement('ul');
+              list.className = 'answer-list';
+              container.appendChild(list);
+            }
             const row = document.createElement('li');
             appendAnswerText(row, line.replace(/^[-*•]\\s+/, ''));
             list.appendChild(row);
-          });
-          container.appendChild(list);
-        } else {
-          addAnswerParagraph(container, lines.join(' '));
-        }
+          } else {
+            list = null;
+            paragraph.push(line);
+          }
+        });
+        flush();
       });
     }
     async function loadSources() {
@@ -1348,6 +1361,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                 "web_search_reason": result.get("web_search_reason"),
                 "cache_hit": result.get("cache_hit", False),
                 "api_used": result.get("api_used", False),
+                "agent_rounds": (result.get("agent") or {}).get("rounds"),
                 "user_guidance": result.get("user_guidance"),
                 "async_update_scheduled": result.get("async_update_scheduled", False),
                 "index_status": result.get("index_status", "ready"),

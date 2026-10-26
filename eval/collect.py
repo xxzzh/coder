@@ -99,6 +99,8 @@ def end_to_end(db_path: Path, question: str, k: int, allow_api: bool) -> dict[st
         "retriever_plugin": result.get("retriever_plugin"),
         "degrade_reason": result.get("degrade_reason"),
         "api_used": bool(result.get("api_used")),
+        "agent": result.get("agent"),
+        "agent_error": result.get("agent_error"),
         "sources": [
             {
                 "source_id": source.get("source_id"),

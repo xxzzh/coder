@@ -212,6 +212,22 @@ MiMo Token Plan 的 `tp-` key 仅限编程工具使用，不能配置为本应�
 python scripts\query_knowledge_base.py "What is ACID?" --no-api
 ```
 
+### 智能检索 Agent
+
+配置了可用的答案 API 后，由模型而不是关键词门槛决定能不能答（`scripts/agentic_retrieval.py`）：
+
+1. 按问题做混合检索取前 10 条，每条展开成完整章节或表格（每条最多 1800 字）交给模型。
+2. 模型读完证据后三选一：直接作答；给出 1–3 个按文档写法改写的检索语句再查一轮；或拒答并说明缺什么。最多两轮，最后一轮只能作答或拒答。
+3. 答案每条要点带引用编号。模型用 `[#n]` 标注证据，系统再换成来源编号 `[n]`，门限里的 `[10,20]` 这类原文不会被误当成引用。
+4. 问题里出现知识库从未提到的英文名称或“名称+版本”（如某产品的 3.0 版）时，不调用模型直接拒答。
+5. 模型回复不可用（不是 JSON、引用了不存在的证据、超时、网络错误）时，自动退回本地答案，结果里记录 `agent_error`。
+
+`.env` 配置项：
+
+- `LKA_AGENT_ENABLED`：默认 `true`，设为 `false` 时只用模型润色本地答案。
+- `LKA_AGENT_MAX_ROUNDS`：检索轮数上限，默认 `2`，范围 1–3。
+- `LKA_API_THINKING`：DeepSeek 默认开启思考模式，这里默认 `disabled` 以控制延迟；设为 `enabled` 可换取更强推理。
+
 ## 当前检索技术
 
 - SQLite FTS5 全文检索
@@ -326,6 +342,12 @@ knowledge_base/processed/extraction_report.jsonl
 ```
 
 评测不联网、不调用 API、关闭查询缓存，判分只用规则不用模型。指标定义、评测集格式和出题要求见 `eval/README.md`。
+
+评测智能检索 Agent 时加 `--allow-api`，会按 `.env` 调用模型（产生少量 API 费用），检索指标不变，只有作答、通过和拒答会变化：
+
+```bat
+.\run-agent.bat eval --allow-api --log "这次改了什么"
+```
 
 ## 项目内本地审计
 

@@ -25,7 +25,7 @@ PROVIDERS: dict[str, dict[str, Any]] = {
     "deepseek": {
         "name": "DeepSeek",
         "base_url": "https://api.deepseek.com",
-        "fallback_models": ["deepseek-v4-pro", "deepseek-v4-flash"],
+        "fallback_models": ["deepseek-flash", "deepseek-v4-pro"],
         "docs": "https://api-docs.deepseek.com/",
     },
     "openai": {
@@ -194,22 +194,43 @@ def chat_completion(
     temperature: float = 0.1,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> str:
+    return chat_completion_detailed(provider, base_url, api_key, model, messages, temperature, timeout)["content"]
+
+
+def chat_completion_detailed(
+    provider: str,
+    base_url: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float = 0.1,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    json_output: bool = False,
+    max_tokens: int | None = None,
+    thinking: str | None = None,
+) -> dict[str, Any]:
+    """One chat call; returns the reply text and the provider's token usage.
+
+    thinking ("enabled" / "disabled") is sent only to DeepSeek, whose models think by default;
+    other providers would reject the unknown parameter.
+    """
     provider = infer_provider(base_url, api_key, provider)
     base_url = (base_url or default_base_url(provider)).rstrip("/")
     if token_plan_rejected(base_url, api_key):
         raise RuntimeError("MiMo Token Plan 的 tp- key 仅限编程工具使用，不能作为本应用后端。")
-    data = api_request(
-        "POST",
-        f"{base_url}/chat/completions",
-        provider,
-        api_key,
-        payload={"model": model, "temperature": temperature, "messages": messages},
-        timeout=timeout,
-    )
+    payload: dict[str, Any] = {"model": model, "temperature": temperature, "messages": messages}
+    if json_output:
+        payload["response_format"] = {"type": "json_object"}
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
+    if thinking and provider == "deepseek":
+        payload["thinking"] = {"type": thinking}
+    data = api_request("POST", f"{base_url}/chat/completions", provider, api_key, payload=payload, timeout=timeout)
     answer = data["choices"][0]["message"]["content"]
     if isinstance(answer, list):
         answer = "".join(str(item.get("text", "")) for item in answer if isinstance(item, dict))
-    return str(answer).strip()
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    return {"content": str(answer or "").strip(), "usage": usage}
 
 
 def validate_chat_model(provider: str, base_url: str, api_key: str, model: str, timeout: int = 20) -> dict[str, Any]:

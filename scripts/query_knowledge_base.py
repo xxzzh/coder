@@ -30,7 +30,8 @@ from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from xml.etree import ElementTree
 
-from api_providers import chat_completion, token_plan_rejected
+import agentic_retrieval
+from api_providers import chat_completion, chat_completion_detailed, token_plan_rejected
 from ingest_knowledge_base import ingest_in_progress, is_ignored_raw_file, raw_file_stat_fingerprint
 import model_capabilities
 import project_runtime
@@ -700,6 +701,9 @@ def runtime_config() -> dict[str, str]:
         "LKA_RERANK_ENABLED",
         "LKA_LLM_CHUNKING_ENABLED",
         "LKA_LLM_QUERY_ROUTING_ENABLED",
+        "LKA_AGENT_ENABLED",
+        "LKA_AGENT_MAX_ROUNDS",
+        "LKA_API_THINKING",
     ):
         if os.environ.get(key):
             config[key] = os.environ[key]
@@ -729,7 +733,30 @@ def api_cache_variant(config: dict[str, str], allow_api: bool) -> str:
     provider = config.get("LKA_API_PROVIDER", "openai-compatible")
     base_url = config.get("LKA_API_BASE_URL", "")
     model = config.get("LKA_API_MODEL", "")
-    return f"{CACHE_VARIANT_VERSION}:api-refined:{provider}:{base_url}:{model}"
+    agent = (
+        f":{agentic_retrieval.AGENT_VERSION}:rounds-{agent_max_rounds(config)}:thinking-{api_thinking(config)}"
+        if agent_enabled(config)
+        else ""
+    )
+    return f"{CACHE_VARIANT_VERSION}:api-refined:{provider}:{base_url}:{model}{agent}"
+
+
+def agent_enabled(config: dict[str, str]) -> bool:
+    """The retrieval agent runs whenever the answer API is usable, unless LKA_AGENT_ENABLED=false."""
+    return api_enabled(config) and model_capabilities.enabled(config, "LKA_AGENT_ENABLED", default=True)
+
+
+def agent_max_rounds(config: dict[str, str]) -> int:
+    try:
+        return max(1, min(3, int(config.get("LKA_AGENT_MAX_ROUNDS", "2") or 2)))
+    except ValueError:
+        return 2
+
+
+def api_thinking(config: dict[str, str]) -> str:
+    # DeepSeek thinks by default, which multiplies latency; the agent's judgement works without it.
+    value = config.get("LKA_API_THINKING", "disabled").strip().lower()
+    return value if value in {"enabled", "disabled"} else "disabled"
 
 
 def query_cache_variant(config: dict[str, str], allow_api: bool, use_web: bool) -> str:
@@ -4107,7 +4134,7 @@ def finalize_answer(question: str, result: dict[str, Any], config: dict[str, str
     attach_query_structure(question, result)
     if result.get("source_type") not in {"knowledge_base", "web_search", "hybrid_web_knowledge", "faq_fallback"}:
         return result
-    if result.get("answer_mode") == "api_grounded_summary":
+    if result.get("answer_mode") in {"api_grounded_summary", "api_agent_answer"}:
         return apply_citation_validation(prune_unreferenced_output_sources(polish_internal_answer(result)))
     if str(result.get("answer_mode", "")).startswith("local_structured_"):
         result["api_used"] = False
@@ -4247,6 +4274,109 @@ def run_domain_retrievers(
     return None
 
 
+AGENT_EVIDENCE_MAX_CHARS = 1800
+
+
+def agent_retriever(db_path: Path, config: dict[str, str]) -> agentic_retrieval.Retrieve:
+    def retrieve(query_text: str, limit: int) -> list[dict[str, Any]]:
+        rows, _ = search(db_path, query_text, limit, config)
+        rows = rows[:limit]
+        for row in rows:
+            # The whole section or table, as a local answer would cite it, so the model sees
+            # complete steps and rows rather than a fragment.
+            row["evidence"] = block_citation(full_section_text(db_path, row), query_text, AGENT_EVIDENCE_MAX_CHARS)
+        return rows
+
+    return retrieve
+
+
+def agent_completion(config: dict[str, str]) -> agentic_retrieval.Complete:
+    timeout = int(config.get("LKA_API_TIMEOUT_SECONDS", str(DEFAULT_API_TIMEOUT_SECONDS)) or DEFAULT_API_TIMEOUT_SECONDS)
+
+    def complete(messages: list[dict[str, str]]) -> dict[str, Any]:
+        return chat_completion_detailed(
+            config.get("LKA_API_PROVIDER", "openai-compatible"),
+            config.get("LKA_API_BASE_URL", "").rstrip("/"),
+            config.get("LKA_API_KEY", ""),
+            config.get("LKA_API_MODEL", ""),
+            messages,
+            temperature=0.0,
+            timeout=timeout,
+            json_output=True,
+            max_tokens=agentic_retrieval.ANSWER_MAX_TOKENS,
+            thinking=api_thinking(config),
+        )
+
+    return complete
+
+
+def agent_trace(outcome: agentic_retrieval.AgentOutcome, config: dict[str, str]) -> dict[str, Any]:
+    return {
+        "version": agentic_retrieval.AGENT_VERSION,
+        "decision": outcome.decision,
+        "reason": outcome.reason,
+        "rounds": outcome.rounds,
+        "follow_up_queries": outcome.queries,
+        "evidence_count": len(outcome.evidence),
+        "usage": outcome.usage,
+        "elapsed_ms": outcome.elapsed_ms,
+        "thinking": api_thinking(config),
+    }
+
+
+def agent_answer_result(
+    question: str,
+    outcome: agentic_retrieval.AgentOutcome,
+    metadata: dict[str, str],
+    config: dict[str, str],
+    refresh_scheduled: bool,
+) -> dict[str, Any]:
+    by_id = {item["id"]: item for item in outcome.evidence}
+    sources: list[dict[str, Any]] = []
+    citations: list[dict[str, Any]] = []
+    for source_id, evidence_id in enumerate(outcome.cited_ids, start=1):
+        item = by_id[evidence_id]
+        row = item["row"]
+        source = {
+            "source_id": source_id,
+            "file": row.get("file_name"),
+            "file_path": row.get("file_path"),
+            "file_type": row.get("file_type"),
+            "chunk_id": row.get("chunk_id"),
+            "excerpt": item["text"],
+            "citation": item["text"],
+            "rerank_score": row.get("rerank_score"),
+            "semantic_score": row.get("semantic_score"),
+            "keyword_score": row.get("keyword_score"),
+            "fts_score": row.get("fts_score"),
+        }
+        if row.get("context_chunk_ids"):
+            source["context_chunk_ids"] = row["context_chunk_ids"]
+        sources.append(source)
+        citations.append({"source_id": source_id, "file": row.get("file_name"), "chunk_id": row.get("chunk_id"), "quote": item["text"]})
+    return {
+        "answer": agentic_retrieval.renumber_citations(outcome.answer, outcome.cited_ids),
+        "answer_mode": "api_agent_answer",
+        "source_type": "knowledge_base",
+        "sources": sources,
+        "citations": citations,
+        "need_web_search": False,
+        "web_search_used": False,
+        "api_used": True,
+        "api_provider": config.get("LKA_API_PROVIDER", "openai-compatible"),
+        "api_model": config.get("LKA_API_MODEL", ""),
+        "agent": agent_trace(outcome, config),
+        "index_updated_at": metadata.get("indexed_at"),
+        "embedding_model": metadata.get("embedding_model"),
+        "vector_backend": metadata.get("vector_backend", "faiss"),
+        "vector_embedding_model": metadata.get("vector_embedding_model"),
+        "retrieval_mode": "agentic_llm_retrieval",
+        "async_update_scheduled": refresh_scheduled,
+        "index_status": "updating" if refresh_scheduled else "ready",
+        "cache_hit": False,
+    }
+
+
 def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, allow_api: bool = True) -> dict[str, Any]:
     config = runtime_config()
     cache_variant = query_cache_variant(config, allow_api, use_web)
@@ -4341,6 +4471,45 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
             cache_conn.close()
         return result
 
+    agent_error = ""
+    if allow_api and agent_enabled(config) and not unknown_names(question, db_path):
+        try:
+            outcome = agentic_retrieval.run_agent(
+                question, agent_retriever(db_path, config), agent_completion(config), agent_max_rounds(config)
+            )
+        except (agentic_retrieval.AgentError, RuntimeError, OSError, ValueError, KeyError) as exc:
+            # Unusable reply, timeout or network failure: answer locally instead.
+            agent_error = human_text(str(exc), max_len=240)
+        else:
+            if outcome.decision == "answer":
+                result = agent_answer_result(question, outcome, metadata, config, refresh_scheduled)
+            else:
+                reason = trim_terminal_punctuation(outcome.reason) if outcome.reason else ""
+                result = no_local_answer(
+                    use_web,
+                    question,
+                    f"本地知识库没有找到足够依据：{reason}。" if reason else "本地知识库没有找到足够依据。",
+                    metadata,
+                    config,
+                    allow_api,
+                    limit,
+                )
+                result["agent"] = agent_trace(outcome, config)
+                if not use_web:
+                    result["degraded"] = True
+                    result["degrade_reason"] = "agent_no_evidence"
+                    result["user_guidance"] = local_no_match_user_guidance(question, db_path)
+            result = finalize_answer(question, result, config, allow_api)
+            if result.get("source_type") == "knowledge_base":
+                result["answer_quality"] = model_capabilities.evaluate_answer(
+                    question, str(result.get("answer", "")), result.get("sources") or []
+                )
+            apply_index_status(result, refresh_scheduled)
+            if cache_conn is not None and not result.get("web_search_reason"):
+                cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)
+                cache_conn.close()
+            return result
+
     try:
         rows, metadata = search(db_path, question, limit, config)
     except sqlite3.DatabaseError:
@@ -4370,7 +4539,14 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
             result["user_guidance"] = local_no_match_user_guidance(question, db_path)
         apply_index_status(result, refresh_scheduled)
         result = finalize_answer(question, result, config, allow_api)
-        if cache_conn is not None and (not result.get("web_search_used") or result.get("sources")) and not result.get("web_search_reason"):
+        if agent_error:
+            result["agent_error"] = agent_error
+        if (
+            cache_conn is not None
+            and not agent_error  # a fallback after a passing API failure must not be served from cache later
+            and (not result.get("web_search_used") or result.get("sources"))
+            and not result.get("web_search_reason")
+        ):
             cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)
             cache_conn.close()
         return result
@@ -4446,8 +4622,10 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
         result["answer_mode"] = "local_structured_table_summary"
     result = finalize_answer(question, result, config, allow_api)
     result["answer_quality"] = model_capabilities.evaluate_answer(question, str(result.get("answer", "")), result.get("sources") or [])
+    if agent_error:
+        result["agent_error"] = agent_error
     apply_index_status(result, refresh_scheduled)
-    if cache_conn is not None and not result.get("web_search_reason"):
+    if cache_conn is not None and not agent_error and not result.get("web_search_reason"):
         cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)
         cache_conn.close()
     return result
