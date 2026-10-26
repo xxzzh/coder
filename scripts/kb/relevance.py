@@ -1,0 +1,154 @@
+"""Relevance gate: does the retrieved evidence cover the question, and does the question name anything the index never mentions."""
+
+from __future__ import annotations
+
+import re
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+from kb.terms import ENGLISH_QUERY_STOP_WORDS, QUESTION_FUNCTION_PHRASES, abbreviation_query_term, iterative_retrieval_question, normalized_retrieval_question
+
+
+LOCAL_SCORE_THRESHOLD = 0.16
+
+
+LOCAL_CONTENT_COVERAGE_THRESHOLD = 0.5
+
+
+# A name followed by a version: MES 3.0, USB 4.0, WIFI 6E, .NET 6, MES3.0. A version without a
+# dot (6, 6E) must be separated by a space, so model codes such as AB123 are not split.
+VERSIONED_NAME_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]*?)(?:\s*(\d+\.\d+(?:\.\d+)*[A-Za-z]?)|\s+(\d+[A-Za-z]?))(?![A-Za-z0-9]|\.\d)"
+)
+
+
+KNOWLEDGE_TEXT_CACHE: dict[str, tuple[str, str]] = {}
+
+
+def query_content_units(question: str) -> list[tuple[str, str, float]]:
+    """Weighted subject units of a question as (kind, term, weight).
+
+    Each ASCII term (identifier, abbreviation, English word) weighs 1. Each Chinese
+    content span left after removing question-function words also weighs 1 in total,
+    spread over its distinct bigrams, so 「添加一个新测试项」 still mostly matches the
+    source wording 「添加新测试项」 instead of requiring the whole span verbatim.
+    """
+    normalized = normalized_retrieval_question(question)
+    abbreviation = abbreviation_query_term(normalized)
+    if abbreviation:
+        return [("ascii", abbreviation.lower(), 1.0)]
+    units: list[tuple[str, str, float]] = []
+    seen: set[str] = set()
+    for word in re.findall(r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_]*", normalized):
+        lowered = word.lower()
+        if len(lowered) < 2 or lowered in ENGLISH_QUERY_STOP_WORDS or lowered in seen:
+            continue
+        seen.add(lowered)
+        units.append(("ascii", lowered, 1.0))
+    chinese_text = normalized
+    for phrase in QUESTION_FUNCTION_PHRASES:
+        chinese_text = chinese_text.replace(phrase, " ")
+    for span in re.findall(r"[\u4e00-\u9fff]{2,}", chinese_text):
+        bigrams = [gram for gram in dict.fromkeys(span[index : index + 2] for index in range(len(span) - 1)) if gram not in seen]
+        if not bigrams:
+            continue
+        seen.update(bigrams)
+        units.extend(("cjk", gram, 1.0 / len(bigrams)) for gram in bigrams)
+    return units
+
+
+def content_coverage(units: list[tuple[str, str, float]], text: str) -> float:
+    """Share of the question's subject weight found in text (0..1)."""
+    total = sum(weight for _, _, weight in units)
+    if not total:
+        return 0.0
+    lowered = text.lower()
+    compact = re.sub(r"\s+", "", text)
+    matched = 0.0
+    for kind, term, weight in units:
+        if kind == "ascii":
+            if ascii_term_pattern(term).search(lowered):
+                matched += weight
+        elif term in compact:
+            matched += weight
+    return matched / total
+
+
+def ascii_term_pattern(term: str) -> re.Pattern[str]:
+    # Short terms (PR, GW, AC) need a full word boundary; longer ones may prefix
+    # a compound such as Camera -> CameraTest.
+    return re.compile(rf"(?<![a-z0-9]){re.escape(term)}" + (r"(?![a-z0-9])" if len(term) < 3 else ""))
+
+
+def knowledge_text(db_path: Path) -> str | None:
+    """All chunk text of the index, lower-cased; reloaded whenever the index is rebuilt."""
+    key = str(Path(db_path).resolve())
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute("SELECT value FROM metadata WHERE key = 'indexed_at'").fetchone()
+            stamp = str(row[0]) if row else ""
+            cached = KNOWLEDGE_TEXT_CACHE.get(key)
+            if cached and cached[0] == stamp:
+                return cached[1]
+            text = "\n".join(str(value) for (value,) in conn.execute("SELECT text FROM chunks")).lower()
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        return None
+    KNOWLEDGE_TEXT_CACHE[key] = (stamp, text)
+    return text
+
+
+def unknown_names(question: str, db_path: Path) -> list[str]:
+    """Names in a Chinese question that occur nowhere in the knowledge base.
+
+    In a Chinese question, Latin-script terms are names and identifiers (Jenkins, FATAL,
+    LogMsgType), and a word followed by a version (MES 3.0, Windows 7) names one release.
+    If the index never mentions such a name it holds no evidence about it, however well
+    the rest of the question matches: MES 2.0 chunks do not answer a question about MES 3.0.
+    Chinese words are not checked this way: users' wording (记事本, 连不上) is often absent
+    from the documents even when the documents answer the question.
+    """
+    if not re.search(r"[\u4e00-\u9fff]", question):
+        return []
+    corpus = knowledge_text(db_path)
+    if corpus is None:
+        return []
+    unknown: list[str] = []
+    normalized = normalized_retrieval_question(question)
+    for match in VERSIONED_NAME_PATTERN.finditer(normalized):
+        word, version = match.group(1), match.group(2) or match.group(3)
+        dotted = "." if normalized[max(match.start(1) - 1, 0) : match.start(1)] == "." else ""  # .NET 6
+        pattern = rf"(?<![a-z0-9]){re.escape(word.lower())}\s*{re.escape(version.lower())}(?![a-z0-9]|\.\d)"
+        if not re.search(pattern, corpus):
+            unknown.append(f"{dotted}{word} {version}")
+    versioned = [name.lower().replace(" ", "") for name in unknown]
+    for kind, term, _ in query_content_units(question):
+        if kind != "ascii" or ascii_term_pattern(term).search(corpus) or any(term in name for name in versioned):
+            continue
+        # Report the name as the user wrote it (FATAL, not fatal).
+        written = re.search(re.escape(term), question, re.IGNORECASE)
+        unknown.append(written.group(0) if written else term)
+    return unknown
+
+
+def local_result_is_relevant(rows: list[dict[str, Any]], question: str, db_path: Path | None = None) -> bool:
+    if not rows or rows[0].get("rerank_score", 0.0) < LOCAL_SCORE_THRESHOLD:
+        return False
+    units = query_content_units(question)
+    if not units:
+        return False
+    if db_path is not None and unknown_names(question, db_path):
+        return False
+    candidate_count = min(len(rows), 8 if iterative_retrieval_question(question) else 3)
+    for row in rows[:candidate_count]:
+        if row.get("rerank_score", 0.0) < LOCAL_SCORE_THRESHOLD * 0.8:
+            continue
+        has_lexical_score = float(row.get("keyword_score", 0.0) or 0.0) > 0 or float(row.get("fts_score", 0.0) or 0.0) > 0
+        # Strictly more than half: a chunk that only shares the subject (a model code) but not the
+        # asked attribute (售价) must not count as evidence.
+        if has_lexical_score and content_coverage(units, str(row.get("text", ""))) > LOCAL_CONTENT_COVERAGE_THRESHOLD:
+            return True
+    return False
