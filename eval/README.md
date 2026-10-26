@@ -22,6 +22,22 @@
 | `summary.md` / `summary.json` | 汇总表、未通过题目、负样本误答 |
 | `run_meta.json` | 代码版本、索引状态、运行参数 |
 
+## 调混合检索权重
+
+```bat
+python eval\run_eval.py ...    REM 先确认当前基线
+.venv\Scripts\python.exe eval\tune_weights.py --step 0.05
+```
+
+`tune_weights.py` 对每道题只跑一次检索，记录完整候选池及各项分数（语义、关键词、全文），然后离线按不同权重重新排序，结果与 `search()` 用这些权重时完全一致。为了防止在小评测集上过拟合：
+
+- 题目按类别分层，分成两折；
+- 只接受在两折上 MRR 都提高、且任一折的 Hit@1 和 Hit@5 都不下降的权重；
+- 在符合条件的权重里，选两折提升中较小的那个最大的一组；
+- 同时报告"在一折上最优的权重放到另一折上的表现"，用来判断泛化。
+
+脚本只给出建议，不会改代码；采用时修改 `scripts/query_knowledge_base.py` 里的 `RERANK_WEIGHTS`，再跑一遍完整评测确认。
+
 ## 三个角色互相独立
 
 | 脚本 | 职责 | 是否用模型 |

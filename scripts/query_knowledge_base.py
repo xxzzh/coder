@@ -79,7 +79,10 @@ SECTION_SCAN_MAX_CHUNKS = 40
 # Excel import writes per-group item lists as "<sheet> 概览 | <group>：" chunks.
 TABLE_OVERVIEW_MARKER = " 概览 | "
 OVERVIEW_LIST_BOOST = 1.1
-CACHE_VARIANT_VERSION = "retrieval-v53:subject-coverage-gate-no-canned-answers"
+# Hybrid rerank weights, chosen with eval/tune_weights.py (two-fold validation on the local eval set;
+# previously 0.48 / 0.34 / 0.18): MRR 0.759 -> 0.788, Hit@5 0.836 -> 0.909, Hit@1 unchanged.
+RERANK_WEIGHTS = {"semantic": 0.70, "keyword": 0.25, "fts": 0.05}
+CACHE_VARIANT_VERSION = "retrieval-v54:query-terms-tuned-weights"
 ITERATIVE_RETRIEVAL_LIMIT = 12
 EMBEDDING_CACHE: dict[str, Any] = {"key": None, "rows": []}
 EMBEDDING_CACHE_LOCK = threading.Lock()
@@ -209,6 +212,21 @@ QUESTION_FUNCTION_PHRASES = tuple(
     )
 )
 LOCAL_CONTENT_COVERAGE_THRESHOLD = 0.5
+# Question words and particles that never help locate evidence. Aspect words such as 流程,
+# 步骤, 区别 stay: they often appear in the section titles that hold the answer.
+RETRIEVAL_STOP_PHRASES = tuple(
+    sorted(
+        {
+            *CHINESE_QUERY_STOP_PHRASES,
+            "什么", "哪些", "那些", "哪个", "哪种", "怎样", "一个", "分别",
+            "吗", "呢", "吧", "啊", "呀", "么", "的", "了", "是", "都", "也", "和", "与", "及",
+        },
+        key=len,
+        reverse=True,
+    )
+)
+CANDIDATE_TERMS_LIMIT = 48
+FTS_QUERY_MAX_TERMS = CANDIDATE_TERMS_LIMIT
 TRAD_TO_SIMP = str.maketrans(
     {
         "與": "与",
@@ -383,7 +401,13 @@ def iterative_retrieval_question(question: str) -> bool:
 
 
 def candidate_terms(question: str) -> list[str]:
-    terms: list[str] = []
+    """Lexical terms of a question: ASCII phrases and words first, then the question's content
+    spans and their 4-, 3- and 2-character n-grams.
+
+    Question words and particles are removed first. The FTS index stores Chinese as 2-4
+    character n-gram tokens, and the old fixed-size list sorted longest-first dropped every
+    short term (门限, 风扇, usb) from long questions, so their FTS query matched nothing.
+    """
     question = retrieval_question_with_aliases(question)
     ascii_phrases = [
         phrase.strip()
@@ -395,26 +419,28 @@ def candidate_terms(question: str) -> list[str]:
     ascii_words = [
         word.lower()
         for word in re.findall(r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_]*(?![A-Za-z0-9_])", question)
-        if len(word) >= 2
+        if len(word) >= 2 and word.lower() not in ENGLISH_QUERY_STOP_WORDS
     ]
-    terms.extend(ascii_phrases)
-    terms.extend(ascii_words)
-
-    for word in re.findall(r"[\u4e00-\u9fff]+", question):
-        if re.fullmatch(r"[\u4e00-\u9fff]+", word):
-            if word not in STOP_WORDS and len(word) >= 2:
-                terms.append(word)
-            for size in range(2, min(6, len(word)) + 1):
-                for index in range(0, len(word) - size + 1):
-                    term = word[index : index + size]
-                    if term not in STOP_WORDS:
-                        terms.append(term)
+    chinese_text = question
+    for phrase in RETRIEVAL_STOP_PHRASES:
+        chinese_text = chinese_text.replace(phrase, " ")
+    spans = re.findall(r"[\u4e00-\u9fff]{2,}", chinese_text)
+    grams: dict[int, list[str]] = {4: [], 3: [], 2: []}
+    for span in spans:
+        for size, bucket in grams.items():
+            bucket.extend(span[index : index + size] for index in range(len(span) - size + 1))
+    whole_spans = sorted({span for span in spans if 4 < len(span) <= 8}, key=len, reverse=True)
+    terms = [*ascii_phrases, *ascii_words, *whole_spans, *grams[4], *grams[3], *grams[2]]
     lowered = question.lower()
     if "dioxide" in lowered or "carbon" in lowered:
         terms.extend(["二氧化碳", "碳固定"])
     if "穿过" in question or "介质" in question or "pass through" in lowered:
         terms.extend(["travel", "through", "solids", "liquids", "gases", "pass through"])
-    return unique_terms(terms, limit=32)
+    unique: dict[str, str] = {}
+    for term in terms:
+        if term and term not in STOP_WORDS:
+            unique.setdefault(term.lower(), term)
+    return list(unique.values())[:CANDIDATE_TERMS_LIMIT]
 
 
 def unique_terms(terms: list[str], limit: int) -> list[str]:
@@ -540,7 +566,9 @@ def fts_query(question: str) -> str:
     if not terms:
         escaped = question.replace('"', '""').strip()
         return f'"{escaped}"' if escaped else '""'
-    return " OR ".join(f'"{term.replace(chr(34), chr(34) + chr(34))}"' for term in terms[:16])
+    # Only terms the index can hold as tokens: ASCII words and Chinese n-grams of 2-4 characters.
+    indexable = [term for term in terms if not re.search(r"[\u4e00-\u9fff]{5,}", term)] or terms
+    return " OR ".join(f'"{term.replace(chr(34), chr(34) + chr(34))}"' for term in indexable[:FTS_QUERY_MAX_TERMS])
 
 
 def sentence_score(sentence: str, terms: list[str]) -> int:
@@ -1207,7 +1235,15 @@ def rerank(rows: list[dict[str, Any]], question: str, limit: int, config: dict[s
         term_score = item["term_score"] / max_term
         semantic_score = max(0.0, float(item.get("semantic_score", 0.0)))
         quality_score = chunk_information_quality(item["text"])
-        item["rerank_score"] = round((0.48 * semantic_score + 0.34 * term_score + 0.18 * fts_score) * quality_score, 6)
+        item["rerank_score"] = round(
+            (
+                RERANK_WEIGHTS["semantic"] * semantic_score
+                + RERANK_WEIGHTS["keyword"] * term_score
+                + RERANK_WEIGHTS["fts"] * fts_score
+            )
+            * quality_score,
+            6,
+        )
         if list_question and TABLE_OVERVIEW_MARKER in str(item["text"]):
             # A table overview lists every item of a group in one chunk; for "which items" questions
             # it beats any single row of that group.

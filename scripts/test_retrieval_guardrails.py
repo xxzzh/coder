@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import os
+import re
 import sqlite3
 import tempfile
 import zipfile
@@ -808,7 +809,19 @@ AcWing 是一个算法交流平台。
     check_embedding_cache()
     check_block_citations()
     check_structured_xlsx()
+    check_query_terms()
     print("retrieval guardrails: ok")
+
+
+def check_query_terms() -> None:
+    """Long questions keep their short terms, and FTS only receives terms it can match."""
+    terms = query_module.candidate_terms("风扇测试的低中高转速门限分别是多少")
+    assert {"风扇", "转速", "门限"} <= set(terms), terms
+    assert not {"是多", "多少", "分别"} & set(terms), terms  # question words are not evidence
+    assert query_module.candidate_terms("主板USB 4.0读写速度门限是多少")[0] == "usb"
+    fts_terms = re.findall(r'"([^"]+)"', query_module.fts_query("测试中途重启后，已经通过的测试项还要重新测吗"))
+    assert fts_terms and all(len(term) <= 4 for term in fts_terms), fts_terms  # index holds 2-4 char n-grams
+    assert "重启" in fts_terms
 
 
 def check_structured_xlsx() -> None:
