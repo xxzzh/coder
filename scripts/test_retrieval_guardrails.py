@@ -1305,6 +1305,11 @@ def check_embedding_cache() -> None:
                 assert vector_store.load_index(index_dir)[0] is first_load[0]  # served from memory
                 assert vector_store.search_vector_index([1.0, 0.0], 1, vector_dir=index_dir)["rows"][0]["chunk_id"] == "c0"
                 vector_store.build_vector_index(records, [[0.0, 1.0], [1.0, 0.0]], {}, vector_dir=index_dir)
+                # The rewrite can land in the same timestamp tick with the same file sizes; give the files
+                # a later time, as any real rebuild has, so the check does not depend on timing.
+                for path in index_dir.iterdir():
+                    stat = path.stat()
+                    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
                 assert vector_store.load_index(index_dir)[0] is not first_load[0]  # rewritten files reload
                 assert vector_store.search_vector_index([1.0, 0.0], 1, vector_dir=index_dir)["rows"][0]["chunk_id"] == "c1"
 
