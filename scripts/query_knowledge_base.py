@@ -1584,7 +1584,7 @@ def polish_internal_answer_text(text: str) -> str:
     text = re.sub(r"\s*\|+\s*", "，", text)
     text = re.sub(r"[<>《》]{2,}", " ", text)
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffd]+", "", text)
-    # Only commas next to Chinese text are prose; [4.75,5.26] or f(a,b) must stay intact.
+    # Only commas next to Chinese text are prose; [1.25,3.75] or f(a,b) must stay intact.
     text = re.sub(r"(?<=[\u4e00-\u9fff])\s*,\s*|\s*,\s*(?=[\u4e00-\u9fff])", "，", text)
     text = re.sub(r"，{2,}", "，", text)
     text = re.sub(r"[ \t]+([，。；：、！？])", r"\1", text)
@@ -3643,7 +3643,7 @@ def local_result_is_relevant(rows: list[dict[str, Any]], question: str, db_path:
         if row.get("rerank_score", 0.0) < LOCAL_SCORE_THRESHOLD * 0.8:
             continue
         has_lexical_score = float(row.get("keyword_score", 0.0) or 0.0) > 0 or float(row.get("fts_score", 0.0) or 0.0) > 0
-        # Strictly more than half: a chunk that only shares the subject (N972) but not the
+        # Strictly more than half: a chunk that only shares the subject (a model code) but not the
         # asked attribute (售价) must not count as evidence.
         if has_lexical_score and content_coverage(units, str(row.get("text", ""))) > LOCAL_CONTENT_COVERAGE_THRESHOLD:
             return True

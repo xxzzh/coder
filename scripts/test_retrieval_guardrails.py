@@ -78,17 +78,17 @@ def main() -> None:
     # Identifiers, paths and numeric ranges must survive answer polishing.
     polished = polish_internal_answer_text(
         "缓存 `Output/LocalData/`，**EnableReadLocalStatus**，GetWorkOrderData_V20()，"
-        "C:\\ProgramData\\WONOTELIST.txt，SAMPLE_ENUM_VALUE，[4.75,5.26]，接口*2，90%*设计容量 [1]"
+        "C:\\ProgramData\\SAMPLELIST.txt，SAMPLE_ENUM_VALUE，[1.25,3.75]，接口*2，80%*标称值 [1]"
     )
     for fragment in (
         "Output/LocalData/",
         "EnableReadLocalStatus",
         "GetWorkOrderData_V20()",
-        "C:\\ProgramData\\WONOTELIST.txt",
+        "C:\\ProgramData\\SAMPLELIST.txt",
         "SAMPLE_ENUM_VALUE",
-        "[4.75,5.26]",
+        "[1.25,3.75]",
         "接口*2",
-        "90%*设计容量",
+        "80%*标称值",
     ):
         assert fragment in polished, (fragment, polished)
     assert "**" not in polished and "`" not in polished
@@ -112,12 +112,12 @@ def main() -> None:
     assert query_module.cache_key("人工功能测试的IR Camera判定标准", 5, False) != query_module.cache_key("人工功能测试", 5, False)
     # Relevance gate: a paraphrase of a section title passes, a known subject with an unknown attribute does not.
     assert query_module.local_result_is_relevant(
-        [{"rerank_score": 0.48, "keyword_score": 1.0, "fts_score": 0.1, "text": "十一、添加新测试项完整步骤 共需修改 5 处"}],
-        "如何添加一个新测试项",
+        [{"rerank_score": 0.48, "keyword_score": 1.0, "fts_score": 0.1, "text": "十一、添加新设备完整步骤 共需修改 3 处"}],
+        "如何添加一个新设备",
     )
     assert not query_module.local_result_is_relevant(
-        [{"rerank_score": 0.6, "keyword_score": 1.0, "fts_score": 0.3, "text": "N972装备测试计划 测试流程图 SMT单板测试"}],
-        "N972的售价是多少",
+        [{"rerank_score": 0.6, "keyword_score": 1.0, "fts_score": 0.3, "text": "AB123装备测试计划 测试流程图 单板测试"}],
+        "AB123的售价是多少",
     )
     assert query_module.query_cache_variant({}, allow_api=False, use_web=False).startswith("local-only:")
     assert query_module.query_cache_variant({}, allow_api=False, use_web=True).startswith("web-enabled:")
