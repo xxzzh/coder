@@ -84,14 +84,24 @@ from kb.terms import (  # noqa: F401  (re-exported for callers of this module)
     station_test_item_question,
     strip_query_trailing_phrases,
 )
+from kb.config import (  # noqa: F401  (re-exported for callers of this module)
+    DB_PATH,
+    DEFAULT_API_TIMEOUT_SECONDS,
+    ENV_PATH,
+    PROCESSED_DIR,
+    PROJECT_ROOT,
+    RAW_DIR,
+    agent_enabled,
+    agent_max_rounds,
+    api_backend_allowed,
+    api_enabled,
+    api_thinking,
+    load_env_file,
+    runtime_config,
+)
 
 
-DB_PATH = Path("knowledge_base/index/knowledge.db")
 project_runtime.apply_project_runtime_env()
-RAW_DIR = Path("knowledge_base/raw")
-PROCESSED_DIR = Path("knowledge_base/processed")
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-ENV_PATH = PROJECT_ROOT / ".env"
 WEB_TIMEOUT_SECONDS = 5
 WEB_SEARCH_TIMEOUT_SECONDS = 14
 WEB_SEARCH_TOTAL_TIMEOUT_SECONDS = 20
@@ -113,7 +123,6 @@ LOCAL_SCORE_THRESHOLD = 0.16
 HOT_QUERY_THRESHOLD = 2
 CACHE_TTL_SECONDS = 3600
 NEGATIVE_CACHE_TTL_SECONDS = 120
-DEFAULT_API_TIMEOUT_SECONDS = 20
 SECTION_CONTEXT_FORWARD_CHUNKS = 4
 SECTION_CONTEXT_MAX_CHARS = 3200
 # Evidence budgets for local answers built without an LLM.
@@ -342,63 +351,6 @@ def apply_index_status(result: dict[str, Any], refresh_scheduled: bool) -> dict[
     return result
 
 
-def load_env_file(path: Path = ENV_PATH) -> dict[str, str]:
-    values: dict[str, str] = {}
-    if not path.exists():
-        return values
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip('"').strip("'")
-    return values
-
-
-def runtime_config() -> dict[str, str]:
-    config = load_env_file()
-    for key in (
-        "LKA_USE_API",
-        "LKA_API_PROVIDER",
-        "LKA_API_BASE_URL",
-        "LKA_API_KEY",
-        "LKA_API_MODEL",
-        "LKA_API_TIMEOUT_SECONDS",
-        "LKA_EMBEDDING_ENABLED",
-        "LKA_EMBEDDING_PROVIDER",
-        "LKA_EMBEDDING_BASE_URL",
-        "LKA_EMBEDDING_API_KEY",
-        "LKA_EMBEDDING_MODEL",
-        "LKA_EMBEDDING_DIMENSIONS",
-        "LKA_EMBEDDING_BATCH_SIZE",
-        "LKA_VECTOR_BACKEND",
-        "LKA_RERANK_ENABLED",
-        "LKA_LLM_CHUNKING_ENABLED",
-        "LKA_LLM_QUERY_ROUTING_ENABLED",
-        "LKA_AGENT_ENABLED",
-        "LKA_AGENT_MAX_ROUNDS",
-        "LKA_API_THINKING",
-    ):
-        if os.environ.get(key):
-            config[key] = os.environ[key]
-    return config
-
-
-def api_enabled(config: dict[str, str]) -> bool:
-    return (
-        config.get("LKA_USE_API", "false").lower() == "true"
-        and bool(config.get("LKA_API_KEY"))
-        and bool(config.get("LKA_API_MODEL"))
-        and api_backend_allowed(config)
-    )
-
-
-def api_backend_allowed(config: dict[str, str]) -> bool:
-    base_url = config.get("LKA_API_BASE_URL", "").lower()
-    api_key = config.get("LKA_API_KEY", "").lower()
-    return not token_plan_rejected(base_url, api_key)
-
-
 def api_cache_variant(config: dict[str, str], allow_api: bool) -> str:
     if not allow_api:
         return f"{CACHE_VARIANT_VERSION}:no-api"
@@ -413,24 +365,6 @@ def api_cache_variant(config: dict[str, str], allow_api: bool) -> str:
         else ""
     )
     return f"{CACHE_VARIANT_VERSION}:api-refined:{provider}:{base_url}:{model}{agent}"
-
-
-def agent_enabled(config: dict[str, str]) -> bool:
-    """The retrieval agent runs whenever the answer API is usable, unless LKA_AGENT_ENABLED=false."""
-    return api_enabled(config) and model_capabilities.enabled(config, "LKA_AGENT_ENABLED", default=True)
-
-
-def agent_max_rounds(config: dict[str, str]) -> int:
-    try:
-        return max(1, min(3, int(config.get("LKA_AGENT_MAX_ROUNDS", "2") or 2)))
-    except ValueError:
-        return 2
-
-
-def api_thinking(config: dict[str, str]) -> str:
-    # DeepSeek thinks by default, which multiplies latency; the agent's judgement works without it.
-    value = config.get("LKA_API_THINKING", "disabled").strip().lower()
-    return value if value in {"enabled", "disabled"} else "disabled"
 
 
 def query_cache_variant(config: dict[str, str], allow_api: bool, use_web: bool) -> str:
