@@ -30,6 +30,7 @@ from eval_lib import DB_PATH, DEFAULT_SET, ROOT, SCRIPTS_DIR, load_eval_set, use
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import query_knowledge_base as qkb  # noqa: E402
+from kb import config as kb_config  # noqa: E402
 
 RETRIEVAL_KEEP = 10
 
@@ -44,6 +45,7 @@ def isolate_system(allow_api: bool) -> dict[str, str]:
         base_config = {**base_config, "LKA_USE_API": "false", "LKA_RERANK_ENABLED": "false"}
         frozen = dict(base_config)
         qkb.runtime_config = lambda: dict(frozen)
+        kb_config.runtime_config = qkb.runtime_config  # read by search() when called without a config
     return base_config
 
 

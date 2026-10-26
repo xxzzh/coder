@@ -48,6 +48,7 @@ from eval_lib import (
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import query_knowledge_base as qkb  # noqa: E402
+from kb import retrieval as kb_retrieval  # noqa: E402
 
 import collect  # noqa: E402
 import validate_set  # noqa: E402
@@ -62,16 +63,16 @@ def capture_pool(db_path: Path, question: str, config: dict[str, str]) -> list[d
     section/table context expansion to all of them, exactly as it would to the rows it returns.
     Hits are then judged on the same text the evaluation sees.
     """
-    original = qkb.rerank
+    original = kb_retrieval.rerank
 
     def full_rerank(rows, question_text, limit, config_arg=None):  # noqa: ANN001
         return original(rows, question_text, 10**6, config_arg)
 
-    qkb.rerank = full_rerank
+    kb_retrieval.rerank = full_rerank  # search() looks rerank up in kb.retrieval
     try:
         rows, _ = qkb.search(db_path, question, K, config)
     finally:
-        qkb.rerank = original
+        kb_retrieval.rerank = original
     return rows
 
 

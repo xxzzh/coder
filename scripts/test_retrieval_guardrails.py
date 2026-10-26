@@ -429,15 +429,17 @@ AcWing 是一个算法交流平台。
 
     insert_lsh_chunk("physics-1", "doc-physics", "量子纠缠是量子力学中的关联现象，多个粒子的状态之间存在关联。")
     insert_lsh_chunk("cooking-1", "doc-cooking", "番茄炒蛋需要番茄、鸡蛋和少量盐。")
-    original_vector_threshold = query_module.VECTOR_INDEX_THRESHOLD_CHUNKS
-    original_vector_fallback_min = query_module.VECTOR_CANDIDATE_FALLBACK_MIN
+    from kb import retrieval as retrieval_module
+
+    original_vector_threshold = retrieval_module.VECTOR_INDEX_THRESHOLD_CHUNKS
+    original_vector_fallback_min = retrieval_module.VECTOR_CANDIDATE_FALLBACK_MIN
     try:
-        query_module.VECTOR_INDEX_THRESHOLD_CHUNKS = 1
-        query_module.VECTOR_CANDIDATE_FALLBACK_MIN = 1
+        retrieval_module.VECTOR_INDEX_THRESHOLD_CHUNKS = 1
+        retrieval_module.VECTOR_CANDIDATE_FALLBACK_MIN = 1
         semantic_rows = query_module.semantic_candidates(conn, "量子纠缠是什么", 5, {"indexed_at": "test-index"})
     finally:
-        query_module.VECTOR_INDEX_THRESHOLD_CHUNKS = original_vector_threshold
-        query_module.VECTOR_CANDIDATE_FALLBACK_MIN = original_vector_fallback_min
+        retrieval_module.VECTOR_INDEX_THRESHOLD_CHUNKS = original_vector_threshold
+        retrieval_module.VECTOR_CANDIDATE_FALLBACK_MIN = original_vector_fallback_min
         conn.close()
     assert semantic_rows[0]["chunk_id"] == "physics-1"
     assert semantic_rows[0]["semantic_candidate_mode"] == "lsh"
