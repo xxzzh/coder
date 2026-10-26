@@ -75,6 +75,9 @@ SECTION_CONTEXT_MAX_CHARS = 3200
 # Evidence budgets for local answers built without an LLM.
 PRIMARY_CITATION_MAX_CHARS = 1500
 SECONDARY_BLOCK_MAX_CHARS = 300
+# A process question (流程/步骤/机制 ...) is often answered across several sections, e.g. an overview
+# ranked below a section about one variant; supporting sections are then shown whole, not as snippets.
+PROCESS_SECONDARY_BLOCK_MAX_CHARS = 900
 TABLE_ROW_MAX_CHARS = 120
 SECTION_SCAN_MAX_CHUNKS = 40
 # Excel import writes per-group item lists as "<sheet> 概览 | <group>：" chunks.
@@ -84,7 +87,7 @@ OVERVIEW_LIST_BOOST = 1.1
 # with the corrected bm25 normalisation): MRR 0.759 -> 0.813, Hit@1 0.727 -> 0.764, Hit@5 0.836 -> 0.927
 # against the original 0.48 / 0.34 / 0.18.
 RERANK_WEIGHTS = {"semantic": 0.80, "keyword": 0.15, "fts": 0.05}
-CACHE_VARIANT_VERSION = "retrieval-v55:bm25-fix-table-focus-unknown-names"
+CACHE_VARIANT_VERSION = "retrieval-v56:process-sections-offline-translation"
 ITERATIVE_RETRIEVAL_LIMIT = 12
 EMBEDDING_CACHE: dict[str, Any] = {"key": None, "rows": []}
 EMBEDDING_CACHE_LOCK = threading.Lock()
@@ -1545,6 +1548,10 @@ def primary_citation(db_path: Path, row: dict[str, Any], question: str) -> str:
     return block_citation(full_section_text(db_path, row), question, PRIMARY_CITATION_MAX_CHARS)
 
 
+def process_question(question: str) -> bool:
+    return bool(re.search(r"流程|路径|步骤|过程|机制|逻辑|生命周期|workflow|process|steps", question, flags=re.IGNORECASE))
+
+
 def citation_for_retrieval_row(row: dict[str, Any], question: str) -> str:
     text = str(row["text"])
     if row.get("context_expanded") or re.search(
@@ -1552,7 +1559,8 @@ def citation_for_retrieval_row(row: dict[str, Any], question: str) -> str:
         text,
         flags=re.IGNORECASE | re.MULTILINE,
     ):
-        return block_citation(text, question, SECONDARY_BLOCK_MAX_CHARS, outline=False)
+        budget = PROCESS_SECONDARY_BLOCK_MAX_CHARS if process_question(question) else SECONDARY_BLOCK_MAX_CHARS
+        return block_citation(text, question, budget, outline=False)
     return citation_for_text(text, question)
 
 
@@ -4063,8 +4071,14 @@ def chinese_grounded_fallback(result: dict[str, Any]) -> dict[str, Any]:
         if "\n" in lead_text:
             # A whole section or table: one bullet per line so the Web UI renders a list.
             answer = prefix.rstrip("，") + "：\n\n" + "\n".join(f"- {line}" for line in lead_text.splitlines()) + f" [{lead_id}]"
-            if len(translated_citations) > 1:
-                answer += "\n\n补充：" + "；".join(translated_citations[1:]) + "。"
+            # A supporting section longer than a snippet was cited whole (process questions):
+            # it keeps its own list instead of being flattened into the one-line 补充.
+            whole_sections = [(text, source_id) for text, source_id in pieces[1:] if "\n" in text and len(text) > SECONDARY_BLOCK_MAX_CHARS]
+            snippets = [f"{' '.join(text.splitlines())} [{source_id}]" for text, source_id in pieces[1:] if (text, source_id) not in whole_sections]
+            for text, source_id in whole_sections:
+                answer += "\n\n另见：\n\n" + "\n".join(f"- {line}" for line in text.splitlines()) + f" [{source_id}]"
+            if snippets:
+                answer += "\n\n补充：" + "；".join(snippets) + "。"
             result["answer"] = answer
         else:
             result["answer"] = prefix + "；".join(translated_citations) + "。"

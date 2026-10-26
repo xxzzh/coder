@@ -377,6 +377,15 @@ knowledge_base/processed/extraction_report.jsonl
 .\run-agent.bat eval --allow-api --log "这次改了什么"
 ```
 
+Web UI 端到端验证：先启动 Web UI，再运行下面的命令。17 道提问、3 项页面检查和 3 项“同一问题不同问法引用相同证据”的一致性检查，默认通过 Web UI 自己的查询接口执行，不需要安装 Playwright：
+
+```bat
+.venv\Scripts\python.exe scripts\run_webui_question_suite.py
+.venv\Scripts\python.exe scripts\run_webui_question_suite.py --allow-api
+```
+
+`--allow-api` 按配置了大模型 API 时 Web UI 的实际方式提问。想用真实浏览器检查时加 `--transport playwright`（需要 Node.js 和 Playwright 浏览器）。
+
 ## 项目内本地审计
 
 本项目不依赖外部审计目录即可完成日常审计。解压后在项目根目录执行：

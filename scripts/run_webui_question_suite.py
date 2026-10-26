@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Automated WebUI question verification through Playwright CLI.
+"""Automated Web UI question verification against a running Web UI.
 
-This intentionally drives the running WebUI from a real browser session via
-playwright-cli, then checks API answers from the same origin.
+Transports:
+- http (default): asks the questions through the Web UI's own /api/query endpoint and checks the
+  page from its HTML and /api/health, rendered in the same wording as the page. Nothing to install.
+- playwright: drives a real browser through playwright-cli (needs Node.js/npx and a Playwright browser).
+
+Usage:
+    .venv\\Scripts\\python.exe scripts\\run_webui_question_suite.py
+    .venv\\Scripts\\python.exe scripts\\run_webui_question_suite.py --allow-api
+    .venv\\Scripts\\python.exe scripts\\run_webui_question_suite.py --transport playwright
+
+--allow-api asks as the Web UI itself does when an answer API is configured: the retrieval agent
+then answers most questions, so the local table/dictionary mode expectations do not apply to them.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import shutil
@@ -16,6 +27,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -280,34 +293,87 @@ UI_CHECKS: list[dict[str, Any]] = [
 ]
 
 
-def run_suite() -> dict[str, Any]:
-    subprocess.run(
-        [
-            NPX,
-            "--yes",
-            "--package",
-            "@playwright/cli",
-            "playwright-cli",
-            f"-s={SESSION}",
-            "open",
-            WEBUI_URL,
-        ],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        timeout=120,
-        encoding="utf-8",
+def http_get(path: str, timeout: int = 180) -> tuple[int, Any]:
+    with urlopen(WEBUI_URL.rstrip("/") + path, timeout=timeout) as response:
+        body = response.read().decode("utf-8")
+        return response.status, json.loads(body) if path.startswith("/api/") else body
+
+
+def page_texts_http() -> dict[str, str]:
+    """What the page shows, read without a browser: the static HTML with scripts removed, plus the
+    status lines the page renders from /api/health, worded as in the page."""
+    _, html = http_get("/")
+    h1 = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.S)
+    visible = re.sub(r"<(script|style)\b.*?</\1>", " ", html, flags=re.S | re.I)
+    visible = re.sub(r"<[^>]+>", " ", visible)
+    _, health = http_get("/api/health")
+    status_lines = [
+        f"索引时间：{(health.get('index') or {}).get('indexed_at') or '-'}",
+        f"OCR：{'可用（离线/online）' if (health.get('optional_extractors') or {}).get('ocr_ready') else '不可用'}",
+    ]
+    return {"h1": re.sub(r"<[^>]+>", "", h1.group(1)).strip() if h1 else "", "body": visible + "\n" + "\n".join(status_lines)}
+
+
+def page_text_playwright(selector: str, label: str) -> str:
+    data = pw_eval(
+        "async () => JSON.stringify({text:(document.querySelector(%s)?.innerText || '')})" % json.dumps(selector),
+        label=label,
     )
+    return data.get("text", "")
+
+
+def query_http(question: str, allow_api: bool) -> dict[str, Any]:
+    params = urlencode({"question": question, "limit": "5", "use_web": "false", "allow_api": str(allow_api).lower()})
+    started = time.perf_counter()
+    try:
+        status, data = http_get(f"/api/query?{params}")
+    except Exception as exc:  # noqa: BLE001
+        status, data = 0, {"answer": "", "error": str(exc)}
+    return {"ok": status == 200, "status": status, "elapsedMs": round((time.perf_counter() - started) * 1000), "data": data}
+
+
+def query_playwright(question: str, allow_api: bool, label: str) -> dict[str, Any]:
+    question_json = json.dumps(question, ensure_ascii=True)
+    js = (
+        "async () => {"
+        "const started=performance.now();"
+        f"const params=new URLSearchParams({{question:{question_json},limit:'5',use_web:'false',allow_api:'{str(allow_api).lower()}'}});"
+        "const resp=await fetch('/api/query?'+params.toString());"
+        "const data=await resp.json();"
+        "return JSON.stringify({ok:resp.ok,status:resp.status,elapsedMs:Math.round(performance.now()-started),data});"
+        "}"
+    )
+    return pw_eval(js, timeout=180, label=label)
+
+
+def cited_sources(data: dict[str, Any]) -> set[str]:
+    return {
+        str(source.get("chunk_id") or f"{source.get('file')}|{str(source.get('excerpt') or '')[:60]}")
+        for source in data.get("sources") or []
+    }
+
+
+def run_suite(transport: str = "http", allow_api: bool = False) -> dict[str, Any]:
+    if transport == "playwright":
+        subprocess.run(
+            [NPX, "--yes", "--package", "@playwright/cli", "playwright-cli", f"-s={SESSION}", "open", WEBUI_URL],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=120,
+            encoding="utf-8",
+        )
+        page_texts: dict[str, str] = {}
+    else:
+        page_texts = page_texts_http()
 
     rows: list[dict[str, Any]] = []
 
     for check in UI_CHECKS:
-        data = pw_eval(
-            "async () => JSON.stringify({text:(document.querySelector(%s)?.innerText || '')})"
-            % json.dumps(check["selector"]),
-            label=check["id"],
-        )
-        text = data.get("text", "")
+        if transport == "playwright":
+            text = page_text_playwright(check["selector"], check["id"])
+        else:
+            text = page_texts.get(check["selector"], "")
         failures = [f"缺少: {item}" for item in check["must_contain"] if not contains_expected(text, item)]
         rows.append(
             {
@@ -316,30 +382,23 @@ def run_suite() -> dict[str, Any]:
                 "question": check["question"],
                 "status": status_from_failures(failures),
                 "failures": failures,
-                "mode": "dom",
+                "mode": "dom" if transport == "playwright" else "html+health",
                 "answerMode": "",
                 "sourceType": "",
                 "sourceCount": "",
                 "cacheHit": "",
                 "elapsedMs": "",
-                "answerPreview": text.replace("\n", " ")[:220],
-                "fullAnswer": text,
+                "answerPreview": text.replace("\n", " ")[:160],
+                "fullAnswer": "",
                 "group": "",
             }
         )
 
     for case in QUERY_CASES:
-        question_json = json.dumps(case["question"], ensure_ascii=True)
-        js = (
-            "async () => {"
-            "const started=performance.now();"
-            f"const params=new URLSearchParams({{question:{question_json},limit:'5',use_web:'false',allow_api:'false'}});"
-            "const resp=await fetch('/api/query?'+params.toString());"
-            "const data=await resp.json();"
-            "return JSON.stringify({ok:resp.ok,status:resp.status,elapsedMs:Math.round(performance.now()-started),data});"
-            "}"
-        )
-        result = pw_eval(js, timeout=180, label=case["id"])
+        if transport == "playwright":
+            result = query_playwright(case["question"], allow_api, case["id"])
+        else:
+            result = query_http(case["question"], allow_api)
         data = result.get("data", {})
         answer = data.get("answer", "") or ""
         failures: list[str] = []
@@ -352,14 +411,17 @@ def run_suite() -> dict[str, Any]:
         for item in case.get("must_not_contain", []):
             if contains_expected(answer, item):
                 failures.append(f"不应包含: {item}")
-        if case.get("expected_mode") and data.get("retrieval_mode") != case["expected_mode"]:
+        # The table/dictionary mode expectations describe local answers. When an answer API is
+        # configured the retrieval agent may answer instead; the content checks above still apply.
+        agent_answer = data.get("answer_mode") == "api_agent_answer"
+        if case.get("expected_mode") and not agent_answer and data.get("retrieval_mode") != case["expected_mode"]:
             failures.append(f"retrieval_mode={data.get('retrieval_mode')}，期望 {case['expected_mode']}")
-        if case.get("expected_answer_mode") and data.get("answer_mode") != case["expected_answer_mode"]:
+        if case.get("expected_answer_mode") and not agent_answer and data.get("answer_mode") != case["expected_answer_mode"]:
             failures.append(f"answer_mode={data.get('answer_mode')}，期望 {case['expected_answer_mode']}")
         if case.get("expected_source_type") and data.get("source_type") != case["expected_source_type"]:
             failures.append(f"source_type={data.get('source_type')}，期望 {case['expected_source_type']}")
         if not result.get("ok", False):
-            failures.append(f"HTTP {result.get('status')}")
+            failures.append(f"HTTP {result.get('status')} {data.get('error', '')}".strip())
 
         rows.append(
             {
@@ -376,17 +438,25 @@ def run_suite() -> dict[str, Any]:
                 "elapsedMs": result.get("elapsedMs"),
                 "answerPreview": answer.replace("\n", " ")[:260],
                 "fullAnswer": answer,
+                "citedSources": sorted(cited_sources(data)),
                 "group": case.get("group", ""),
             }
         )
 
+    # Different wordings of one question must rest on the same evidence. Their wording may differ
+    # (an LLM never repeats itself word for word), so each answer has to share at least one cited
+    # source with the first answer of its group.
     groups: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         if row.get("group"):
             groups.setdefault(row["group"], []).append(row)
     for group, items in groups.items():
-        base = items[0]["fullAnswer"]
-        mismatches = [f"{item['id']}:{item['question']}" for item in items if item["fullAnswer"] != base]
+        base = set(items[0]["citedSources"])
+        mismatches = [
+            f"{item['id']}:{item['question']} 与 {items[0]['id']} 没有共同引用来源"
+            for item in items[1:]
+            if not base & set(item["citedSources"])
+        ]
         rows.append(
             {
                 "id": "G-" + group,
@@ -394,7 +464,7 @@ def run_suite() -> dict[str, Any]:
                 "question": group,
                 "status": status_from_failures(mismatches),
                 "failures": mismatches,
-                "mode": "answer equality",
+                "mode": "shared evidence",
                 "answerMode": "",
                 "sourceType": "",
                 "sourceCount": "",
@@ -407,6 +477,8 @@ def run_suite() -> dict[str, Any]:
         )
 
     summary = {
+        "transport": transport,
+        "allow_api": allow_api,
         "total": len(rows),
         "pass": sum(1 for row in rows if row["status"] == "PASS"),
         "fail": sum(1 for row in rows if row["status"] == "FAIL"),
@@ -417,7 +489,11 @@ def run_suite() -> dict[str, Any]:
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    print(json.dumps(run_suite(), ensure_ascii=False, indent=2))
+    parser = argparse.ArgumentParser(description="Check the running Web UI with the question suite.")
+    parser.add_argument("--transport", choices=("http", "playwright"), default="http")
+    parser.add_argument("--allow-api", action="store_true", help="Ask as the Web UI does when an answer API is configured.")
+    args = parser.parse_args()
+    print(json.dumps(run_suite(args.transport, args.allow_api), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

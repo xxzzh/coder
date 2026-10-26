@@ -815,8 +815,32 @@ AcWing 是一个算法交流平台。
     check_ocr_pipeline()
     check_xlsx_drawings()
     check_offline_translation_setup()
+    check_process_answers()
     print("retrieval guardrails: ok")
 
+
+def check_process_answers() -> None:
+    """A process question shows supporting sections whole, each as its own list; other questions keep snippets."""
+    assert query_module.process_question("工单数据获取流程") and query_module.process_question("单个测试项要经历哪些步骤")
+    assert not query_module.process_question("客户类型有哪些")
+    overview = "\n".join(["处理总览"] + [f"路径 {name}：读取步骤说明，这一步的输入、输出和异常处理都写在这里" for name in "ABCDEFGHIJ"])
+    row = {"text": overview, "context_expanded": True}
+    assert query_module.citation_for_retrieval_row(row, "数据获取流程").count("路径") == 10  # whole section
+    assert len(query_module.citation_for_retrieval_row(row, "数据获取有哪些路径说明")) <= query_module.PROCESS_SECONDARY_BLOCK_MAX_CHARS
+    assert len(query_module.citation_for_retrieval_row(row, "客户类型有哪些")) <= query_module.SECONDARY_BLOCK_MAX_CHARS + 20
+    result = query_module.chinese_grounded_fallback(
+        {
+            "source_type": "knowledge_base",
+            "sources": [
+                {"source_id": 1, "file": "a.md", "citation": "流程一\n第一步\n第二步"},
+                {"source_id": 2, "file": "b.md", "citation": overview},
+                {"source_id": 3, "file": "c.md", "citation": "一句简短的补充说明"},
+            ],
+        }
+    )
+    answer = result["answer"]
+    assert "另见：\n\n- 处理总览" in answer and "- 路径 J：" in answer, answer  # the whole section keeps its list
+    assert "补充：一句简短的补充说明 [3]。" in answer, answer  # a snippet stays on the 补充 line
 
 def check_offline_translation_setup() -> None:
     """Stanza pipelines started for translation reuse local resources instead of re-downloading them."""
