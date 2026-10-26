@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from api_providers import infer_provider, token_plan_rejected
-from ingest_knowledge_base import extraction_reports, find_winword, is_ignored_raw_file, pending_review_reports
+from ingest_knowledge_base import extraction_reports, find_winword, is_ignored_raw_file, pdf_page_renderer, pending_review_reports
 import model_capabilities
 import project_runtime
 import vector_store
@@ -95,7 +95,7 @@ def db_stats() -> dict[str, object]:
 
 def optional_extractors() -> dict[str, object]:
     modules: dict[str, bool] = {}
-    for module_name in ("pypdf", "PyPDF2", "pdfplumber", "PIL", "pytesseract", "openpyxl", "faiss", "numpy"):
+    for module_name in ("pypdf", "PyPDF2", "pdfplumber", "pypdfium2", "PIL", "pytesseract", "openpyxl", "faiss", "numpy"):
         try:
             __import__(module_name)
             modules[module_name] = True
@@ -122,11 +122,15 @@ def optional_extractors() -> dict[str, object]:
     languages = []
     if tessdata_dir:
         languages = sorted(path.stem for path in tessdata_dir.glob("*.traineddata"))
-    ocr_ready = bool(tesseract and shutil.which("pdftoppm") and {"eng", "chi_sim"}.issubset(set(languages)))
+    # Scanned PDFs need page images: pdftoppm if installed, otherwise pypdfium2 (comes with pdfplumber).
+    # OCR runs locally either way, so the online and offline status are the same.
+    pdf_renderer = pdf_page_renderer()
+    ocr_ready = bool(tesseract and pdf_renderer and {"eng", "chi_sim"}.issubset(set(languages)))
     return {
         "modules": modules,
         "tesseract": tesseract,
         "pdftoppm": shutil.which("pdftoppm"),
+        "pdf_renderer": pdf_renderer,
         "word_doc_converter": find_winword(),
         "tessdata_dir": str(tessdata_dir) if tessdata_dir else None,
         "ocr_languages": languages,

@@ -812,8 +812,48 @@ AcWing 是一个算法交流平台。
     check_query_terms()
     check_unknown_names()
     check_agent_loop()
+    check_ocr_pipeline()
     print("retrieval guardrails: ok")
 
+
+def check_ocr_pipeline() -> None:
+    """Scanned PDFs render without Poppler, and OCR keeps the page-segmentation mode Tesseract is surest of."""
+    import shutil
+
+    original_which = ingest_module.shutil.which
+    ingest_module.shutil.which = lambda name, *args, **kwargs: None if name == "pdftoppm" else original_which(name, *args, **kwargs)
+    try:
+        renderer = ingest_module.pdf_page_renderer()
+        try:
+            import pypdfium2  # noqa: F401
+        except ImportError:
+            assert renderer is None
+        else:
+            assert renderer == "pypdfium2"
+            sample = Path(__file__).resolve().parents[1] / "test_materials" / "ocr" / "scan_english_basic.pdf"
+            if sample.exists():
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    pages = ingest_module.render_pdf_pages_for_ocr(sample, Path(temp_dir))
+                    assert pages and all(page.suffix == ".png" and page.stat().st_size > 0 for page in pages)
+    finally:
+        ingest_module.shutil.which = original_which
+    assert shutil.which is original_which  # the patch did not leak
+    with tempfile.TemporaryDirectory() as temp_dir:
+        tsv = Path(temp_dir) / "page.tsv"
+        header = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext"
+        tsv.write_text(
+            "\n".join(
+                [
+                    header,
+                    "1\t1\t0\t0\t0\t0\t0\t0\t100\t100\t-1\t",  # structural row: no text, no confidence
+                    "5\t1\t1\t1\t1\t1\t0\t0\t10\t10\t90\tabcd",
+                    "5\t1\t1\t1\t1\t2\t0\t0\t10\t10\t60\tab",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        assert abs(ingest_module.tsv_mean_confidence(tsv) - 80.0) < 1e-6  # weighted by characters: (90*4 + 60*2) / 6
+        assert ingest_module.tsv_mean_confidence(Path(temp_dir) / "missing.tsv") == -1.0
 
 def check_agent_loop() -> None:
     """The agent answers from cited evidence, searches again when asked, and never ends a last round searching."""

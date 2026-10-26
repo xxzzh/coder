@@ -2,8 +2,8 @@
   "summary": {
     "materials": 7,
     "total_required_phrases": 59,
-    "total_matched_phrases": 57,
-    "overall_phrase_recall": 0.9661,
+    "total_matched_phrases": 58,
+    "overall_phrase_recall": 0.9831,
     "requires_review": 0,
     "warning_files": 0
   },
@@ -28,26 +28,25 @@
       "file": "scan_chinese_basic.pdf",
       "kind": "image_only_pdf",
       "description": "Clean Chinese scanned PDF.",
-      "text_chars": 167,
+      "text_chars": 161,
       "method": [
         "ocr_tesseract"
       ],
       "warnings": [],
       "requires_review": false,
       "required_phrases": 18,
-      "matched_phrases": 16,
-      "phrase_recall": 0.8889,
+      "matched_phrases": 17,
+      "phrase_recall": 0.9444,
       "missed_phrases": [
-        "隔离性",
         "水分条件"
       ],
-      "sample_text": "[ocr page 1]\n中 文 OCR 评测 材料\n\n水 循环 包括 蒸发 、 凝 结\n\n降水 、 径 流 和 地 下 水 补给\n\n数据 库 ACID 指 原子 性\n\n一 致 性 、 隅 离 性 和 持久 性 。\n\n光合 作用 受到 光照 强度\n\n二 氧化 碳 浓 度 、 温 度 和 水\n\n人 名.\n\nJI AR\n\n件 影 响 。"
+      "sample_text": "[ocr page 1]\n中 文 OCR 评测 材料\n\n水 循环 包括 蒸发 、 凝 结\n\n降水 、 径 流 和 地 下 水 补给\n\n数据 库 ACID 指 原子 性\n\n一 致 性 、 隔 离 性 和 持久 性\n\n光合 作用 受到 光照 强度\n\n二 氧化 碳 浓度 、 温 度 和 水\n\nNE\n\nJI AR\n\n件 影响 。"
     },
     {
       "file": "scan_mixed_table.pdf",
       "kind": "image_table_pdf",
       "description": "Scanned table with English and Chinese cells.",
-      "text_chars": 274,
+      "text_chars": 254,
       "method": [
         "ocr_tesseract"
       ],
@@ -57,7 +56,7 @@
       "matched_phrases": 17,
       "phrase_recall": 1.0,
       "missed_phrases": [],
-      "sample_text": "[ocr page 1]\nScanned Table OCR Evaluation\n\nConcept\n\nKey fact\n\nValue\n\nACID\n\nAtomicity Consistency Isolation Durability\n\n4 properties\n\nOhm\n\nVoltage equals current times resistance\n\nV=IxXR\n\nDNA\n\nA pairs with T and C pairs with G\n\nbase pairing\n\nGAS\n\n水 循环\n\n蒸发 凝结 降水\n\nfib\n\n四 个 过 程"
+      "sample_text": "[ocr page 1]\nScanned Table OCR Evaluation\n\nConcept Key fact Value\n\nACID Atomicity Consistency Isolation Durability 4 properties\nOhm Voltage equals current times resistance V=IxR\nDNA A pairs with T and C pairs with G base pairing\n\n水 循环 蒸发 凝结 降水 径流 四 个 过 程"
     },
     {
       "file": "scan_low_contrast.pdf",
@@ -79,7 +78,7 @@
       "file": "scan_rotated_slightly.pdf",
       "kind": "image_only_pdf",
       "description": "Slightly rotated scanned PDF.",
-      "text_chars": 194,
+      "text_chars": 188,
       "method": [
         "ocr_tesseract"
       ],
@@ -89,13 +88,13 @@
       "matched_phrases": 3,
       "phrase_recall": 1.0,
       "missed_phrases": [],
-      "sample_text": "[ocr page 1]\nRotated Scan OCR Evaluation\n\nNewton's second law states that net force equal\n\ns mass times acceleration.\n\nMomentum equals mass times vel\n\nocity and is conserved in isolated systems."
+      "sample_text": "[ocr page 1]\nRotated Scan OCR Evaluation\nNewton's second law states that net force equals mass times acceleration.\nMomentum equals mass times velocity and is conserved in isolated systems."
     },
     {
       "file": "complex_two_column_layout.pdf",
       "kind": "two_column_image_pdf",
       "description": "Two-column image-based layout.",
-      "text_chars": 377,
+      "text_chars": 372,
       "method": [
         "ocr_tesseract"
       ],
@@ -105,7 +104,7 @@
       "matched_phrases": 8,
       "phrase_recall": 1.0,
       "missed_phrases": [],
-      "sample_text": "[ocr page 1]\nComplex Layout Evaluation\n\nDatabase Notes\n\nAlgorithms organize procedures for solving problems.\n\nA transaction groups operations into a logical unit of work.\n\nBig O notation describes growth in time or space use.\n\nNormalization reduces avoidable duplication.\n\nHash tables map keys to values for fast lookup.\n\nDurability means committed data should survive crashes."
+      "sample_text": "[ocr page 1]\nComplex Layout Evaluation Database Notes\n\nAlgorithms organize procedures for solving problems. A transaction groups operations into a logical unit of work.\nBig O notation describes growth in time or space use. Normalization reduces avoidable duplication.\n\nHash tables map keys to values for fast lookup. Durability means committed data should survive crashes."
     },
     {
       "file": "docx_with_embedded_image.docx",

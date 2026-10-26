@@ -31,6 +31,7 @@ knowledge_base/raw/
 - Python 3.10 或更高版本，安装时勾选 “Add python.exe to PATH”。
 - 磁盘预留约 4 GB：依赖约 1 GB，本地向量模型 `BAAI/bge-m3` 约 2.2 GB，都放在项目目录内。
 - 安装依赖和下载模型时需要联网；之后本地检索可以离线运行（大模型 API 和联网兜底除外）。
+- 资料里有扫描件或图片时，另装 Tesseract OCR，见「扫描件、图片表格和复杂版式」。
 
 ### 第一次安装
 
@@ -321,17 +322,25 @@ knowledge_base/processed/extraction_report.jsonl
 - `requires_review`: 该文件可能存在未完整抽取的内容，需要人工处理或安装 OCR 后重建索引。
 - `method`: 实际使用的抽取方法，例如 `pdfplumber`、`pypdf_or_pypdf2`、`ocr_tesseract`。
 
-扫描 PDF 和图片表格需要 OCR 引擎。推荐安装：
+扫描 PDF、Word/Excel 里的图片和图片表格靠本机 OCR 识别，全程离线运行，开不开联网都能用。需要：
 
-1. Python 可选依赖：
+1. Python 依赖（含把 PDF 页面转成图片的 `pypdfium2`，随 `pdfplumber` 一起安装）：
 
 ```bat
 .\run-agent.bat install-deps
 ```
 
-2. Tesseract OCR，并确保 `tesseract.exe` 在 PATH 中。
+2. Tesseract OCR 引擎。Windows 可从 https://github.com/UB-Mannheim/tesseract/wiki 下载安装包，装在默认位置 `C:\Program Files\Tesseract-OCR` 即可自动找到，装在别处时把 `tesseract.exe` 所在目录加入 PATH。中文和英文识别数据已随仓库放在 `tools/tessdata`，不需要另外下载。
 
-3. `pdftoppm`。如果安装了 TeX Live、Poppler 或 Xpdf，通常会提供该命令。
+3. 可选：Poppler 的 `pdftoppm`。在 PATH 中时优先用它渲染 PDF 页面，没有时自动改用 `pypdfium2`，识别效果不受影响。
+
+`verify` 输出里的 `optional_extractors.ocr_ready` 为 `true`（Web UI 状态栏显示“OCR：可用（离线/online）”）即表示 OCR 可用，`pdf_renderer` 显示实际使用的 PDF 渲染方式。用随仓库附带的测试资料检查识别效果（结果写入 `test_materials/ocr/ocr_eval_results.json`）：
+
+```bat
+.venv\Scripts\python.exe scripts\evaluate_ocr_test_materials.py
+```
+
+每页会依次尝试几种版面分析模式，保留 Tesseract 自评置信度最高的结果。
 
 安装 OCR 后重新构建：
 
@@ -385,6 +394,7 @@ knowledge_base/processed/extraction_report.jsonl
 | 依赖环境 | `.venv/` | `.\run-agent.bat install-deps` |
 | 配置和 API Key | `.env` | `.\run-agent.bat setup`，再 `api-setup` |
 | 向量模型 | `tools/cache/huggingface/` | `.\run-agent.bat embedding-setup` 首次自动下载 |
+| OCR 引擎（有扫描件或图片时） | 系统安装的 Tesseract | 见「扫描件、图片表格和复杂版式」；识别数据已在 `tools/tessdata` |
 | 原始资料 | `knowledge_base/raw/` | 自己放入 |
 | 索引和向量 | `knowledge_base/index/`、`knowledge_base/vector/` | `.\run-agent.bat rebuild-strict` |
 | 评测集 | `eval/eval_set.jsonl` | 按 `eval/README.md` 自己出题，可选 |
