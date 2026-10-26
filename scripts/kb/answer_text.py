@@ -5,6 +5,7 @@ from __future__ import annotations
 from html import unescape
 import re
 from typing import Any
+
 import project_runtime
 
 from kb.citations import SECONDARY_BLOCK_MAX_CHARS, strip_native_reference_markers, synthesis_citations

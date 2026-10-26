@@ -264,6 +264,24 @@ python scripts\query_knowledge_base.py "What is ACID?" --no-api
 
 FAISS 是本地文件型向量索引，不需要 Docker 或外部服务。当前默认使用精确 `IndexFlatIP`，优先召回质量；当 chunk 规模明显增大时，再有意识地切换到 HNSW/IVF 这类近似索引。对于没有 API key 或没有安装 FAISS 的环境，当前 SQLite + 本地 hash embedding 仍是稳定兜底路径。
 
+## 代码结构
+
+问答主流程在 `scripts/query_knowledge_base.py`：答案缓存、索引状态、大模型作答与智能检索 Agent 的衔接、找不到时的引导、`query()` 和命令行入口。各环节的实现按功能放在 `scripts/kb/`：
+
+| 模块 | 内容 |
+|---|---|
+| `kb/text.py` | 文本清洗、繁简转换、句子切分、Markdown 小工具 |
+| `kb/terms.py` | 问题归一化、停用词、检索关键词、问题类型判断 |
+| `kb/config.py` | 路径、`.env` 读取、大模型 API 与 Agent 开关 |
+| `kb/retrieval.py` | 向量/全文/关键词候选、章节扩展、混合重排、`search()` |
+| `kb/relevance.py` | 相关性门槛：证据是否覆盖问题、知识库中没有的名称直接拒答 |
+| `kb/citations.py` | 引用选取（整节、表格聚焦行、句子）与引用校验 |
+| `kb/answer_text.py` | 不调用模型时的答案：润色、离线英译中、本地答案拼装 |
+| `kb/structured.py` | 直接读表格的结构化答案：缩写词典、站位测试项、Excel 字段、FFT 清单 |
+| `kb/web.py` | 联网搜索、公开网页抓取与正文提取、联网来源筛选去重 |
+
+`scripts/agentic_retrieval.py` 是智能检索 Agent 的循环，`scripts/ingest_knowledge_base.py` 负责导入和建索引。`kb/` 中的名称都会从 `query_knowledge_base` 重新导出，原有调用方式不变。写测试替换某个函数时，要替换调用方所在的模块：例如联网搜索的各个来源在 `kb.web` 里被调用，就替换 `kb.web` 中的函数。
+
 ## 项目本地依赖和下载目录
 
 推荐用项目命令安装依赖：

@@ -17,17 +17,13 @@ from kb.text import first_markdown_heading_level, human_text, markdown_table_of_
 # Evidence budgets for local answers built without an LLM.
 PRIMARY_CITATION_MAX_CHARS = 1500
 
-
 SECONDARY_BLOCK_MAX_CHARS = 300
-
 
 # A process question (流程/步骤/机制 ...) is often answered across several sections, e.g. an overview
 # ranked below a section about one variant; supporting sections are then shown whole, not as snippets.
 PROCESS_SECONDARY_BLOCK_MAX_CHARS = 900
 
-
 TABLE_ROW_MAX_CHARS = 120
-
 
 SECTION_SCAN_MAX_CHUNKS = 40
 

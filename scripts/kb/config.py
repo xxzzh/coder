@@ -4,24 +4,20 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+
 from api_providers import token_plan_rejected
 import model_capabilities
 
 
 DB_PATH = Path("knowledge_base/index/knowledge.db")
 
-
 RAW_DIR = Path("knowledge_base/raw")
-
 
 PROCESSED_DIR = Path("knowledge_base/processed")
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]  # scripts/kb/config.py -> project root
 
-
 ENV_PATH = PROJECT_ROOT / ".env"
-
 
 DEFAULT_API_TIMEOUT_SECONDS = 20
 

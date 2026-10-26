@@ -58,7 +58,6 @@ TRAD_TO_SIMP = str.maketrans(
     }
 )
 
-
 TRAD_PHRASES = {"通訊": "通信"}
 
 

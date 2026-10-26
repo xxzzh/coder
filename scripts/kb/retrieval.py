@@ -10,6 +10,7 @@ import sqlite3
 from pathlib import Path
 import threading
 from typing import Any
+
 import model_capabilities
 import vector_store
 
@@ -21,49 +22,35 @@ from kb.text import first_markdown_heading_level, human_text, markdown_table_of_
 
 EMBEDDING_DIMS = 384
 
-
 VECTOR_INDEX_THRESHOLD_CHUNKS = 10_000
-
 
 VECTOR_CANDIDATE_MULTIPLIER = 80
 
-
 VECTOR_CANDIDATE_MIN = 400
-
 
 VECTOR_CANDIDATE_FALLBACK_MIN = 80
 
-
 EMBEDDING_LSH_BUCKETS = 12
-
 
 EMBEDDING_LSH_PAIR_BUCKETS = 4
 
-
 SECTION_CONTEXT_FORWARD_CHUNKS = 4
 
-
 SECTION_CONTEXT_MAX_CHARS = 3200
-
 
 # Excel import writes per-group item lists as "<sheet> 概览 | <group>：" chunks.
 TABLE_OVERVIEW_MARKER = " 概览 | "
 
-
 OVERVIEW_LIST_BOOST = 1.1
-
 
 # Hybrid rerank weights, chosen with eval/tune_weights.py (two-fold validation on the local eval set,
 # with the corrected bm25 normalisation): MRR 0.759 -> 0.813, Hit@1 0.727 -> 0.764, Hit@5 0.836 -> 0.927
 # against the original 0.48 / 0.34 / 0.18.
 RERANK_WEIGHTS = {"semantic": 0.80, "keyword": 0.15, "fts": 0.05}
 
-
 ITERATIVE_RETRIEVAL_LIMIT = 12
 
-
 EMBEDDING_CACHE: dict[str, Any] = {"key": None, "rows": []}
-
 
 EMBEDDING_CACHE_LOCK = threading.Lock()
 

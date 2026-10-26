@@ -1,37 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Query the local SQLite FTS5 + embedding knowledge base, with optional web fallback."""
+"""Query the local SQLite FTS5 + embedding knowledge base, with optional web fallback.
+
+This module is the main flow: answer cache, index status, the answer API and retrieval agent,
+guidance when nothing is found, query() and the command line. The building blocks live in kb/:
+text, terms (question analysis), config, retrieval, relevance (the answer gate), citations,
+answer_text (answers without a model), structured (table answers) and web (web search).
+Their names are re-exported here, so existing callers keep working.
+"""
 
 from __future__ import annotations
 
 import argparse
-import base64
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
 import hashlib
-from html import unescape
-from html.parser import HTMLParser
-from ipaddress import ip_address
 import json
-import math
-import os
-import queue
 import re
-import socket
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
-import threading
-import time
 from typing import Any
-from urllib.error import HTTPError
-from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
-from xml.etree import ElementTree
+from urllib.parse import quote
 
 import agentic_retrieval
-from api_providers import chat_completion, chat_completion_detailed, token_plan_rejected
+from api_providers import chat_completion, chat_completion_detailed
 from ingest_knowledge_base import ingest_in_progress, is_ignored_raw_file, raw_file_stat_fingerprint
 import model_capabilities
 import project_runtime
@@ -39,7 +32,6 @@ from retrievers import abbreviation as abbreviation_retriever
 from retrievers import excel_table as excel_table_retriever
 from retrievers import station_test as station_test_retriever
 from retrievers.base import DomainRetriever
-import vector_store
 from kb.text import (  # noqa: F401  (re-exported for callers of this module)
     TRAD_PHRASES,
     TRAD_TO_SIMP,

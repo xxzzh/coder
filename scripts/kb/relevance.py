@@ -12,16 +12,13 @@ from kb.terms import ENGLISH_QUERY_STOP_WORDS, QUESTION_FUNCTION_PHRASES, abbrev
 
 LOCAL_SCORE_THRESHOLD = 0.16
 
-
 LOCAL_CONTENT_COVERAGE_THRESHOLD = 0.5
-
 
 # A name followed by a version: MES 3.0, USB 4.0, WIFI 6E, .NET 6, MES3.0. A version without a
 # dot (6, 6E) must be separated by a space, so model codes such as AB123 are not split.
 VERSIONED_NAME_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]*?)(?:\s*(\d+\.\d+(?:\.\d+)*[A-Za-z]?)|\s+(\d+[A-Za-z]?))(?![A-Za-z0-9]|\.\d)"
 )
-
 
 KNOWLEDGE_TEXT_CACHE: dict[str, tuple[str, str]] = {}
 

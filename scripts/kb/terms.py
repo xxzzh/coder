@@ -33,12 +33,10 @@ QUERY_TRAILING_PHRASES = (
     "值",
 )
 
-
 QUERY_ALIAS_PHRASES = {
     "FFT测试": ("人工功能测试", "MES：FFT", "IR CameraTest", "IR Camera Test", "IQCapture"),
     "人工功能测试": ("FFT测试", "MES：FFT", "IR CameraTest", "IR Camera Test", "IQCapture"),
 }
-
 
 STOP_WORDS = {
     "什么",
@@ -63,7 +61,6 @@ STOP_WORDS = {
     "与",
     "及",
 }
-
 
 ENGLISH_QUERY_STOP_WORDS = {
     "a",
@@ -92,7 +89,6 @@ ENGLISH_QUERY_STOP_WORDS = {
     "with",
 }
 
-
 CHINESE_QUERY_STOP_PHRASES = (
     "请介绍一下",
     "介绍一下",
@@ -119,7 +115,6 @@ CHINESE_QUERY_STOP_PHRASES = (
     "一下",
 )
 
-
 # Words that only express the kind of question (how / what / difference / steps / translation),
 # never its subject. The local relevance gate ignores them when measuring how much of the
 # question's subject a retrieved chunk covers. Longest phrases are removed first.
@@ -143,7 +138,6 @@ QUESTION_FUNCTION_PHRASES = tuple(
     )
 )
 
-
 # Question words and particles that never help locate evidence. Aspect words such as 流程,
 # 步骤, 区别 stay: they often appear in the section titles that hold the answer.
 RETRIEVAL_STOP_PHRASES = tuple(
@@ -158,9 +152,7 @@ RETRIEVAL_STOP_PHRASES = tuple(
     )
 )
 
-
 CANDIDATE_TERMS_LIMIT = 48
-
 
 FTS_QUERY_MAX_TERMS = CANDIDATE_TERMS_LIMIT
 
