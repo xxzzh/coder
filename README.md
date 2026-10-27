@@ -241,11 +241,43 @@ python scripts\query_knowledge_base.py "What is ACID?" --no-api
 4. 问题里出现知识库从未提到的英文名称或“名称+版本”（如某产品的 3.0 版）时，不调用模型直接拒答。
 5. 模型回复不可用（不是 JSON、引用了不存在的证据、超时、网络错误）时，自动退回本地答案，结果里记录 `agent_error`。
 
+
 `.env` 配置项：
 
 - `LKA_AGENT_ENABLED`：默认 `true`，设为 `false` 时只用模型润色本地答案。
-- `LKA_AGENT_MAX_ROUNDS`：检索轮数上限，默认 `2`，范围 1–3。
-- `LKA_API_THINKING`：DeepSeek 默认开启思考模式，这里默认 `disabled` 以控制延迟；设为 `enabled` 可换取更强推理。
+- `LKA_AGENT_MAX_ROUNDS`：检索轮数上限，默认 `2`，范围 1–3。追加检索全是重复语句、或没查到新证据时直接结束，不再多调用一次。
+- `LKA_API_THINKING`：DeepSeek 默认开启思考模式，这里默认 `disabled` 以控制延迟和输出费用；设为 `enabled` 可换取更强推理。重排、连接测试这类简单任务始终关闭思考。
+- `LKA_AGENT_EVIDENCE_MAX_CHARS` / `LKA_AGENT_EVIDENCE_MAX_ITEMS`：每条证据最多字数（默认 1800）和证据总条数（默认 18）。
+
+### API 费用控制
+
+DeepSeek 按“缓存命中输入 × 极低价 + 未命中输入 × 正常价 + 输出 × 最高价”计费，缓存只认从第一个 token 开始完全一致的前缀；北京时间工作日 9:00–12:00、14:00–18:00 为高峰，价格翻倍。代码按这个规则组织请求（`scripts/llm_budget.py`）：
+
+- 每次请求的顺序固定为：固定的 System Prompt（含示例）→ 之前各轮的对话原样不动 → 本轮的问题和证据。问题、证据这类每次不同的内容只出现在最后一条消息里，JSON 一律排序键名、固定分隔符，同样的输入每次字节完全一致。
+- 智能检索 Agent 的第二轮是在第一轮对话后面追加：第一轮的问题、证据和模型回复原样保留（全部按缓存命中计费），第二轮只发新查到的证据。
+- 每类任务有自己的输出上限：Agent 3000、答案摘要 2000、重排 400、连接测试 16 个 token，可用 `LKA_MAX_TOKENS_AGENT`、`LKA_MAX_TOKENS_SUMMARY`、`LKA_MAX_TOKENS_RERANK` 调整。送去摘要的每段引用最多 `LKA_API_CITATION_MAX_CHARS`（默认 4000）字。
+- 请求发出前先校验参数（key、模型、消息、`max_tokens`），注定失败的请求不会发出；同时发出的完全相同的请求只发一次；同一个问题同时被问两次（重复点击、两个标签页）时，后一个等前一个答完直接读答案缓存。
+- 默认所有调用都用 `LKA_API_MODEL`（Flash）。需要让复杂任务用 Pro 时，设置 `LKA_API_PRO_TASKS=agent`（可选 `agent`、`summary`，逗号分隔）；Pro 模型默认 `deepseek-v4-pro`，可用 `LKA_API_PRO_MODEL` 指定。重排和连接测试不会切到 Pro。
+
+每次调用都会在 `logs/api_usage.jsonl` 追加一条记录：时间、任务、模型、缓存命中/未命中输入、输出 token、命中率、输出/输入比、是否高峰、按价目表估算的费用（美元）。`LKA_API_USAGE_LOG` 可改路径，设为 `off` 关闭。Flash 的价格已内置；其他模型用 `LKA_PRICE_<模型名>=命中价,未命中价,输出价`（美元/百万 token，模型名大写、其他字符换成 `_`）补充，例如 `LKA_PRICE_DEEPSEEK_V4_PRO=...`。
+
+查看费用和命中率（`run-agent.bat` 在任何目录下都能运行，例如在上一级目录用 `.\coder\run-agent.bat cost-report`）：
+
+```bat
+.\run-agent.bat cost-report --since 2026-10-27T12:00
+```
+
+检查请求前缀是否字节一致（离线，不花钱）：
+
+```bat
+.\run-agent.bat cost-test
+```
+
+实测命中率（会真实调用 API 并计费，建议在非高峰时段运行）：清掉这些问题的答案缓存后连问两遍，第二遍的请求与第一遍字节一致，输入应几乎全部命中缓存：
+
+```bat
+.\run-agent.bat cost-measure --passes 2
+```
 
 ## 当前检索技术
 

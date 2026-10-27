@@ -4,11 +4,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+import llm_budget
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -114,7 +119,8 @@ def api_request(
     payload: dict[str, Any] | None = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    # Sorted keys: the same request is always the same bytes.
+    body = llm_budget.stable_json(payload).encode("utf-8") if payload is not None else None
     request = Request(url, data=body, headers=request_headers(provider, api_key), method=method)
     try:
         with urlopen(request, timeout=timeout) as response:
@@ -193,8 +199,74 @@ def chat_completion(
     messages: list[dict[str, str]],
     temperature: float = 0.1,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    **options: Any,
 ) -> str:
-    return chat_completion_detailed(provider, base_url, api_key, model, messages, temperature, timeout)["content"]
+    """The reply text only; options (json_output, max_tokens, thinking, task) as for chat_completion_detailed."""
+    return chat_completion_detailed(provider, base_url, api_key, model, messages, temperature, timeout, **options)["content"]
+
+
+CHAT_ROLES = {"system", "user", "assistant"}
+
+
+def validate_chat_request(
+    api_key: str, model: str, messages: list[dict[str, str]], temperature: float, max_tokens: int | None
+) -> None:
+    """Refuse a request that cannot succeed before it is sent, so it is never billed."""
+    problems = []
+    if not str(api_key).strip():
+        problems.append("API key 为空")
+    if not str(model).strip():
+        problems.append("模型名为空")
+    if not messages:
+        problems.append("messages 为空")
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") not in CHAT_ROLES:
+            problems.append(f"第 {index + 1} 条消息的 role 无效")
+        elif not isinstance(message.get("content"), str) or not message["content"].strip():
+            problems.append(f"第 {index + 1} 条消息内容为空")
+    if not 0 <= float(temperature) <= 2:
+        problems.append("temperature 必须在 0 到 2 之间")
+    if max_tokens is not None and (not isinstance(max_tokens, int) or max_tokens <= 0):
+        problems.append("max_tokens 必须是正整数")
+    if problems:
+        raise ValueError("请求参数无效，未发送：" + "；".join(problems))
+
+
+class _Flight:
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result: dict[str, Any] | None = None
+        self.error: Exception | None = None
+
+
+_IN_FLIGHT: dict[str, _Flight] = {}
+_IN_FLIGHT_LOCK = threading.Lock()
+
+
+def post_once(url: str, provider: str, api_key: str, payload: dict[str, Any], timeout: int) -> tuple[dict[str, Any], bool]:
+    """Send a request, unless the identical request is already on its way: then wait for that call
+    and share its reply (double clicks, two tabs, concurrent retries), so it is billed once.
+    Returns (response, shared)."""
+    key = hashlib.sha256(f"{url}\n{api_key}\n{llm_budget.stable_json(payload)}".encode("utf-8")).hexdigest()
+    with _IN_FLIGHT_LOCK:
+        flight = _IN_FLIGHT.get(key)
+        owner = flight is None
+        if owner:
+            flight = _IN_FLIGHT[key] = _Flight()
+    if not owner:
+        if not flight.done.wait(timeout + 5) or flight.result is None:
+            raise flight.error or RuntimeError("timed out waiting for an identical request")
+        return flight.result, True
+    try:
+        flight.result = api_request("POST", url, provider, api_key, payload=payload, timeout=timeout)
+        return flight.result, False
+    except Exception as exc:
+        flight.error = exc
+        raise
+    finally:
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT.pop(key, None)
+        flight.done.set()
 
 
 def chat_completion_detailed(
@@ -208,8 +280,10 @@ def chat_completion_detailed(
     json_output: bool = False,
     max_tokens: int | None = None,
     thinking: str | None = None,
+    task: str = "chat",
 ) -> dict[str, Any]:
-    """One chat call; returns the reply text and the provider's token usage.
+    """One chat call; returns the reply text, the provider's token usage, and the usage record
+    (cache hit rate, estimated cost) written to the usage log under the given task name.
 
     thinking ("enabled" / "disabled") is sent only to DeepSeek, whose models think by default;
     other providers would reject the unknown parameter.
@@ -218,22 +292,29 @@ def chat_completion_detailed(
     base_url = (base_url or default_base_url(provider)).rstrip("/")
     if token_plan_rejected(base_url, api_key):
         raise RuntimeError("MiMo Token Plan 的 tp- key 仅限编程工具使用，不能作为本应用后端。")
+    validate_chat_request(api_key, model, messages, temperature, max_tokens)
     payload: dict[str, Any] = {"model": model, "temperature": temperature, "messages": messages}
     if json_output:
         payload["response_format"] = {"type": "json_object"}
     if max_tokens:
-        payload["max_tokens"] = max_tokens
+        # OpenAI's current models only accept the newer name for the same limit.
+        payload["max_completion_tokens" if provider == "openai" else "max_tokens"] = max_tokens
     if thinking and provider == "deepseek":
         payload["thinking"] = {"type": thinking}
-    data = api_request("POST", f"{base_url}/chat/completions", provider, api_key, payload=payload, timeout=timeout)
+    started = time.perf_counter()
+    data, shared = post_once(f"{base_url}/chat/completions", provider, api_key, payload, timeout)
     answer = data["choices"][0]["message"]["content"]
     if isinstance(answer, list):
         answer = "".join(str(item.get("text", "")) for item in answer if isinstance(item, dict))
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-    return {"content": str(answer or "").strip(), "usage": usage}
+    if shared:  # billed once, to the request that was actually sent
+        return {"content": str(answer or "").strip(), "usage": {}, "record": None}
+    record = llm_budget.record_call(task, provider, model, usage, round((time.perf_counter() - started) * 1000))
+    return {"content": str(answer or "").strip(), "usage": usage, "record": record}
 
 
 def validate_chat_model(provider: str, base_url: str, api_key: str, model: str, timeout: int = 20) -> dict[str, Any]:
+    budget = llm_budget.task_settings({}, "connection_test")
     try:
         answer = chat_completion(
             provider,
@@ -246,6 +327,9 @@ def validate_chat_model(provider: str, base_url: str, api_key: str, model: str, 
             ],
             temperature=0.0,
             timeout=timeout,
+            max_tokens=budget["max_tokens"],
+            thinking=budget["thinking"],
+            task="connection_test",
         )
         return {"ok": True, "answer": answer}
     except Exception as exc:  # noqa: BLE001

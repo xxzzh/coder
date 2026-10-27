@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from api_providers import token_plan_rejected
+import llm_budget
 import model_capabilities
 
 
@@ -58,6 +59,15 @@ def runtime_config() -> dict[str, str]:
         "LKA_AGENT_ENABLED",
         "LKA_AGENT_MAX_ROUNDS",
         "LKA_API_THINKING",
+        "LKA_API_PRO_TASKS",
+        "LKA_API_PRO_MODEL",
+        "LKA_MAX_TOKENS_AGENT",
+        "LKA_MAX_TOKENS_SUMMARY",
+        "LKA_MAX_TOKENS_RERANK",
+        "LKA_AGENT_EVIDENCE_MAX_CHARS",
+        "LKA_AGENT_EVIDENCE_MAX_ITEMS",
+        "LKA_API_CITATION_MAX_CHARS",
+        "LKA_API_USAGE_LOG",
     ):
         if os.environ.get(key):
             config[key] = os.environ[key]
@@ -92,6 +102,4 @@ def agent_max_rounds(config: dict[str, str]) -> int:
 
 
 def api_thinking(config: dict[str, str]) -> str:
-    # DeepSeek thinks by default, which multiplies latency; the agent's judgement works without it.
-    value = config.get("LKA_API_THINKING", "disabled").strip().lower()
-    return value if value in {"enabled", "disabled"} else "disabled"
+    return llm_budget.configured_thinking(config)

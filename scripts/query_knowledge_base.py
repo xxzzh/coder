@@ -19,6 +19,8 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -26,6 +28,7 @@ from urllib.parse import quote
 import agentic_retrieval
 from api_providers import chat_completion, chat_completion_detailed
 from ingest_knowledge_base import ingest_in_progress, is_ignored_raw_file, raw_file_stat_fingerprint
+import llm_budget
 import model_capabilities
 import project_runtime
 from retrievers import abbreviation as abbreviation_retriever
@@ -328,11 +331,18 @@ def api_cache_variant(config: dict[str, str], allow_api: bool) -> str:
     provider = config.get("LKA_API_PROVIDER", "openai-compatible")
     base_url = config.get("LKA_API_BASE_URL", "")
     model = config.get("LKA_API_MODEL", "")
-    agent = (
-        f":{agentic_retrieval.AGENT_VERSION}:rounds-{agent_max_rounds(config)}:thinking-{api_thinking(config)}"
-        if agent_enabled(config)
-        else ""
-    )
+    summary_model = llm_budget.model_for_task(config, "summary")
+    if summary_model != model:
+        model += f":summary-{summary_model}"
+    agent = ""
+    if agent_enabled(config):
+        agent = f":{agentic_retrieval.AGENT_VERSION}:rounds-{agent_max_rounds(config)}:thinking-{api_thinking(config)}"
+        agent_model = llm_budget.model_for_task(config, "agent")
+        if agent_model != config.get("LKA_API_MODEL", ""):
+            agent += f":model-{agent_model}"
+        limits = (agent_evidence_max_chars(config), agent_evidence_max_items(config))
+        if limits != (AGENT_EVIDENCE_MAX_CHARS, agentic_retrieval.EVIDENCE_MAX_ITEMS):
+            agent += f":evidence-{limits[0]}x{limits[1]}"
     return f"{CACHE_VARIANT_VERSION}:api-refined:{provider}:{base_url}:{model}{agent}"
 
 
@@ -604,6 +614,21 @@ def local_no_match_user_guidance(question: str, db_path: Path | None = None) -> 
     }
 
 
+SUMMARY_SYSTEM_PROMPT = (
+    "You are a grounded knowledge base assistant. Answer only from the supplied citations. "
+    "Always answer in Simplified Chinese, even when the question or citations are in another language. "
+    "Translate relevant facts faithfully into Chinese. Do not invent facts or silently omit important details. "
+    "Remove repeated statements from overlapping citations. Ignore citation content unrelated to the question. "
+    "Integrate local knowledge and web evidence into one direct answer instead of listing search results. "
+    "When citations conflict, state the conflict instead of choosing an unsupported claim. "
+    "If the citations are insufficient, clearly say the available evidence is insufficient. "
+    "Keep the answer concise and cite source ids like [1]."
+)
+# Longest citation sent to the summary model (LKA_API_CITATION_MAX_CHARS); long web pages and
+# whole sections keep their beginning.
+SUMMARY_CITATION_MAX_CHARS = 4000
+
+
 def synthesize_with_api(question: str, result: dict[str, Any], config: dict[str, str]) -> dict[str, Any]:
     if result.get("source_type") not in {"knowledge_base", "web_search", "hybrid_web_knowledge", "faq_fallback"}:
         result["api_used"] = False
@@ -617,30 +642,16 @@ def synthesize_with_api(question: str, result: dict[str, Any], config: dict[str,
         return chinese_grounded_fallback(result)
 
     base_url = config.get("LKA_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = config.get("LKA_API_MODEL", "gpt-5.2")
+    budget = llm_budget.task_settings({"LKA_API_MODEL": "gpt-5.2", **config}, "summary")
+    model = budget["model"]
     timeout = int(config.get("LKA_API_TIMEOUT_SECONDS", str(DEFAULT_API_TIMEOUT_SECONDS)) or DEFAULT_API_TIMEOUT_SECONDS)
-    messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a grounded knowledge base assistant. Answer only from the supplied citations. "
-                    "Always answer in Simplified Chinese, even when the question or citations are in another language. "
-                    "Translate relevant facts faithfully into Chinese. Do not invent facts or silently omit important details. "
-                    "Remove repeated statements from overlapping citations. Ignore citation content unrelated to the question. "
-                    "Integrate local knowledge and web evidence into one direct answer instead of listing search results. "
-                    "When citations conflict, state the conflict instead of choosing an unsupported claim. "
-                    "If the citations are insufficient, clearly say the available evidence is insufficient. "
-                    "Keep the answer concise and cite source ids like [1]."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"question": question, "source_type": result.get("source_type"), "citations": citations},
-                    ensure_ascii=False,
-                ),
-            },
-        ]
+    max_chars = llm_budget.int_setting(config, "LKA_API_CITATION_MAX_CHARS", SUMMARY_CITATION_MAX_CHARS, 200)
+    citations = [{**citation, "quote": llm_budget.clip(str(citation.get("quote", "")), max_chars)} for citation in citations]
+    # Fixed instructions first, then the question and its citations, so the instructions are a cached prefix.
+    messages = llm_budget.build_messages(
+        SUMMARY_SYSTEM_PROMPT,
+        llm_budget.stable_json({"question": question, "source_type": result.get("source_type"), "citations": citations}),
+    )
     try:
         answer = chat_completion(
             config.get("LKA_API_PROVIDER", "openai-compatible"),
@@ -650,6 +661,9 @@ def synthesize_with_api(question: str, result: dict[str, Any], config: dict[str,
             messages,
             temperature=0.1,
             timeout=timeout,
+            max_tokens=budget["max_tokens"],
+            thinking=budget["thinking"],
+            task="summary",
         )
     except Exception as exc:
         result["api_error"] = human_text(str(exc), max_len=240)
@@ -814,17 +828,29 @@ def run_domain_retrievers(
     return None
 
 
+# Evidence fed back to the agent per search hit (LKA_AGENT_EVIDENCE_MAX_CHARS) and in total
+# (LKA_AGENT_EVIDENCE_MAX_ITEMS): every character is billed as input on each round.
 AGENT_EVIDENCE_MAX_CHARS = 1800
 
 
+def agent_evidence_max_chars(config: dict[str, str]) -> int:
+    return llm_budget.int_setting(config, "LKA_AGENT_EVIDENCE_MAX_CHARS", AGENT_EVIDENCE_MAX_CHARS, 200, 20_000)
+
+
+def agent_evidence_max_items(config: dict[str, str]) -> int:
+    return llm_budget.int_setting(config, "LKA_AGENT_EVIDENCE_MAX_ITEMS", agentic_retrieval.EVIDENCE_MAX_ITEMS, 1, 60)
+
+
 def agent_retriever(db_path: Path, config: dict[str, str]) -> agentic_retrieval.Retrieve:
+    max_chars = agent_evidence_max_chars(config)
+
     def retrieve(query_text: str, limit: int) -> list[dict[str, Any]]:
         rows, _ = search(db_path, query_text, limit, config)
         rows = rows[:limit]
         for row in rows:
             # The whole section or table, as a local answer would cite it, so the model sees
             # complete steps and rows rather than a fragment.
-            row["evidence"] = block_citation(full_section_text(db_path, row), query_text, AGENT_EVIDENCE_MAX_CHARS)
+            row["evidence"] = block_citation(full_section_text(db_path, row), query_text, max_chars)
         return rows
 
     return retrieve
@@ -832,25 +858,28 @@ def agent_retriever(db_path: Path, config: dict[str, str]) -> agentic_retrieval.
 
 def agent_completion(config: dict[str, str]) -> agentic_retrieval.Complete:
     timeout = int(config.get("LKA_API_TIMEOUT_SECONDS", str(DEFAULT_API_TIMEOUT_SECONDS)) or DEFAULT_API_TIMEOUT_SECONDS)
+    budget = llm_budget.task_settings(config, "agent")
 
     def complete(messages: list[dict[str, str]]) -> dict[str, Any]:
         return chat_completion_detailed(
             config.get("LKA_API_PROVIDER", "openai-compatible"),
             config.get("LKA_API_BASE_URL", "").rstrip("/"),
             config.get("LKA_API_KEY", ""),
-            config.get("LKA_API_MODEL", ""),
+            budget["model"],
             messages,
             temperature=0.0,
             timeout=timeout,
             json_output=True,
-            max_tokens=agentic_retrieval.ANSWER_MAX_TOKENS,
-            thinking=api_thinking(config),
+            max_tokens=budget["max_tokens"],
+            thinking=budget["thinking"],
+            task="agent",
         )
 
     return complete
 
 
 def agent_trace(outcome: agentic_retrieval.AgentOutcome, config: dict[str, str]) -> dict[str, Any]:
+    metrics = llm_budget.usage_metrics(outcome.usage)
     return {
         "version": agentic_retrieval.AGENT_VERSION,
         "decision": outcome.decision,
@@ -859,6 +888,11 @@ def agent_trace(outcome: agentic_retrieval.AgentOutcome, config: dict[str, str])
         "follow_up_queries": outcome.queries,
         "evidence_count": len(outcome.evidence),
         "usage": outcome.usage,
+        "calls": outcome.calls,
+        "cache_hit_rate": metrics["cache_hit_rate"],
+        "output_input_ratio": metrics["output_input_ratio"],
+        "cost_usd": outcome.cost_usd,
+        "model": llm_budget.model_for_task(config, "agent"),
         "elapsed_ms": outcome.elapsed_ms,
         "thinking": api_thinking(config),
     }
@@ -904,7 +938,7 @@ def agent_answer_result(
         "web_search_used": False,
         "api_used": True,
         "api_provider": config.get("LKA_API_PROVIDER", "openai-compatible"),
-        "api_model": config.get("LKA_API_MODEL", ""),
+        "api_model": llm_budget.model_for_task(config, "agent"),
         "agent": agent_trace(outcome, config),
         "index_updated_at": metadata.get("indexed_at"),
         "embedding_model": metadata.get("embedding_model"),
@@ -917,7 +951,33 @@ def agent_answer_result(
     }
 
 
+_QUERY_FLIGHTS: dict[tuple[Any, ...], list[Any]] = {}
+_QUERY_FLIGHTS_LOCK = threading.Lock()
+
+
+@contextmanager
+def single_flight(key: tuple[Any, ...]):
+    """Requests for the same answer run one at a time: a repeated click or a second tab waits for
+    the first request and then reads its answer from the answer cache instead of paying again."""
+    with _QUERY_FLIGHTS_LOCK:
+        entry = _QUERY_FLIGHTS.setdefault(key, [threading.Lock(), 0])
+        entry[1] += 1
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _QUERY_FLIGHTS_LOCK:
+            entry[1] -= 1
+            if not entry[1]:
+                _QUERY_FLIGHTS.pop(key, None)
+
+
 def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, allow_api: bool = True) -> dict[str, Any]:
+    with single_flight((str(Path(db_path).resolve()), question.strip(), limit, use_web, allow_api)):
+        return query_unshared(db_path, question, limit, use_web, allow_api)
+
+
+def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool = False, allow_api: bool = True) -> dict[str, Any]:
     config = runtime_config()
     cache_variant = query_cache_variant(config, allow_api, use_web)
     if not db_path.exists():
@@ -1015,7 +1075,11 @@ def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, a
     if allow_api and agent_enabled(config) and not unknown_names(question, db_path):
         try:
             outcome = agentic_retrieval.run_agent(
-                question, agent_retriever(db_path, config), agent_completion(config), agent_max_rounds(config)
+                question,
+                agent_retriever(db_path, config),
+                agent_completion(config),
+                agent_max_rounds(config),
+                agent_evidence_max_items(config),
             )
         except (agentic_retrieval.AgentError, RuntimeError, OSError, ValueError, KeyError) as exc:
             # Unusable reply, timeout or network failure: answer locally instead.

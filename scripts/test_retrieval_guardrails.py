@@ -12,6 +12,8 @@ import sqlite3
 import tempfile
 import zipfile
 
+os.environ["LKA_API_USAGE_LOG"] = "off"  # test calls must not land in the real usage log
+
 import ingest_knowledge_base as ingest_module
 from kb_ingest import ocr as ocr_module  # OCR code looks shutil.which up here
 from kb_ingest import pdf as pdf_module  # pdftotext reading looks find_pdftotext and subprocess up here

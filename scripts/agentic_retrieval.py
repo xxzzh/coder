@@ -9,6 +9,11 @@ ask for up to three follow-up searches worded the way the documents are written.
 
 Retrieval and the model are passed in as functions, so this module holds only the loop, the
 prompt and the checks on the model's reply.
+
+The rounds of one question form one conversation that only grows: the fixed system prompt, then
+round 1's question and evidence, the model's reply, then round 2's new evidence. Each round's
+request therefore starts with the previous request byte for byte, and the provider's prefix cache
+bills the earlier evidence at the cache-hit price instead of sending it at full price again.
 """
 
 from __future__ import annotations
@@ -18,6 +23,8 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+import llm_budget
 
 AGENT_VERSION = "agent-v1"
 FIRST_ROUND_RESULTS = 10
@@ -49,6 +56,8 @@ SYSTEM_PROMPT = """你是本地知识库的检索问答助手。用户问题和�
 
 final_round 为 true 时不能选 "search"，只能选 "answer" 或 "refuse"。
 
+选 "search" 之后，下一条消息只给出新检索到的证据，编号接着之前的编号；之前给出的证据仍然有效，回答时可以一起引用。
+
 只输出一个 JSON 对象，例如：
 {"decision": "answer", "answer": "设备启动时先自检，再加载配置。\\n- 先执行硬件自检 HardwareCheck() [#2]\\n- 再读取 config.ini [#3]", "evidence_ids": [2, 3], "queries": [], "reason": "证据 2、3 说明了启动顺序"}"""
 
@@ -68,18 +77,20 @@ class AgentOutcome:
     queries: list[str]
     usage: dict[str, int] = field(default_factory=dict)
     elapsed_ms: int = 0
+    calls: int = 0  # model calls billed, retries included
+    cost_usd: float | None = None  # estimated from the price table; None when the model has no price
 
 
 def evidence_key(text: str) -> str:
     return re.sub(r"\W+", "", text.lower())
 
 
-def add_evidence(evidence: list[dict[str, Any]], rows: list[dict[str, Any]]) -> int:
+def add_evidence(evidence: list[dict[str, Any]], rows: list[dict[str, Any]], max_items: int = EVIDENCE_MAX_ITEMS) -> int:
     """Append rows not already shown (or contained in shown evidence); returns how many were added."""
     added = 0
     keys = [evidence_key(item["text"]) for item in evidence]
     for row in rows:
-        if len(evidence) >= EVIDENCE_MAX_ITEMS:
+        if len(evidence) >= max_items:
             break
         text = str(row.get("evidence") or row.get("text") or "").strip()
         key = evidence_key(text)
@@ -124,24 +135,37 @@ def cited_ids(answer: str) -> list[int]:
     return ids
 
 
-def ask(
-    complete: Complete,
-    question: str,
-    evidence: list[dict[str, Any]],
-    searched: list[str],
-    final_round: bool,
-    usage: dict[str, int],
-) -> dict[str, Any]:
-    payload = {
-        "question": question,
-        "final_round": final_round,
-        "searched_queries": searched,
-        "evidence": [{"id": item["id"], "file": item["file"], "text": item["text"]} for item in evidence],
-    }
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-    ]
+def round_message(question: str, new_evidence: list[dict[str, Any]], searched: list[str], final_round: bool) -> str:
+    """This round's dynamic content: only the evidence not shown in an earlier round."""
+    return llm_budget.stable_json(
+        {
+            "question": question,
+            "final_round": final_round,
+            "searched_queries": searched,
+            "evidence": [{"id": item["id"], "file": item["file"], "text": item["text"]} for item in new_evidence],
+        }
+    )
+
+
+def query_key(text: str) -> str:
+    return re.sub(r"\W+", "", text.casefold())
+
+
+def new_queries(proposed: Any, searched: list[str]) -> list[str]:
+    """Follow-up searches not already run; "BootUp 流程" and "bootup流程" are the same search."""
+    seen = {query_key(item) for item in searched}
+    queries: list[str] = []
+    for item in proposed if isinstance(proposed, list) else []:
+        text = str(item).strip()
+        key = query_key(text)
+        if key and key not in seen:
+            seen.add(key)
+            queries.append(text)
+    return queries[:FOLLOW_UP_QUERIES]
+
+
+def ask(complete: Complete, messages: list[dict[str, str]], usage: dict[str, int], spend: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """One round: the reply text (kept verbatim for the next round's prefix) and its parsed JSON."""
     last_error: Exception | None = None
     for _ in range(REPLY_ATTEMPTS):
         try:
@@ -153,39 +177,63 @@ def ask(
                 raise
             last_error = exc
             continue
+        spend["calls"] += 1
+        record = response.get("record") or {}
+        if isinstance(record.get("cost_usd"), (int, float)):
+            spend["cost_usd"] = (spend["cost_usd"] or 0.0) + record["cost_usd"]
         for key, value in (response.get("usage") or {}).items():
             if isinstance(value, int):
                 usage[key] = usage.get(key, 0) + value
+        content = str(response.get("content", ""))
         try:
-            return parse_reply(str(response.get("content", "")))
+            return content, parse_reply(content)
         except AgentError as exc:
             last_error = exc
     raise AgentError(f"no usable reply after {REPLY_ATTEMPTS} attempts: {last_error}")
 
 
-def run_agent(question: str, retrieve: Retrieve, complete: Complete, max_rounds: int = 2) -> AgentOutcome:
+def run_agent(
+    question: str,
+    retrieve: Retrieve,
+    complete: Complete,
+    max_rounds: int = 2,
+    max_evidence: int = EVIDENCE_MAX_ITEMS,
+) -> AgentOutcome:
     started = time.perf_counter()
     evidence: list[dict[str, Any]] = []
-    add_evidence(evidence, retrieve(question, FIRST_ROUND_RESULTS))
+    add_evidence(evidence, retrieve(question, FIRST_ROUND_RESULTS), max_evidence)
     searched = [question]
     usage: dict[str, int] = {}
+    spend: dict[str, Any] = {"calls": 0, "cost_usd": None}
+    history: list[dict[str, str]] = []
+    shown = 0
     rounds = 0
     reply: dict[str, Any] = {}
     max_rounds = max(1, max_rounds)
     while rounds < max_rounds:
         rounds += 1
         final_round = rounds == max_rounds
-        reply = ask(complete, question, evidence, searched, final_round, usage)
+        messages = llm_budget.build_messages(
+            SYSTEM_PROMPT, round_message(question, evidence[shown:], searched, final_round), history=history
+        )
+        shown = len(evidence)
+        content, reply = ask(complete, messages, usage, spend)
+        # The next round extends this exact conversation, so all of it is a cached prefix.
+        history = [*messages[1:], {"role": "assistant", "content": content}]
         if reply["decision"] != "search":
             break
         if final_round:
             reply = {**reply, "decision": "refuse", "reason": str(reply.get("reason") or "检索后仍没有足够依据")}
             break
-        queries = [str(item).strip() for item in reply.get("queries") or [] if str(item).strip()]
-        queries = [item for item in dict.fromkeys(queries) if item not in searched][:FOLLOW_UP_QUERIES]
-        for query in queries:
-            add_evidence(evidence, retrieve(query, FOLLOW_UP_RESULTS))
+        added = 0
+        for query in new_queries(reply.get("queries"), searched):
+            added += add_evidence(evidence, retrieve(query, FOLLOW_UP_RESULTS), max_evidence)
             searched.append(query)
+        if not added:
+            # Only repeated searches, or nothing new found: another round would judge the same
+            # evidence the model just called insufficient, so stop here instead of paying for it.
+            reply = {**reply, "decision": "refuse", "reason": str(reply.get("reason") or "检索后仍没有足够依据")}
+            break
 
     decision = reply["decision"]
     answer = str(reply.get("answer") or "").strip()
@@ -208,6 +256,8 @@ def run_agent(question: str, retrieve: Retrieve, complete: Complete, max_rounds:
         queries=searched[1:],
         usage=usage,
         elapsed_ms=round((time.perf_counter() - started) * 1000),
+        calls=spend["calls"],
+        cost_usd=round(spend["cost_usd"], 8) if spend["cost_usd"] is not None else None,
     )
 
 

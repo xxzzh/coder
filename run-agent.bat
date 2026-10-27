@@ -14,6 +14,9 @@ set "API_SETUP=%ROOT%scripts\configure_api.py"
 set "EMBEDDING_SETUP=%ROOT%scripts\configure_embedding.py"
 set "INSTALL_DEPS=%ROOT%scripts\install_project_dependencies.py"
 set "EVAL=%ROOT%eval\run_eval.py"
+set "COST=%ROOT%scripts\llm_budget.py"
+set "COST_TEST=%ROOT%scripts\test_llm_budget.py"
+set "COST_MEASURE=%ROOT%scripts\measure_api_cache.py"
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 set "LKA_PROJECT_ROOT=%ROOT%"
@@ -52,6 +55,9 @@ if /I "%~1"=="sources" goto sources
 if /I "%~1"=="rebuild" goto rebuild
 if /I "%~1"=="rebuild-strict" goto rebuild_strict
 if /I "%~1"=="eval" goto eval
+if /I "%~1"=="cost-report" goto cost_report
+if /I "%~1"=="cost-test" goto cost_test
+if /I "%~1"=="cost-measure" goto cost_measure
 goto direct
 
 :usage
@@ -72,6 +78,9 @@ echo   .\run-agent.bat sources
 echo   .\run-agent.bat rebuild
 echo   .\run-agent.bat rebuild-strict
 echo   .\run-agent.bat eval --log "change description"
+echo   .\run-agent.bat cost-report [--since 2026-10-27T12:00]
+echo   .\run-agent.bat cost-test
+echo   .\run-agent.bat cost-measure [--passes 2]   (calls the API and is billed)
 echo.
 echo Direct questions query the local knowledge base first. If local evidence is insufficient, web search is used automatically and source_type is web_search.
 exit /b 1
@@ -124,6 +133,20 @@ exit /b %ERRORLEVEL%
 :eval
 shift
 "%PY%" "%EVAL%" %1 %2 %3 %4 %5 %6 %7 %8 %9
+exit /b %ERRORLEVEL%
+
+:cost_report
+shift
+"%PY%" "%COST%" report %1 %2 %3 %4 %5 %6 %7 %8 %9
+exit /b %ERRORLEVEL%
+
+:cost_test
+"%PY%" "%COST_TEST%"
+exit /b %ERRORLEVEL%
+
+:cost_measure
+shift
+"%PY%" "%COST_MEASURE%" %1 %2 %3 %4 %5 %6 %7 %8 %9
 exit /b %ERRORLEVEL%
 
 :rebuild_strict

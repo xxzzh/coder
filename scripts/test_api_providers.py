@@ -6,7 +6,10 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import threading
+
+os.environ["LKA_API_USAGE_LOG"] = "off"  # test calls must not land in the real usage log
 
 from api_providers import chat_completion, discover_models, infer_provider, token_plan_rejected, validate_chat_model
 import model_capabilities
@@ -154,16 +157,37 @@ def check_chat_payload() -> None:
         return {"choices": [{"message": {"content": " {} "}}], "usage": {"total_tokens": 7}}
 
     api_providers.api_request = fake_request
+    messages = [{"role": "user", "content": "hi"}]
     try:
         reply = api_providers.chat_completion_detailed(
-            "deepseek", "https://api.deepseek.com", "key", "deepseek-flash", [], json_output=True, max_tokens=100, thinking="disabled"
+            "deepseek", "https://api.deepseek.com", "key", "deepseek-flash", messages, json_output=True, max_tokens=100, thinking="disabled"
         )
-        assert reply == {"content": "{}", "usage": {"total_tokens": 7}}
+        assert reply["content"] == "{}" and reply["usage"] == {"total_tokens": 7} and reply["record"]["task"] == "chat"
         assert captured[-1]["thinking"] == {"type": "disabled"}
         assert captured[-1]["response_format"] == {"type": "json_object"} and captured[-1]["max_tokens"] == 100
-        api_providers.chat_completion_detailed("openai-compatible", "http://127.0.0.1:9/v1", "key", "m", [], thinking="disabled")
+        api_providers.chat_completion_detailed("openai-compatible", "http://127.0.0.1:9/v1", "key", "m", messages, thinking="disabled")
         assert "thinking" not in captured[-1] and "response_format" not in captured[-1]
-        assert api_providers.chat_completion("deepseek", "https://api.deepseek.com", "key", "deepseek-flash", []) == "{}"
+        api_providers.chat_completion_detailed("openai", "https://api.openai.com/v1", "key", "gpt-5.2", messages, max_tokens=50)
+        assert captured[-1]["max_completion_tokens"] == 50 and "max_tokens" not in captured[-1]
+        assert api_providers.chat_completion("deepseek", "https://api.deepseek.com", "key", "deepseek-flash", messages) == "{}"
+        # A request that cannot succeed is refused before it is sent (and billed).
+        sent = len(captured)
+        for bad in (
+            {"messages": []},
+            {"messages": [{"role": "user", "content": " "}]},
+            {"messages": [{"role": "tool", "content": "x"}]},
+            {"messages": messages, "max_tokens": 0},
+            {"messages": messages, "model": ""},
+        ):
+            try:
+                api_providers.chat_completion_detailed(
+                    "deepseek", "https://api.deepseek.com", "key", bad.get("model", "deepseek-flash"), bad["messages"], max_tokens=bad.get("max_tokens")
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(bad)
+        assert len(captured) == sent
     finally:
         api_providers.api_request = original
 

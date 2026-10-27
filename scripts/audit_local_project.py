@@ -23,6 +23,8 @@ REQUIRED_FILES = [
     "scripts/manage_knowledge_base.py",
     "scripts/query_knowledge_base.py",
     "scripts/test_retrieval_guardrails.py",
+    "scripts/llm_budget.py",
+    "scripts/test_llm_budget.py",
 ]
 
 
@@ -145,6 +147,11 @@ def main() -> int:
             "details": guardrails,
         }
     )
+
+    # Prompt prefixes stay byte-identical, output budgets and the usage log work (offline).
+    budget = run_step([sys.executable, "scripts/test_llm_budget.py"])
+    budget.pop("stdout", None)
+    checks.append({"id": "llm-cost-control", "ok": budget["exitCode"] == 0, "details": budget})
 
     sources = run_step([sys.executable, "scripts/manage_knowledge_base.py", "sources"])
     sources_payload = parse_json_from_tail(sources)

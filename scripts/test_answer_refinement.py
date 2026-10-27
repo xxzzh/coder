@@ -6,7 +6,10 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import threading
+
+os.environ["LKA_API_USAGE_LOG"] = "off"  # test calls must not land in the real usage log
 
 from query_knowledge_base import chinese_grounded_fallback, grounded_citations, local_translate_to_chinese, synthesize_with_api
 

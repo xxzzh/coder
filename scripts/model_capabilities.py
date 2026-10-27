@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from api_providers import api_request, chat_completion, default_base_url, infer_provider, token_plan_rejected
+import llm_budget
 import project_runtime
 
 
@@ -60,6 +61,11 @@ def runtime_config(env_path: Path = ENV_PATH) -> dict[str, str]:
         "LKA_API_KEY",
         "LKA_API_MODEL",
         "LKA_API_TIMEOUT_SECONDS",
+        "LKA_API_THINKING",
+        "LKA_API_PRO_TASKS",
+        "LKA_API_PRO_MODEL",
+        "LKA_MAX_TOKENS_RERANK",
+        "LKA_API_USAGE_LOG",
     ):
         if os.environ.get(key):
             config[key] = os.environ[key]
@@ -332,6 +338,12 @@ def classify_query(question: str, config: dict[str, str] | None = None) -> dict[
     return {"type": "general_rag", "confidence": 0.5, "rewrites": [text]}
 
 
+RERANK_PROMPT = (
+    "请按与问题的相关性从高到低重排候选证据。问题和候选以 JSON 给出（question、candidates）。"
+    "只返回 JSON 数组，元素为 chunk_id 字符串，不要解释。"
+)
+
+
 def rerank_chunks(question: str, chunks: list[dict[str, Any]], config: dict[str, str] | None = None) -> dict[str, Any]:
     config = config or runtime_config()
     if not enabled(config, "LKA_RERANK_ENABLED") or not chunks:
@@ -352,19 +364,21 @@ def rerank_chunks(question: str, chunks: list[dict[str, Any]], config: dict[str,
                 "text": str(chunk.get("text", ""))[:900],
             }
         )
-    prompt = (
-        "请按与问题的相关性从高到低重排候选证据。只返回 JSON 数组，元素为 chunk_id 字符串。\n"
-        f"问题：{question}\n候选：{json.dumps(candidates, ensure_ascii=False)}"
-    )
+    # Fixed instruction as the system prompt (a cached prefix), the question and candidates last.
+    messages = llm_budget.build_messages(RERANK_PROMPT, llm_budget.stable_json({"question": question, "candidates": candidates}))
+    budget = llm_budget.task_settings(config, "rerank")
     try:
         answer = chat_completion(
             config.get("LKA_API_PROVIDER", "openai-compatible"),
             config.get("LKA_API_BASE_URL", ""),
             config.get("LKA_API_KEY", ""),
-            config.get("LKA_API_MODEL", ""),
-            [{"role": "user", "content": prompt}],
+            budget["model"],
+            messages,
             temperature=0.0,
             timeout=int(config.get("LKA_API_TIMEOUT_SECONDS", "20") or 20),
+            max_tokens=budget["max_tokens"],
+            thinking=budget["thinking"],
+            task="rerank",
         )
         match = re.search(r"\[[\s\S]*\]", answer)
         ordered = json.loads(match.group(0) if match else answer)
