@@ -245,6 +245,13 @@ def citation_for_retrieval_row(row: dict[str, Any], question: str) -> str:
     ):
         budget = PROCESS_SECONDARY_BLOCK_MAX_CHARS if process_question(question) else SECONDARY_BLOCK_MAX_CHARS
         return block_citation(text, question, budget, outline=False)
+    if len(re.findall(r"(?m)^[\s│┃|]*[├└┣┗]\s*[─━]", text)) >= 3:
+        # A directory tree or flow diagram answers as a whole: one line of it is not the answer.
+        return block_citation(text, question, PROCESS_SECONDARY_BLOCK_MAX_CHARS, outline=False)
+    if text.lstrip().startswith("## 工作表") and len(re.findall(r"(?m)^[^\n|]+(?:\s*\|\s*[^|\n]+：[^|\n]*){2,}", text)) >= 2:
+        # A sheet section holds several rows of one group (every sub-item and threshold of a test):
+        # cite the rows, not the single row that happens to share the most words with the question.
+        return block_citation(text, question, PROCESS_SECONDARY_BLOCK_MAX_CHARS, outline=False)
     return citation_for_text(text, question)
 
 

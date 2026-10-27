@@ -47,8 +47,8 @@ CONCEPT_SYNONYMS: dict[str, tuple[str, ...]] = {
     "目录": ("目录", "路径", "文件夹", "directory", "folder"),
     "同时执行": ("同时执行", "并行", "parallel"),
     "同时运行": ("同时运行", "并行", "parallel"),
-    "重新测试": ("重新测试", "重测", "重试", "retry"),
-    "重新测": ("重新测", "重测", "重试", "retry"),
+    "重新测试": ("重新测试", "重测", "重试", "重新执行", "retry"),
+    "重新测": ("重新测", "重测", "重试", "重新执行", "retry"),
     "冷启动": ("冷启动", "coldboot", "cold boot"),
     "热启动": ("热启动", "warmboot", "warm boot"),
     "重启": ("重启", "reboot", "restart"),
@@ -150,6 +150,8 @@ QUESTION_FUNCTION_PHRASES = tuple(
             "需要", "应该", "以及", "或者", "还是",
             # Where something is kept, and causatives / counts that only shape the question.
             "存放在", "保存在", "放在", "让", "两个",
+            # Spans of time and adverbs that only frame the question: 从开始到结束要经历哪些步骤.
+            "从开始到结束", "从头到尾", "要经历", "要经过", "经历", "已经", "还要",
             # Asking for a name: the answer is the parameter or function itself (EnableSampleReboot),
             # whose definition seldom contains the words 参数 / 函数.
             "哪个参数控制", "什么参数控制", "哪个参数", "什么参数", "哪个配置项", "哪个开关",

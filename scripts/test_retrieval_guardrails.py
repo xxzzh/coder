@@ -830,6 +830,7 @@ AcWing 是一个算法交流平台。
     check_local_answer_layout()
     check_gate_synonyms()
     check_gate_asked_part()
+    check_local_evidence_blocks()
     print("retrieval guardrails: ok")
 
 
@@ -913,6 +914,29 @@ def check_gate_asked_part() -> None:
         # 「X支持Y吗」 needs Y in the evidence.
         assert not relevance.local_result_is_relevant([row("样例箱模式：循环执行测试")], "样例箱模式支持双屏测试吗", db_path)
         assert relevance.local_result_is_relevant([row("样例箱模式支持并行测试，组号相同即可")], "样例箱模式支持并行测试吗", db_path)
+
+
+def check_local_evidence_blocks() -> None:
+    """Sheet sections and diagrams are cited whole; rows of one table share their common fields;
+    a sub-heading that lost its ### marker is still a group name, a list of short items is not."""
+    from kb import answer_text, citations
+
+    sheet = "## 工作表 样例门限表 / 站点甲 / 样例测试\n" + "\n".join(
+        f"样例门限表 | Item：站点甲 | 测试项：样例测试 | 测试子项：{name} | 测试门限：{limit} | 单位：℃"
+        for name, limit in (("Sensor_A", "5-80"), ("Sensor_B", "5-60"), ("Sensor_C", "5-50"))
+    )
+    cited = citations.citation_for_retrieval_row({"text": sheet}, "站点甲样例测试门限")
+    assert all(name in cited for name in ("Sensor_A", "Sensor_B", "Sensor_C")), cited
+    _, title, lines = answer_text.evidence_layout(cited)
+    assert "- 共同：Item 站点甲；测试项 样例测试；单位 ℃" in lines and "- Sensor_B：测试门限 5-60" in lines, lines
+    assert answer_text.clean_title(title) == "样例门限表 / 站点甲 / 样例测试", title
+    tree = "6.4 样例目录\nOut/CFG/\n├── AAA/ ← 甲站\n├── BBB/ ← 乙站\n└── CCC/ ← 丙站"
+    cited = citations.citation_for_retrieval_row({"text": tree}, "各目录对应什么站")
+    assert all(station in cited for station in ("甲站", "乙站", "丙站")), cited
+    assert answer_text.is_subheading_line("用途", "支持断点续测：中断后已通过的项无需重新执行。")
+    assert answer_text.is_subheading_line("缓存文件", "文件 | 路径 | 内容")
+    assert not answer_text.is_subheading_line("检查配置文件", "加载配置")  # list items stay items
+    assert not answer_text.is_subheading_line("-1：等待测试", "0：测试失败")
 
 
 def check_local_answer_layout() -> None:

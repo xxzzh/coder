@@ -215,6 +215,19 @@ def is_heading_line(line: str) -> bool:
     return len(text) <= 40 and " | " not in text and (bool(HEADING_PATTERN.match(text)) or text.endswith(("：", ":")))
 
 
+def is_subheading_line(line: str, following: str) -> bool:
+    """A section's sub-heading whose ### marker the citation dropped (用途, 缓存文件, 状态值): a short
+    Chinese label without punctuation that introduces a table, a longer line or another heading.
+    A run of short list items is not mistaken for one: what follows must be longer or a table."""
+    text = line.strip()
+    if not (2 <= len(text) <= 12) or len(re.findall(r"[\u4e00-\u9fff]", text)) < max(2, len(text) * 0.6):
+        return False
+    if re.search(r"[，。；：:、！？,.;!?（）()\[\]|=→<>]", text) or is_code_line(text):
+        return False
+    following = following.strip()
+    return " | " in following or len(following) >= 2 * len(text) + 4 or is_heading_line(following)
+
+
 def table_cells(line: str) -> list[str]:
     return [cell.strip() for cell in re.split(r"\s*\|\s*", line.strip().strip("|"))]
 
@@ -250,6 +263,25 @@ def table_row_bullet(header: list[str], row: list[str]) -> str:
     if first and details:
         return f"- {first} — {'；'.join(details)}"
     return f"- {first or '；'.join(details)}"
+
+
+def record_group_lines(records: list[tuple[str, list[tuple[str, str]]]]) -> list[str]:
+    """Several rows of one table: the fields every row shares once, then one line per row with
+    only what differs, labelled by its first differing value (Sensor_A：门限 5-80)."""
+    field_maps = [dict(fields) for _, fields in records]
+    names = list(dict.fromkeys(name for fields in field_maps for name in fields))
+    shared = [name for name in names if all(name in fields for fields in field_maps) and len({fields[name] for fields in field_maps}) == 1]
+    lines: list[str] = []
+    if shared:
+        lines.append("- 共同：" + "；".join(f"{name} {field_maps[0][name]}" if name else field_maps[0][name] for name in shared))
+    for fields in field_maps:
+        varying = [(name, value) for name, value in fields.items() if name not in shared]
+        if not varying:
+            continue
+        label = varying[0][1]
+        rest = "；".join(f"{name} {value}" if name else value for name, value in varying[1:])
+        lines.append(f"- {label}：{rest}" if rest else f"- {label}")
+    return lines
 
 
 def evidence_layout(text: str) -> tuple[str, str, list[str]]:
@@ -298,10 +330,20 @@ def evidence_layout(text: str) -> tuple[str, str, list[str]]:
         record = evidence_record(line)
         if record:
             record_title, fields = record
-            if record_title:
+            group = [record]
+            end = index + 1
+            while end < len(lines) and (following := evidence_record(lines[end])) and following[0] == record_title:
+                group.append(following)
+                end += 1
+            # The section title (工作表 样例表 / 站点 / …) already names the table of its rows.
+            if record_title and not re.sub(r"^(?:##\s*)?工作表\s*", "", title).startswith(record_title):
                 out += ["", record_title]
+            if len(group) >= 2:
+                out += record_group_lines(group)
+                index = end
+                continue
             out += record_lines(fields)
-        elif is_heading_line(line) and index + 1 < len(lines):
+        elif index + 1 < len(lines) and (is_heading_line(line) or is_subheading_line(line, lines[index + 1])):
             out += ["", line.rstrip("：:")]
         else:
             out.append(f"- {line}")
@@ -337,6 +379,7 @@ def has_text_line(lines: list[str]) -> bool:
 def clean_title(title: str) -> str:
     # "工作表 参数表 / 站点 / 项目。 参数表" names a sheet by its path: keep the sheet.
     title = title.rsplit("。", 1)[-1].strip() or title
+    title = re.sub(r"^(?:##\s*)?工作表\s+", "", title).strip() or title
     return re.sub(r"^(?:第?[一二三四五六七八九十百]+[、.．]|\d+(?:\.\d+)*[、.．]?|#{1,6})\s*", "", title).strip() or title
 
 
@@ -381,7 +424,10 @@ def chinese_grounded_fallback(result: dict[str, Any]) -> dict[str, Any]:
     summary_source_ids = set(result.get("summary_source_ids") or [])
     if summary_source_ids:
         citations = [citation for citation in citations if citation.get("source_id") in summary_source_ids]
-    citation_limit = 2 if source_type == "web_search" else 3
+    # Up to five pieces of local evidence: without a model the answer cannot tell which of several
+    # relevant chunks holds the asked detail, so it shows them (each in its own group) rather
+    # than dropping the fourth or fifth.
+    citation_limit = 2 if source_type == "web_search" else 5
     pieces: list[tuple[str, Any]] = []
     for citation in citations[:citation_limit]:
         translated = local_translate_to_chinese(str(citation.get("quote", "")))
