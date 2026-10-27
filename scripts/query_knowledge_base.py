@@ -622,7 +622,12 @@ SUMMARY_SYSTEM_PROMPT = (
     "Integrate local knowledge and web evidence into one direct answer instead of listing search results. "
     "When citations conflict, state the conflict instead of choosing an unsupported claim. "
     "If the citations are insufficient, clearly say the available evidence is insufficient. "
-    "Keep the answer concise and cite source ids like [1]."
+    "Write a polished answer that is concise and easy to read, not copied fragments: open with one or two sentences "
+    "that answer the question directly; when it covers several stages or categories, give each group a short line "
+    "ending with '：' followed by '- ' bullets, with a blank line between groups; one point per bullet, in fluent "
+    "sentences; merge overlapping points. Concise means tight wording, not fewer facts: keep every listed item, every "
+    "step, and identifiers, numbers and units exactly as written. No Markdown tables, # headings or bold. "
+    "Cite source ids like [1] at the end of each point."
 )
 # Longest citation sent to the summary model (LKA_API_CITATION_MAX_CHARS); long web pages and
 # whole sections keep their beginning.

@@ -149,11 +149,14 @@ QUERY_CASES: list[dict[str, Any]] = [
         "area": "人工功能/FFT",
         "question": "FFT测试",
         "expected_answer_mode": "local_structured_table_summary",
+        # Every item and sub-item name, in any layout (a polished API answer rewrites the table rows).
         "must_contain": [
-            "IR CameraTest / IR Camera Test",
-            "Sensor Test / Lid Hall Sensor Test",
-            "手写笔功能测试 / 充电功能测试",
-            "FFT 过站 / FFT扫描过站",
+            "IR Camera Test",
+            "Sensor Test",
+            "Lid Hall Sensor Test",
+            "手写笔功能测试",
+            "充电功能测试",
+            "FFT扫描过站",  # the sub-item; a grouped answer may title its group just "过站"
         ],
         "group": "fft_manual",
     },
@@ -162,7 +165,7 @@ QUERY_CASES: list[dict[str, Any]] = [
         "area": "人工功能/FFT",
         "question": "FFT测试项",
         "expected_answer_mode": "local_structured_table_summary",
-        "must_contain": ["IR CameraTest / IR Camera Test", "WIFI吞吐量测试 / T-put测试"],
+        "must_contain": ["IR Camera Test", "WIFI吞吐量测试", "T-put测试"],
         "group": "fft_manual",
     },
     {
@@ -170,7 +173,7 @@ QUERY_CASES: list[dict[str, Any]] = [
         "area": "人工功能/FFT",
         "question": "人工功能测试",
         "expected_answer_mode": "local_structured_table_summary",
-        "must_contain": ["IR CameraTest / IR Camera Test", "异音测试 / 开合转轴异响"],
+        "must_contain": ["IR Camera Test", "异音测试", "开合转轴异响"],
         "group": "fft_manual",
     },
     {

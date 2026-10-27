@@ -475,6 +475,9 @@ def page_html() -> str:
       padding: 0;
       list-style: none;
     }
+    .answer-list.answer-list-wide {
+      grid-template-columns: 1fr;
+    }
     .answer-list li {
       position: relative;
       padding-left: 15px;
@@ -1035,8 +1038,16 @@ def page_html() -> str:
           if (paragraph.length) addAnswerParagraph(container, paragraph.join(' '));
           paragraph = [];
         };
-        lines.forEach((line) => {
-          if (/^[-*•]\\s+/.test(line)) {
+        lines.forEach((line, index) => {
+          // A short line ending in "：" right before bullets names the group below it; the
+          // answer's opening sentence stays a plain paragraph even when it ends with "：".
+          const opening = !container.childElementCount && !paragraph.length;
+          const groupName = !opening && /[：:]$/.test(line) && line.length <= 40 && /^[-*•]\\s+/.test(lines[index + 1] || '');
+          if (groupName) {
+            flush();
+            list = null;
+            addAnswerParagraph(container, line, 'answer-heading');
+          } else if (/^[-*•]\\s+/.test(line)) {
             flush();
             if (!list) {
               list = document.createElement('ul');
@@ -1052,6 +1063,10 @@ def page_html() -> str:
           }
         });
         flush();
+      });
+      // Two columns suit short items such as test-item names; long points read better in one.
+      container.querySelectorAll('.answer-list').forEach((list) => {
+        if ([...list.children].some((item) => item.textContent.length > 36)) list.classList.add('answer-list-wide');
       });
     }
     async function loadSources() {
