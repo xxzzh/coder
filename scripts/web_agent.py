@@ -478,6 +478,16 @@ def page_html() -> str:
     .answer-list.answer-list-wide {
       grid-template-columns: 1fr;
     }
+    .answer-code {
+      margin: 8px 0 0;
+      padding: 10px 12px;
+      background: var(--code);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font: 12.5px/1.5 Consolas, "Courier New", monospace;
+      white-space: pre;
+      overflow-x: auto;
+    }
     .answer-list li {
       position: relative;
       padding-left: 15px;
@@ -1038,11 +1048,38 @@ def page_html() -> str:
           if (paragraph.length) addAnswerParagraph(container, paragraph.join(' '));
           paragraph = [];
         };
+        let code = null;
+        const addCode = () => {
+          const block = document.createElement('pre');
+          block.className = 'answer-code';
+          block.textContent = code.join('\\n');
+          container.appendChild(block);
+          code = null;
+        };
         lines.forEach((line, index) => {
-          // A short line ending in "：" right before bullets names the group below it; the
-          // answer's opening sentence stays a plain paragraph even when it ends with "：".
+          // Fenced code (local answers keep code from the documents as-is) shows as a code block.
+          if (line.startsWith('```')) {
+            if (code === null) {
+              flush();
+              list = null;
+              code = [];
+            } else {
+              addCode();
+            }
+            return;
+          }
+          if (code !== null) {
+            code.push(line);
+            return;
+          }
+          // A short line right before bullets or code names the group below it: one ending in "：",
+          // or a title or step name without sentence punctuation. The answer's opening sentence
+          // stays a plain paragraph even when it ends with "：".
           const opening = !container.childElementCount && !paragraph.length;
-          const groupName = !opening && /[：:]$/.test(line) && line.length <= 40 && /^[-*•]\\s+/.test(lines[index + 1] || '');
+          const next = lines[index + 1] || '';
+          const startsGroup = /^[-*•]\\s+/.test(next) || next.startsWith('```');
+          const bare = line.replace(/\\s*\\[\\d+\\]$/, '');
+          const groupName = !opening && startsGroup && !/^[-*•]\\s+/.test(line) && line.length <= 40 && (/[：:]$/.test(bare) || !/[。！？；，,.!?;]$/.test(bare));
           if (groupName) {
             flush();
             list = null;
@@ -1062,6 +1099,7 @@ def page_html() -> str:
             paragraph.push(line);
           }
         });
+        if (code !== null) addCode();
         flush();
       });
       // Two columns suit short items such as test-item names; long points read better in one.

@@ -156,8 +156,9 @@ QUERY_CASES: list[dict[str, Any]] = [
             "Lid Hall Sensor Test",
             "手写笔功能测试",
             "充电功能测试",
-            "FFT扫描过站",  # the sub-item; a grouped answer may title its group just "过站"
         ],
+        # The station sign-off entry: an API answer names it by its item or its sub-item.
+        "must_contain_any": ["FFT 过站", "FFT扫描过站"],
         "group": "fft_manual",
     },
     {

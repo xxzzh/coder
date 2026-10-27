@@ -827,6 +827,7 @@ AcWing 是一个算法交流平台。
     check_xlsx_drawings()
     check_offline_translation_setup()
     check_process_answers()
+    check_local_answer_layout()
     print("retrieval guardrails: ok")
 
 
@@ -850,8 +851,37 @@ def check_process_answers() -> None:
         }
     )
     answer = result["answer"]
-    assert "另见：\n\n- 处理总览" in answer and "- 路径 J：" in answer, answer  # the whole section keeps its list
-    assert "补充：一句简短的补充说明 [3]。" in answer, answer  # a snippet stays on the 补充 line
+    # The opening names what was found; each section is a group named by its title, keeping its list.
+    assert answer.startswith("以下是本地知识库中「流程一」的内容："), answer
+    assert "\n- 第一步\n- 第二步 [1]" in answer, answer
+    assert "处理总览：\n- 路径 A：" in answer and "- 路径 J：" in answer, answer
+    assert "补充：\n- 一句简短的补充说明 [3]" in answer, answer  # a short snippet goes under 补充
+
+
+def check_local_answer_layout() -> None:
+    """Local answers turn the evidence's structure into readable lines: table rows, Excel records
+    with their row number and empty fields dropped, numbered steps, and code kept as a code block."""
+    from kb import answer_text
+
+    table = "LevelType 枚举\n值 | 颜色 | 用途\nLOW | 绿色 | 普通提示\nNONE | — | 不显示"
+    kind, title, lines = answer_text.evidence_layout(table)
+    assert (kind, title) == ("section", "LevelType 枚举"), (kind, title)
+    assert lines == ["- LOW — 颜色：绿色；用途：普通提示", "- NONE — 用途：不显示"], lines
+    record = "样例清单 | #：7 | 类别：电源 | 内容：电压范围 | 状态：— | 负责人：甲组 | 负责人：乙组 | 方案：1.接通电源 2.读取电压 3.比较范围"
+    kind, title, lines = answer_text.evidence_layout(record)
+    assert (kind, title) == ("record", "样例清单"), (kind, title)
+    assert lines == ["- 类别：电源", "- 内容：电压范围", "- 负责人：甲组，乙组", "", "方案", "- 1.接通电源", "- 2.读取电压", "- 3.比较范围"], lines
+    assert answer_text.numbered_steps("电压 2.5V，版本 1.0") == []  # numbers are not steps
+    code = "步骤 1：新建示例类\nusing Demo.Core;\npublic class Sample : SampleBase\nget { return value; }\n<Target>Release</Target>"
+    kind, title, lines = answer_text.evidence_layout("新增示例\n" + code)
+    assert lines[:2] == ["", "步骤 1：新建示例类"] and lines[2] == "```" and lines[-1] == "```", lines
+    assert "public class Sample : SampleBase" in lines and "<Target>Release</Target>" in lines, lines
+    # Polishing leaves code untouched: pipes, semicolons and commas are not punctuation there.
+    polished = answer_text.polish_internal_answer_text("说明：\n```\nint a = b | c;\nf(x, y);\n```\n- 下一步，继续 [1]")
+    assert "int a = b | c;\nf(x, y);" in polished and "- 下一步，继续 [1]" in polished, polished
+    answer = answer_text.local_structured_answer([(record, 1), ("接通电源后读取电压。", 2)], "knowledge_base")
+    assert answer.startswith("在本地知识库的「样例清单」中找到这条记录："), answer
+    assert "#" not in answer and "补充：\n- 接通电源后读取电压。 [2]" in answer, answer
 
 def check_offline_translation_setup() -> None:
     """Stanza pipelines started for translation reuse local resources instead of re-downloading them."""
