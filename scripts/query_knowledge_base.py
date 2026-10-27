@@ -261,6 +261,9 @@ HOT_QUERY_THRESHOLD = 2
 CACHE_TTL_SECONDS = 3600
 NEGATIVE_CACHE_TTL_SECONDS = 120
 CACHE_VARIANT_VERSION = "retrieval-v56:process-sections-offline-translation"
+# Answers built without a model (layout, gate, cited evidence). Raising it refreshes cached local
+# answers only; cached API answers stay valid and are not paid for again.
+LOCAL_ANSWER_VERSION = "local-v2"
 
 
 def source_fingerprint(raw_dir: Path = RAW_DIR) -> str:
@@ -325,9 +328,9 @@ def apply_index_status(result: dict[str, Any], refresh_scheduled: bool) -> dict[
 
 def api_cache_variant(config: dict[str, str], allow_api: bool) -> str:
     if not allow_api:
-        return f"{CACHE_VARIANT_VERSION}:no-api"
+        return f"{CACHE_VARIANT_VERSION}:no-api:{LOCAL_ANSWER_VERSION}"
     if not api_enabled(config):
-        return f"{CACHE_VARIANT_VERSION}:api-disabled"
+        return f"{CACHE_VARIANT_VERSION}:api-disabled:{LOCAL_ANSWER_VERSION}"
     provider = config.get("LKA_API_PROVIDER", "openai-compatible")
     base_url = config.get("LKA_API_BASE_URL", "")
     model = config.get("LKA_API_MODEL", "")
