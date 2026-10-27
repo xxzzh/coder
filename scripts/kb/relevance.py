@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from kb.terms import ENGLISH_QUERY_STOP_WORDS, QUESTION_FUNCTION_PHRASES, abbreviation_query_term, iterative_retrieval_question, normalized_retrieval_question
+from kb.terms import CONCEPT_SYNONYMS, ENGLISH_QUERY_STOP_WORDS, QUESTION_FUNCTION_PHRASES, abbreviation_query_term, iterative_retrieval_question, normalized_retrieval_question
 
 
 LOCAL_SCORE_THRESHOLD = 0.16
@@ -46,6 +46,11 @@ def query_content_units(question: str) -> list[tuple[str, str, float]]:
     chinese_text = normalized
     for phrase in QUESTION_FUNCTION_PHRASES:
         chinese_text = chinese_text.replace(phrase, " ")
+    # A phrase with known synonyms is one unit, covered by any of its variants (目录 by 路径).
+    for phrase in sorted(CONCEPT_SYNONYMS, key=len, reverse=True):
+        if phrase in chinese_text:
+            chinese_text = chinese_text.replace(phrase, " ")
+            units.append(("concept", "|".join(CONCEPT_SYNONYMS[phrase]), 1.0))
     for span in re.findall(r"[\u4e00-\u9fff]{2,}", chinese_text):
         bigrams = [gram for gram in dict.fromkeys(span[index : index + 2] for index in range(len(span) - 1)) if gram not in seen]
         if not bigrams:
@@ -67,9 +72,20 @@ def content_coverage(units: list[tuple[str, str, float]], text: str) -> float:
         if kind == "ascii":
             if ascii_term_pattern(term).search(lowered):
                 matched += weight
+        elif kind == "concept":
+            if any(concept_variant_found(variant, lowered, compact) for variant in term.split("|")):
+                matched += weight
         elif term in compact:
             matched += weight
     return matched / total
+
+
+def concept_variant_found(variant: str, lowered: str, compact: str) -> bool:
+    if re.search(r"[\u4e00-\u9fff]", variant):
+        return variant in compact
+    if len(variant) >= 4:  # a long identifier may sit inside another: SampleColdBootFlag
+        return variant.lower() in lowered or variant.lower().replace(" ", "") in compact.lower()
+    return bool(re.search(rf"(?<![a-z0-9]){re.escape(variant.lower())}(?![a-z0-9])", lowered))  # short: a whole word only
 
 
 def ascii_term_pattern(term: str) -> re.Pattern[str]:
@@ -131,6 +147,19 @@ def unknown_names(question: str, db_path: Path) -> list[str]:
     return unknown
 
 
+def row_covers_question(row: dict[str, Any], units: list[tuple[str, str, float]]) -> bool:
+    if row.get("rerank_score", 0.0) < LOCAL_SCORE_THRESHOLD * 0.8:
+        return False
+    has_lexical_score = float(row.get("keyword_score", 0.0) or 0.0) > 0 or float(row.get("fts_score", 0.0) or 0.0) > 0
+    # Strictly more than half: a chunk that only shares the subject (a model code) but not the
+    # asked attribute (售价) must not count as evidence.
+    return has_lexical_score and content_coverage(units, str(row.get("text", ""))) > LOCAL_CONTENT_COVERAGE_THRESHOLD
+
+
+def gate_candidate_count(rows: list[dict[str, Any]], question: str) -> int:
+    return min(len(rows), 8 if iterative_retrieval_question(question) else 3)
+
+
 def local_result_is_relevant(rows: list[dict[str, Any]], question: str, db_path: Path | None = None) -> bool:
     if not rows or rows[0].get("rerank_score", 0.0) < LOCAL_SCORE_THRESHOLD:
         return False
@@ -139,13 +168,5 @@ def local_result_is_relevant(rows: list[dict[str, Any]], question: str, db_path:
         return False
     if db_path is not None and unknown_names(question, db_path):
         return False
-    candidate_count = min(len(rows), 8 if iterative_retrieval_question(question) else 3)
-    for row in rows[:candidate_count]:
-        if row.get("rerank_score", 0.0) < LOCAL_SCORE_THRESHOLD * 0.8:
-            continue
-        has_lexical_score = float(row.get("keyword_score", 0.0) or 0.0) > 0 or float(row.get("fts_score", 0.0) or 0.0) > 0
-        # Strictly more than half: a chunk that only shares the subject (a model code) but not the
-        # asked attribute (售价) must not count as evidence.
-        if has_lexical_score and content_coverage(units, str(row.get("text", ""))) > LOCAL_CONTENT_COVERAGE_THRESHOLD:
-            return True
-    return False
+    return any(row_covers_question(row, units) for row in rows[: gate_candidate_count(rows, question)])
+

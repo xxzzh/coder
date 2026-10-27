@@ -38,6 +38,23 @@ QUERY_ALIAS_PHRASES = {
     "人工功能测试": ("FFT测试", "MES：FFT", "IR CameraTest", "IR Camera Test", "IQCapture"),
 }
 
+# Everyday wording in a question -> the same idea as the documents write it. The local relevance
+# gate counts such a phrase as one subject unit that a chunk covers when it contains any of the
+# variants, so 「缓存文件放在哪个目录」 is covered by a chunk that lists the cache file's 路径.
+# Only add true synonyms: the gate refuses when the asked attribute is missing from the evidence,
+# and a loose pair would let a question about something the documents never mention through.
+CONCEPT_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "目录": ("目录", "路径", "文件夹", "directory", "folder"),
+    "同时执行": ("同时执行", "并行", "parallel"),
+    "同时运行": ("同时运行", "并行", "parallel"),
+    "重新测试": ("重新测试", "重测", "重试", "retry"),
+    "重新测": ("重新测", "重测", "重试", "retry"),
+    "冷启动": ("冷启动", "coldboot", "cold boot"),
+    "热启动": ("热启动", "warmboot", "warm boot"),
+    "重启": ("重启", "reboot", "restart"),
+    "电脑": ("电脑", "笔电", "整机", "dut"),
+}
+
 STOP_WORDS = {
     "什么",
     "哪些",
@@ -131,6 +148,12 @@ QUESTION_FUNCTION_PHRASES = tuple(
             "原因", "用途", "意思", "含义", "定义", "方法", "办法", "方式", "步骤", "流程", "过程",
             "机制", "原理", "逻辑", "规则", "英文", "中文", "英语", "全称", "缩写", "简称",
             "需要", "应该", "以及", "或者", "还是",
+            # Where something is kept, and causatives / counts that only shape the question.
+            "存放在", "保存在", "放在", "让", "两个",
+            # Asking for a name: the answer is the parameter or function itself (EnableSampleReboot),
+            # whose definition seldom contains the words 参数 / 函数.
+            "哪个参数控制", "什么参数控制", "哪个参数", "什么参数", "哪个配置项", "哪个开关",
+            "哪个函数", "什么函数", "哪个方法", "哪个字段",
             "的", "了", "吗", "呢", "吧", "啊", "呀", "么", "和", "与", "及", "是", "都", "也",
         },
         key=len,
@@ -180,6 +203,17 @@ def strip_query_trailing_phrases(text: str) -> str:
 
 def normalized_retrieval_question(question: str) -> str:
     return strip_query_trailing_phrases(collapse_repeated_query_terms(question))
+
+
+def question_concepts(question: str) -> list[tuple[str, ...]]:
+    """The synonym groups (CONCEPT_SYNONYMS) whose phrase the question uses, longest phrase first."""
+    normalized = normalized_retrieval_question(question)
+    found: list[tuple[str, ...]] = []
+    for phrase in sorted(CONCEPT_SYNONYMS, key=len, reverse=True):
+        if phrase in normalized:
+            normalized = normalized.replace(phrase, " ")
+            found.append(CONCEPT_SYNONYMS[phrase])
+    return found
 
 
 def retrieval_question_with_aliases(question: str) -> str:

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from kb.terms import ENGLISH_QUERY_STOP_WORDS, STOP_WORDS, candidate_terms, enumeration_or_list_question, process_question
+from kb.terms import ENGLISH_QUERY_STOP_WORDS, STOP_WORDS, candidate_terms, enumeration_or_list_question, process_question, question_concepts
 from kb.text import first_markdown_heading_level, human_text, markdown_table_of_contents, sentence_score, split_sentences, strip_markdown_emphasis, trim_terminal_punctuation, unique_terms
 
 
@@ -41,7 +41,15 @@ def citation_for_text(text: str, question: str, max_len: int = 360) -> str:
         if wave_sentences:
             return human_text(" ".join(trim_terminal_punctuation(sentence) + "." for sentence in wave_sentences), max_len=max_len)
 
-    scored = [(sentence_score(sentence, terms), index, sentence) for index, sentence in enumerate(sentences)]
+    # A sentence that says the asked idea in the documents' words (并行 for 同时执行) scores like
+    # one containing the whole question phrase.
+    concepts = question_concepts(question)
+
+    def concept_score(sentence: str) -> int:
+        lowered = sentence.lower()
+        return sum(3 for variants in concepts if any(variant.lower() in lowered for variant in variants))
+
+    scored = [(sentence_score(sentence, terms) + concept_score(sentence), index, sentence) for index, sentence in enumerate(sentences)]
     matches = [(score, index, sentence) for score, index, sentence in scored if score > 0]
     if matches:
         max_score = max(score for score, _, _ in matches)

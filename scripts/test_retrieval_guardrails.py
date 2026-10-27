@@ -828,6 +828,7 @@ AcWing 是一个算法交流平台。
     check_offline_translation_setup()
     check_process_answers()
     check_local_answer_layout()
+    check_gate_synonyms()
     print("retrieval guardrails: ok")
 
 
@@ -856,6 +857,28 @@ def check_process_answers() -> None:
     assert "\n- 第一步\n- 第二步 [1]" in answer, answer
     assert "处理总览：\n- 路径 A：" in answer and "- 路径 J：" in answer, answer
     assert "补充：\n- 一句简短的补充说明 [3]" in answer, answer  # a short snippet goes under 补充
+
+
+def check_gate_synonyms() -> None:
+    """The local gate accepts evidence written in the documents' words (路径 for 目录, 并行 for
+    同时执行) and ignores words that only shape the question, but still refuses when the asked
+    attribute is missing."""
+    from kb import citations, relevance
+
+    units = relevance.query_content_units("样例缓存文件放在哪个目录")
+    assert ("concept", "目录|路径|文件夹|directory|folder", 1.0) in units, units
+    assert not any(term in {"放在", "件放"} for _, term, _ in units), units
+    assert relevance.content_coverage(units, "样例缓存文件 | 路径 | 内容") > relevance.LOCAL_CONTENT_COVERAGE_THRESHOLD
+    units = relevance.query_content_units("测试通过后让设备冷启动是哪个参数控制的")
+    assert ("concept", "冷启动|coldboot|cold boot", 1.0) in units and not any("参数" in term for _, term, _ in units), units
+    assert relevance.concept_variant_found("coldboot", "if (samplecoldbootflag) coldboot();", "")
+    assert not relevance.concept_variant_found("dut", "dutyratio", "")  # short variants need a word boundary
+    # A missing attribute still refuses: the subject alone covers only half of the question.
+    units = relevance.query_content_units("SAMPLE01的售价是多少")
+    assert relevance.content_coverage(units, "SAMPLE01 测试计划 封面") <= relevance.LOCAL_CONTENT_COVERAGE_THRESHOLD
+    # The excerpt picks the line saying the asked idea in the documents' words.
+    table = "| 字段 | 说明 |\n| CaseTitle | 测试项标题 |\n| GroupNo | 分组号，相同值的测试项会并行执行 |"
+    assert "并行" in citations.citation_for_text(table, "怎么让两个测试项同时执行"), citations.citation_for_text(table, "怎么让两个测试项同时执行")
 
 
 def check_local_answer_layout() -> None:
