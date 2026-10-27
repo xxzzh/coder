@@ -1256,7 +1256,9 @@ def check_query_terms() -> None:
     assert not {"是多", "多少", "分别"} & set(terms), terms  # question words are not evidence
     assert query_module.candidate_terms("主板USB 4.0读写速度门限是多少")[0] == "usb"
     fts_terms = re.findall(r'"([^"]+)"', query_module.fts_query("测试中途重启后，已经通过的测试项还要重新测吗"))
-    assert fts_terms and all(len(term) <= 4 for term in fts_terms), fts_terms  # index holds 2-4 char n-grams
+    # The index holds Chinese as 2-4 character n-grams and English as single words: no longer
+    # Chinese span, and no glued English phrase such as "retry reboot" that no document contains.
+    assert fts_terms and all(len(term) <= 4 if re.search(r"[一-鿿]", term) else " " not in term for term in fts_terms), fts_terms
     assert "重启" in fts_terms
 
 

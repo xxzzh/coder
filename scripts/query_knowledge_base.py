@@ -140,6 +140,7 @@ from kb.relevance import (  # noqa: F401  (re-exported for callers of this modul
     knowledge_text,
     local_result_is_relevant,
     query_content_units,
+    rows_about_named_subject,
     unknown_names,
 )
 from kb.citations import (  # noqa: F401  (re-exported for callers of this module)
@@ -263,7 +264,7 @@ NEGATIVE_CACHE_TTL_SECONDS = 120
 CACHE_VARIANT_VERSION = "retrieval-v56:process-sections-offline-translation"
 # Answers built without a model (layout, gate, cited evidence). Raising it refreshes cached local
 # answers only; cached API answers stay valid and are not paid for again.
-LOCAL_ANSWER_VERSION = "local-v2"
+LOCAL_ANSWER_VERSION = "local-v3"
 
 
 def source_fingerprint(raw_dir: Path = RAW_DIR) -> str:
@@ -1168,6 +1169,7 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
     else:
         min_source_score = max(LOCAL_SCORE_THRESHOLD, rows[0]["rerank_score"] * 0.75)
         rows = [row for row in rows if row["rerank_score"] >= min_source_score]
+    rows = rows_about_named_subject(rows, question)
 
     sources: list[dict[str, Any]] = []
     citations: list[dict[str, Any]] = []

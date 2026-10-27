@@ -53,7 +53,14 @@ CONCEPT_SYNONYMS: dict[str, tuple[str, ...]] = {
     "热启动": ("热启动", "warmboot", "warm boot"),
     "重启": ("重启", "reboot", "restart"),
     "电脑": ("电脑", "笔电", "整机", "dut"),
+    "操作员": ("操作员", "人力", "测试人力", "作业员", "operator"),
+    "节拍": ("节拍", "uph", "测试时间", "takt", "cycle time"),
 }
+
+# Phrases users say that production documents write differently, so searching with the user's
+# word alone never reaches the evidence (操作员 -> 测试人力, 节拍 -> UPH / 测试时间). Only these
+# widen the search; widening a phrase the documents do use (目录, 同时执行) just adds ranking noise.
+SEARCH_EXPANDED_PHRASES = ("操作员", "节拍")
 
 STOP_WORDS = {
     "什么",
@@ -224,7 +231,15 @@ def retrieval_question_with_aliases(question: str) -> str:
     for phrase, phrase_aliases in QUERY_ALIAS_PHRASES.items():
         if phrase.lower() in normalized.lower():
             aliases.extend(phrase_aliases)
-    return " ".join(unique_terms([normalized, *aliases], limit=12))
+    question_text = " ".join(unique_terms([normalized, *aliases], limit=12))
+    # Search with the documents' wording too (SEARCH_EXPANDED_PHRASES): 操作员 also finds 测试人力. Each
+    # variant is set off by "，" so English variants stay separate terms: "retry reboot" would be
+    # searched as a phrase that no document contains.
+    variants: list[str] = []
+    for phrase in SEARCH_EXPANDED_PHRASES:
+        if phrase in normalized:
+            variants.extend(variant for variant in CONCEPT_SYNONYMS[phrase] if variant != phrase and variant not in variants)
+    return "，".join([question_text, *variants]) if variants else question_text
 
 
 def iterative_retrieval_question(question: str) -> bool:

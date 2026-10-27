@@ -262,7 +262,25 @@ def row_covers_question(
     # asked attribute (售价) must not count as evidence.
     if not has_lexical_score or content_coverage(units, text) <= LOCAL_CONTENT_COVERAGE_THRESHOLD:
         return False
+    if not mentions_a_name(text, units):
+        return False
     return all(content_coverage(part, text) >= LOCAL_CONTENT_COVERAGE_THRESHOLD for part in required or [])
+
+
+def mentions_a_name(text: str, units: list[tuple[str, str, float]]) -> bool:
+    """A question that names something (SFT, N972, LogMsgType) is about it: a chunk that mentions
+    none of its names is about something else, however many other words it shares."""
+    names = [term for kind, term, _ in units if kind == "ascii"]
+    lowered = text.lower()
+    return not names or any(ascii_term_pattern(name).search(lowered) for name in names)
+
+
+def rows_about_named_subject(rows: list[dict[str, Any]], question: str) -> list[dict[str, Any]]:
+    """Drop chunks that mention none of the question's names, when others do (the FFT touchpad
+    test does not answer a question about the SFT station)."""
+    units = query_content_units(question)
+    named = [row for row in rows if mentions_a_name(str(row.get("text", "")), units)]
+    return named if named and len(named) < len(rows) else rows
 
 
 def gate_candidate_count(rows: list[dict[str, Any]], question: str) -> int:
