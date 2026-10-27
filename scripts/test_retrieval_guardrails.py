@@ -13,6 +13,8 @@ import tempfile
 import zipfile
 
 import ingest_knowledge_base as ingest_module
+from kb_ingest import ocr as ocr_module  # OCR code looks shutil.which up here
+from kb_ingest import pdf as pdf_module  # pdftotext reading looks find_pdftotext and subprocess up here
 import model_capabilities
 import query_knowledge_base as query_module
 from kb import web as web_module  # the web search code looks its providers and fetchers up here
@@ -546,8 +548,8 @@ AcWing 是一个算法交流平台。
     with tempfile.TemporaryDirectory() as temp_dir:
         pdf_path = Path(temp_dir) / "sample.pdf"
         pdf_path.write_bytes(b"%PDF-1.4\n")
-        original_find_pdftotext = ingest_module.find_pdftotext
-        original_subprocess_run = ingest_module.subprocess.run
+        original_find_pdftotext = pdf_module.find_pdftotext
+        original_subprocess_run = pdf_module.subprocess.run
 
         def fake_run(command, **kwargs):
             Path(command[-1]).write_text("4.2 HPD (Human Presence Detection) Test", encoding="utf-8")
@@ -558,12 +560,12 @@ AcWing 是一个算法交流平台。
             return Completed()
 
         try:
-            ingest_module.find_pdftotext = lambda: "pdftotext"
-            ingest_module.subprocess.run = fake_run
-            assert ingest_module._read_pdf_with_pdftotext(pdf_path) == "4.2 HPD (Human Presence Detection) Test"
+            pdf_module.find_pdftotext = lambda: "pdftotext"
+            pdf_module.subprocess.run = fake_run
+            assert pdf_module._read_pdf_with_pdftotext(pdf_path) == "4.2 HPD (Human Presence Detection) Test"
         finally:
-            ingest_module.find_pdftotext = original_find_pdftotext
-            ingest_module.subprocess.run = original_subprocess_run
+            pdf_module.find_pdftotext = original_find_pdftotext
+            pdf_module.subprocess.run = original_subprocess_run
 
     providers = (
         "jina_baidu_search",
@@ -961,8 +963,8 @@ def check_ocr_pipeline() -> None:
     """Scanned PDFs render without Poppler, and OCR keeps the page-segmentation mode Tesseract is surest of."""
     import shutil
 
-    original_which = ingest_module.shutil.which
-    ingest_module.shutil.which = lambda name, *args, **kwargs: None if name == "pdftoppm" else original_which(name, *args, **kwargs)
+    original_which = ocr_module.shutil.which
+    ocr_module.shutil.which = lambda name, *args, **kwargs: None if name == "pdftoppm" else original_which(name, *args, **kwargs)
     try:
         renderer = ingest_module.pdf_page_renderer()
         try:
@@ -977,7 +979,7 @@ def check_ocr_pipeline() -> None:
                     pages = ingest_module.render_pdf_pages_for_ocr(sample, Path(temp_dir))
                     assert pages and all(page.suffix == ".png" and page.stat().st_size > 0 for page in pages)
     finally:
-        ingest_module.shutil.which = original_which
+        ocr_module.shutil.which = original_which
     assert shutil.which is original_which  # the patch did not leak
     with tempfile.TemporaryDirectory() as temp_dir:
         tsv = Path(temp_dir) / "page.tsv"

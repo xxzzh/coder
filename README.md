@@ -282,7 +282,25 @@ FAISS 是本地文件型向量索引，不需要 Docker 或外部服务。当前
 | `kb/structured.py` | 直接读表格的结构化答案：缩写词典、站位测试项、Excel 字段、FFT 清单 |
 | `kb/web.py` | 联网搜索、公开网页抓取与正文提取、联网来源筛选去重 |
 
-`scripts/agentic_retrieval.py` 是智能检索 Agent 的循环，`scripts/ingest_knowledge_base.py` 负责导入和建索引。`kb/` 中的名称都会从 `query_knowledge_base` 重新导出，原有调用方式不变。写测试替换某个函数时，要替换调用方所在的模块：例如联网搜索的各个来源在 `kb.web` 里被调用，就替换 `kb.web` 中的函数。
+`scripts/agentic_retrieval.py` 是智能检索 Agent 的循环。`kb/` 中的名称都会从 `query_knowledge_base` 重新导出，原有调用方式不变。
+
+导入和建索引的主流程在 `scripts/ingest_knowledge_base.py`：一次导入（逐个文件提取、分块、写索引、写报告）、带锁的 `ingest()` 入口和命令行。各环节的实现放在 `scripts/kb_ingest/`：
+
+| 模块 | 内容 |
+|---|---|
+| `kb_ingest/files.py` | 支持的格式、raw 文件指纹、导入锁、项目路径 |
+| `kb_ingest/reviews.py` | 提取报告、待审核清单和审核通过记录 |
+| `kb_ingest/ocr.py` | 查找 Tesseract 和语言包、渲染 PDF 页面、按置信度选择 OCR 模式 |
+| `kb_ingest/word.py` | `.docx` 文字和图片、`.doc` 经 Word 转换 |
+| `kb_ingest/xlsx.py` | Excel 表格网格、表头识别、逐行记录、文本框和图表里的文字 |
+| `kb_ingest/pdf.py` | PDF 文字提取（pypdf、pdfplumber、pdftotext），扫描页走 OCR |
+| `kb_ingest/documents.py` | 按格式分派读取并生成提取报告 |
+| `kb_ingest/chunking.py` | 文本规范化、语义分块、本地 hash embedding |
+| `kb_ingest/store.py` | SQLite 索引：建表、文档记录、embedding LSH 分桶、元数据 |
+| `kb_ingest/reports.py` | 建完索引后写出的 processed 文件和检索质量报告 |
+| `kb_ingest/vectors.py` | 带缓存的模型 embedding、可选的 FAISS 向量索引 |
+
+`kb_ingest/` 中的名称同样会从 `ingest_knowledge_base` 重新导出。写测试替换某个函数时，要替换调用方所在的模块：例如联网搜索的各个来源在 `kb.web` 里被调用，就替换 `kb.web` 中的函数；PDF 读取调用的 `find_pdftotext` 在 `kb_ingest.pdf` 里，就替换 `kb_ingest.pdf` 中的函数。
 
 ## 项目本地依赖和下载目录
 
