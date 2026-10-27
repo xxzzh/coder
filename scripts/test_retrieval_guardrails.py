@@ -829,6 +829,7 @@ AcWing 是一个算法交流平台。
     check_process_answers()
     check_local_answer_layout()
     check_gate_synonyms()
+    check_gate_asked_part()
     print("retrieval guardrails: ok")
 
 
@@ -879,6 +880,39 @@ def check_gate_synonyms() -> None:
     # The excerpt picks the line saying the asked idea in the documents' words.
     table = "| 字段 | 说明 |\n| CaseTitle | 测试项标题 |\n| GroupNo | 分组号，相同值的测试项会并行执行 |"
     assert "并行" in citations.citation_for_text(table, "怎么让两个测试项同时执行"), citations.citation_for_text(table, "怎么让两个测试项同时执行")
+
+
+def check_gate_asked_part() -> None:
+    """A name that a large share of the index mentions does not make a chunk evidence for whatever
+    is asked about it, and in 「X支持Y吗」 the evidence must mention Y."""
+    from kb import relevance
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "knowledge.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript("CREATE TABLE chunks (text TEXT); CREATE TABLE metadata (key TEXT, value TEXT);")
+        # 30 chunks: SAMPLEFW in 4 (broad, 13%), SampleWidget in 1 (specific, 3%), 测试 in most.
+        texts = [f"SAMPLEFW 测试说明第 {index} 节" for index in range(4)] + [f"测试记录 {index}" for index in range(22)]
+        texts += [f"其他说明 {index}" for index in range(3)] + ["SampleWidget 枚举：A、B"]
+        conn.executemany("INSERT INTO chunks (text) VALUES (?)", [(text,) for text in texts])
+        conn.execute("INSERT INTO metadata VALUES ('indexed_at', 't1')")
+        conn.commit()
+        conn.close()
+        assert relevance.name_share("samplefw", db_path) >= relevance.BROAD_NAME_SHARE > relevance.name_share("samplewidget", db_path)
+        assert relevance.term_share("测试", db_path) >= relevance.UBIQUITOUS_TERM_SHARE
+
+        def row(text: str) -> dict:
+            return {"text": text, "rerank_score": 0.7, "keyword_score": 1.0, "fts_score": 0.5}
+
+        # A broad name plus a ubiquitous word is no evidence for the asked 仓库地址 / 覆盖率.
+        assert not relevance.local_result_is_relevant([row("SAMPLEFW 测试源码说明，代码以源码为准")], "SAMPLEFW的代码仓库地址是什么", db_path)
+        assert not relevance.local_result_is_relevant([row("SAMPLEFW 测试覆盖说明")], "SAMPLEFW的单元测试覆盖率是多少", db_path)
+        assert relevance.local_result_is_relevant([row("SAMPLEFW 代码仓库地址：内部服务器")], "SAMPLEFW的代码仓库地址是什么", db_path)
+        # A specific name still pins the question to its evidence.
+        assert relevance.local_result_is_relevant([row("SampleWidget 枚举：A、B")], "SampleWidget平台枚举有哪些值", db_path)
+        # 「X支持Y吗」 needs Y in the evidence.
+        assert not relevance.local_result_is_relevant([row("样例箱模式：循环执行测试")], "样例箱模式支持双屏测试吗", db_path)
+        assert relevance.local_result_is_relevant([row("样例箱模式支持并行测试，组号相同即可")], "样例箱模式支持并行测试吗", db_path)
 
 
 def check_local_answer_layout() -> None:

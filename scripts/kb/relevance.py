@@ -14,6 +14,19 @@ LOCAL_SCORE_THRESHOLD = 0.16
 
 LOCAL_CONTENT_COVERAGE_THRESHOLD = 0.5
 
+# A name found in at least this share of the chunks (the framework's own name, a station that
+# every test sheet lists) does not pin a question to particular evidence: STPM matches a
+# quarter of the index. When every name in a question is that broad, the evidence must also
+# cover the question's Chinese part (what is asked about the name), at least half of it.
+BROAD_NAME_SHARE = 0.10
+
+# A two-character term found in at least half of the chunks (测试 in an index of test documents)
+# says nothing about what is asked; checks of the asked part ignore it.
+UBIQUITOUS_TERM_SHARE = 0.5
+
+# 「X支持Y吗」 asks about Y: the evidence must mention Y, not just X.
+SUPPORT_QUESTION_PATTERN = re.compile(r"支持(.+?)(?:吗|么|？|\?|$)")
+
 # A name followed by a version: MES 3.0, USB 4.0, WIFI 6E, .NET 6, MES3.0. A version without a
 # dot (6, 6E) must be separated by a space, so model codes such as AB123 are not split.
 VERSIONED_NAME_PATTERN = re.compile(
@@ -21,6 +34,9 @@ VERSIONED_NAME_PATTERN = re.compile(
 )
 
 KNOWLEDGE_TEXT_CACHE: dict[str, tuple[str, str]] = {}
+CHUNK_TEXTS_CACHE: dict[str, tuple[str, list[str]]] = {}
+NAME_SHARE_CACHE: dict[tuple[str, str, str], float] = {}
+TERM_SHARE_CACHE: dict[tuple[str, str, str], float] = {}
 
 
 def query_content_units(question: str) -> list[tuple[str, str, float]]:
@@ -114,6 +130,94 @@ def knowledge_text(db_path: Path) -> str | None:
     return text
 
 
+def index_stamp(db_path: Path) -> tuple[str, str]:
+    key = str(Path(db_path).resolve())
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT value FROM metadata WHERE key = 'indexed_at'").fetchone()
+    finally:
+        conn.close()
+    return key, str(row[0]) if row else ""
+
+
+def chunk_texts(db_path: Path) -> list[str]:
+    """Every chunk's text, lower-cased; reloaded whenever the index is rebuilt."""
+    key, stamp = index_stamp(db_path)
+    cached = CHUNK_TEXTS_CACHE.get(key)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    conn = sqlite3.connect(db_path)
+    try:
+        texts = [str(text).lower() for (text,) in conn.execute("SELECT text FROM chunks")]
+    finally:
+        conn.close()
+    CHUNK_TEXTS_CACHE[key] = (stamp, texts)
+    return texts
+
+
+def name_share(term: str, db_path: Path) -> float:
+    """Share of the index's chunks that mention a Latin-script name."""
+    try:
+        key, stamp = index_stamp(db_path)
+        cache_key = (key, stamp, term)
+        if cache_key not in NAME_SHARE_CACHE:
+            texts = chunk_texts(db_path)
+            pattern = ascii_term_pattern(term)
+            NAME_SHARE_CACHE[cache_key] = sum(bool(pattern.search(text)) for text in texts) / len(texts) if texts else 0.0
+        return NAME_SHARE_CACHE[cache_key]
+    except sqlite3.DatabaseError:
+        return 0.0
+
+
+def term_share(term: str, db_path: Path) -> float:
+    """Share of the index's chunks containing a Chinese term."""
+    try:
+        key, stamp = index_stamp(db_path)
+        cache_key = (key, stamp, term)
+        if cache_key not in TERM_SHARE_CACHE:
+            texts = chunk_texts(db_path)
+            TERM_SHARE_CACHE[cache_key] = sum(term in "".join(text.split()) for text in texts) / len(texts) if texts else 0.0
+        return TERM_SHARE_CACHE[cache_key]
+    except sqlite3.DatabaseError:
+        return 0.0
+
+
+def asked_part(units: list[tuple[str, str, float]], db_path: Path) -> list[tuple[str, str, float]]:
+    """The units that say what is asked: not names, and not terms nearly every chunk contains."""
+    asked = [unit for unit in units if unit[0] != "ascii"]
+    informative = [unit for unit in asked if not (unit[0] == "cjk" and term_share(unit[1], db_path) >= UBIQUITOUS_TERM_SHARE)]
+    return informative or asked
+
+
+def required_parts(question: str, units: list[tuple[str, str, float]], db_path: Path | None) -> list[list[tuple[str, str, float]]]:
+    """Parts of the question each piece of evidence must cover at least half of, besides the whole.
+
+    - When every name in the question is broad (STPM, SFT), the asked part: STPM plus the
+      common word 测试 is no evidence about STPM's 单元测试覆盖率.
+    - In 「X支持Y吗」, Y: a chunk about X that never mentions Y does not answer whether X supports it.
+    """
+    if db_path is None:
+        return []
+    parts = []
+    if broad_names_only(units, db_path):
+        asked = asked_part(units, db_path)
+        if asked:
+            parts.append(asked)
+    support = SUPPORT_QUESTION_PATTERN.search(normalized_retrieval_question(question))
+    if support:
+        supported = asked_part(query_content_units(support.group(1)), db_path)
+        supported += [unit for unit in query_content_units(support.group(1)) if unit[0] == "ascii"]
+        if supported:
+            parts.append(supported)
+    return parts
+
+
+def broad_names_only(units: list[tuple[str, str, float]], db_path: Path | None) -> bool:
+    """The question names something, but only names too common to point at particular evidence."""
+    names = [term for kind, term, _ in units if kind == "ascii"]
+    return bool(db_path is not None and names and all(name_share(name, db_path) >= BROAD_NAME_SHARE for name in names))
+
+
 def unknown_names(question: str, db_path: Path) -> list[str]:
     """Names in a Chinese question that occur nowhere in the knowledge base.
 
@@ -147,13 +251,18 @@ def unknown_names(question: str, db_path: Path) -> list[str]:
     return unknown
 
 
-def row_covers_question(row: dict[str, Any], units: list[tuple[str, str, float]]) -> bool:
+def row_covers_question(
+    row: dict[str, Any], units: list[tuple[str, str, float]], required: list[list[tuple[str, str, float]]] | None = None
+) -> bool:
     if row.get("rerank_score", 0.0) < LOCAL_SCORE_THRESHOLD * 0.8:
         return False
     has_lexical_score = float(row.get("keyword_score", 0.0) or 0.0) > 0 or float(row.get("fts_score", 0.0) or 0.0) > 0
+    text = str(row.get("text", ""))
     # Strictly more than half: a chunk that only shares the subject (a model code) but not the
     # asked attribute (售价) must not count as evidence.
-    return has_lexical_score and content_coverage(units, str(row.get("text", ""))) > LOCAL_CONTENT_COVERAGE_THRESHOLD
+    if not has_lexical_score or content_coverage(units, text) <= LOCAL_CONTENT_COVERAGE_THRESHOLD:
+        return False
+    return all(content_coverage(part, text) >= LOCAL_CONTENT_COVERAGE_THRESHOLD for part in required or [])
 
 
 def gate_candidate_count(rows: list[dict[str, Any]], question: str) -> int:
@@ -168,5 +277,6 @@ def local_result_is_relevant(rows: list[dict[str, Any]], question: str, db_path:
         return False
     if db_path is not None and unknown_names(question, db_path):
         return False
-    return any(row_covers_question(row, units) for row in rows[: gate_candidate_count(rows, question)])
+    required = required_parts(question, units, db_path)
+    return any(row_covers_question(row, units, required) for row in rows[: gate_candidate_count(rows, question)])
 
