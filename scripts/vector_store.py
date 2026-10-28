@@ -257,6 +257,30 @@ def index_vectors(vector_dir: Path | None = None) -> tuple[list[dict[str, Any]],
     return mapping, vectors
 
 
+def vector_scores(query_vector: list[float], chunk_ids: list[str], vector_dir: Path = VECTOR_DIR) -> dict[str, float]:
+    """The query's similarity to the given chunks' stored vectors (cosine: vectors are normalized).
+    Chunks found by full-text search are scored on the same scale as the vector search's own."""
+    if not chunk_ids or not vector_status(vector_dir=vector_dir)["ready"]:
+        return {}
+    try:
+        import numpy as np  # type: ignore
+
+        index, mapping = load_index(vector_dir)
+        with _INDEX_CACHE_LOCK:
+            positions = _INDEX_CACHE.get("positions")
+            if positions is None or _INDEX_CACHE.get("positions_of") is not mapping:
+                positions = {str(row["chunk_id"]): position for position, row in enumerate(mapping)}
+                _INDEX_CACHE.update(positions=positions, positions_of=mapping)
+        wanted = [(chunk_id, positions[chunk_id]) for chunk_id in dict.fromkeys(chunk_ids) if chunk_id in positions]
+        if not wanted:
+            return {}
+        vectors = np.vstack([index.reconstruct(int(position)) for _, position in wanted])
+        scores = vectors @ np.array(query_vector, dtype="float32")
+    except Exception:  # noqa: BLE001  (no vector scores: the caller keeps its own)
+        return {}
+    return {chunk_id: float(score) for (chunk_id, _), score in zip(wanted, scores.tolist())}
+
+
 def search_vector_index(query_vector: list[float], limit: int, vector_dir: Path = VECTOR_DIR) -> dict[str, Any]:
     status = vector_status(vector_dir=vector_dir)
     if not status["ready"]:

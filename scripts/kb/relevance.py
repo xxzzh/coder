@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from kb.text import to_simplified
 from kb.terms import CONCEPT_SYNONYMS, ENGLISH_QUERY_STOP_WORDS, QUESTION_FUNCTION_PHRASES, abbreviation_query_term, iterative_retrieval_question, normalized_retrieval_question
 
 
@@ -53,7 +55,9 @@ def query_content_units(question: str) -> list[tuple[str, str, float]]:
         return [("ascii", abbreviation.lower(), 1.0)]
     units: list[tuple[str, str, float]] = []
     seen: set[str] = set()
-    for word in re.findall(r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_]*", normalized):
+    # An identifier joined by hyphens is one name (TC-999, AB-12, X-ray): split, TC-999 would
+    # pass as the TC that every test case carries.
+    for word in re.findall(r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*", normalized):
         lowered = word.lower()
         if len(lowered) < 2 or lowered in ENGLISH_QUERY_STOP_WORDS or lowered in seen:
             continue
@@ -76,11 +80,19 @@ def query_content_units(question: str) -> list[tuple[str, str, float]]:
     return units
 
 
+@lru_cache(maxsize=8192)
+def simplified(text: str) -> str:
+    """Traditional characters read as simplified: questions are typed in simplified Chinese while
+    many sheets and SOPs are written in traditional (測試 for 测试, 站別 for 站别)."""
+    return to_simplified(text)
+
+
 def content_coverage(units: list[tuple[str, str, float]], text: str) -> float:
     """Share of the question's subject weight found in text (0..1)."""
     total = sum(weight for _, _, weight in units)
     if not total:
         return 0.0
+    text = simplified(text)
     lowered = text.lower()
     compact = re.sub(r"\s+", "", text)
     matched = 0.0
@@ -252,19 +264,59 @@ def unknown_names(question: str, db_path: Path) -> list[str]:
 
 
 def row_covers_question(
-    row: dict[str, Any], units: list[tuple[str, str, float]], required: list[list[tuple[str, str, float]]] | None = None
+    row: dict[str, Any],
+    units: list[tuple[str, str, float]],
+    required: list[list[tuple[str, str, float]]] | None = None,
+    document_label: str = "",
 ) -> bool:
     if row.get("rerank_score", 0.0) < LOCAL_SCORE_THRESHOLD * 0.8:
         return False
     has_lexical_score = float(row.get("keyword_score", 0.0) or 0.0) > 0 or float(row.get("fts_score", 0.0) or 0.0) > 0
     text = str(row.get("text", ""))
+    # A question may name the document itself (某某清单里, 这本手册的): the chunk's file
+    # name and title count as said. The rest of the question must still be the chunk's own content,
+    # or every chunk of a named document would answer whatever is asked about it.
+    seen = f"{text}\n{document_label}" if document_label else text
     # Strictly more than half: a chunk that only shares the subject (a model code) but not the
     # asked attribute (售价) must not count as evidence.
-    if not has_lexical_score or content_coverage(units, text) <= LOCAL_CONTENT_COVERAGE_THRESHOLD:
+    if not has_lexical_score or content_coverage(units, seen) <= LOCAL_CONTENT_COVERAGE_THRESHOLD:
         return False
-    if not mentions_a_name(text, units):
+    if document_label and content_coverage(units, text) <= LOCAL_CONTENT_COVERAGE_THRESHOLD:
+        # Only the document's name lets this chunk through: what is asked (the Chinese part beyond
+        # the name) must then be in the chunk itself, at least half of it, or every chunk of
+        # a named workbook would answer a question about its 重量.
+        asked = [unit for unit in units if unit[0] != "ascii" and not content_coverage([unit], document_label)]
+        if asked and content_coverage(asked, text) < LOCAL_CONTENT_COVERAGE_THRESHOLD:
+            return False
+    if not mentions_a_name(seen, units):
         return False
     return all(content_coverage(part, text) >= LOCAL_CONTENT_COVERAGE_THRESHOLD for part in required or [])
+
+
+DOCUMENT_LABEL_CACHE: dict[tuple[str, str], dict[str, str]] = {}
+
+
+def document_labels(db_path: Path) -> dict[str, str]:
+    """Each document's name as a question would say it: the file name in words and the first line
+    of its text (a title page), simplified. Keyed by file name."""
+    try:
+        key = index_stamp(db_path)
+        if key not in DOCUMENT_LABEL_CACHE:
+            conn = sqlite3.connect(db_path)
+            try:
+                heads = conn.execute("SELECT file_name, substr(text, 1, 400) FROM documents").fetchall()
+            finally:
+                conn.close()
+            labels = {}
+            for file_name, head in heads:
+                words = re.sub(r"[_\-.]+", " ", Path(str(file_name)).stem)
+                lines = [line.strip() for line in str(head or "").splitlines()]
+                title = next((line for line in lines if line and not re.fullmatch(r"\[(?:ocr )?page \d+\]", line)), "")
+                labels[str(file_name)] = simplified(f"{words}\n{title[:60]}")
+            DOCUMENT_LABEL_CACHE[key] = labels
+        return DOCUMENT_LABEL_CACHE[key]
+    except sqlite3.DatabaseError:
+        return {}
 
 
 def mentions_a_name(text: str, units: list[tuple[str, str, float]]) -> bool:
@@ -287,14 +339,24 @@ def gate_candidate_count(rows: list[dict[str, Any]], question: str) -> int:
     return min(len(rows), 8 if iterative_retrieval_question(question) else 3)
 
 
-def local_result_is_relevant(rows: list[dict[str, Any]], question: str, db_path: Path | None = None) -> bool:
+def covering_row_index(rows: list[dict[str, Any]], question: str, db_path: Path | None = None) -> int | None:
+    """Position of the first retrieved chunk that covers the question, or None when none does (the
+    local answer is refused)."""
     if not rows or rows[0].get("rerank_score", 0.0) < LOCAL_SCORE_THRESHOLD:
-        return False
+        return None
     units = query_content_units(question)
     if not units:
-        return False
+        return None
     if db_path is not None and unknown_names(question, db_path):
-        return False
+        return None
     required = required_parts(question, units, db_path)
-    return any(row_covers_question(row, units, required) for row in rows[: gate_candidate_count(rows, question)])
+    labels = document_labels(db_path) if db_path is not None else {}
+    for index, row in enumerate(rows[: gate_candidate_count(rows, question)]):
+        if row_covers_question(row, units, required, labels.get(str(row.get("file_name", "")), "")):
+            return index
+    return None
+
+
+def local_result_is_relevant(rows: list[dict[str, Any]], question: str, db_path: Path | None = None) -> bool:
+    return covering_row_index(rows, question, db_path) is not None
 

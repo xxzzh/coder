@@ -55,12 +55,20 @@ CONCEPT_SYNONYMS: dict[str, tuple[str, ...]] = {
     "电脑": ("电脑", "笔电", "整机", "dut"),
     "操作员": ("操作员", "人力", "测试人力", "作业员", "operator"),
     "节拍": ("节拍", "uph", "测试时间", "takt", "cycle time"),
+    # English sheets and SOPs title these columns and sections in English (Version, Tool).
+    "版本": ("版本", "version"),
+    "工具": ("工具", "tool"),
+    "手册": ("手册", "handbook", "manual"),
+    "老化": ("老化", "aging", "run-in", "runin"),
+    # A book's chapters are named 「…篇」, never 「篇章」.
+    "篇章": ("篇章", "章节", "篇"),
 }
 
 # Phrases users say that production documents write differently, so searching with the user's
-# word alone never reaches the evidence (操作员 -> 测试人力, 节拍 -> UPH / 测试时间). Only these
-# widen the search; widening a phrase the documents do use (目录, 同时执行) just adds ranking noise.
-SEARCH_EXPANDED_PHRASES = ("操作员", "节拍")
+# word alone never reaches the evidence (操作员 -> 测试人力, 节拍 -> UPH / 测试时间, 老化 -> Aging in
+# the English-titled test flows). Only these widen the search; widening a phrase the documents do
+# use (目录, 同时执行) just adds ranking noise.
+SEARCH_EXPANDED_PHRASES = ("操作员", "节拍", "老化")
 
 STOP_WORDS = {
     "什么",
@@ -163,6 +171,8 @@ QUESTION_FUNCTION_PHRASES = tuple(
             # whose definition seldom contains the words 参数 / 函数.
             "哪个参数控制", "什么参数控制", "哪个参数", "什么参数", "哪个配置项", "哪个开关",
             "哪个函数", "什么函数", "哪个方法", "哪个字段",
+            # Asking for the values of a field (某字段的取值) or a part of the named document.
+            "取值", "哪一部分", "哪部分", "这本书",
             "的", "了", "吗", "呢", "吧", "啊", "呀", "么", "和", "与", "及", "是", "都", "也",
         },
         key=len,

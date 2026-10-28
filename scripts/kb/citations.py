@@ -95,10 +95,24 @@ def evidence_lines(text: str) -> list[tuple[str, int]]:
     removed; line structure, numbering and code are kept.
     """
     lines: list[tuple[str, int]] = []
+    previous_cells: list[str] = []
     for raw_line in unescape(text).splitlines():
         line = raw_line.strip()
         if not line or re.fullmatch(r"```[\w+-]*|[-*_=]{3,}|\|?[\s:|-]*-{3,}[\s:|-]*\|?", line):
             continue
+        if line.startswith("|"):
+            # A row that leaves its first cells empty continues the group above (the next field of
+            # same setting group): those cells take the values above, as merged cells would show them.
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if previous_cells and len(cells) == len(previous_cells) and cells and not cells[0] and any(cells):
+                filled = 0
+                while filled < len(cells) - 1 and not cells[filled]:
+                    cells[filled] = previous_cells[filled]
+                    filled += 1
+                line = "| " + " | ".join(cells) + " |"
+            previous_cells = cells
+        else:
+            previous_cells = []
         heading = re.match(r"(#{1,6})\s+", line)
         level = len(heading.group(1)) if heading else 0
         line = re.sub(r"^#{1,6}\s+|^>\s*|^[-*+]\s+", "", line)

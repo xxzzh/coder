@@ -169,7 +169,15 @@ def get_metadata(conn: sqlite3.Connection) -> dict[str, str]:
     return {row["key"]: row["value"] for row in rows}
 
 
+# Full-text candidates are taken best-first, but one document may fill at most this share of them:
+# a workbook with hundreds of rows naming an item otherwise crowds out the one overview that
+# answers what that item's status is.
+FTS_PER_DOCUMENT_SHARE = 0.4
+
+
 def fts_candidates(conn: sqlite3.Connection, question: str, limit: int) -> list[dict[str, Any]]:
+    wanted = max(limit * 20, 100)
+    per_document = max(1, int(wanted * FTS_PER_DOCUMENT_SHARE))
     try:
         rows = conn.execute(
             """
@@ -183,11 +191,21 @@ def fts_candidates(conn: sqlite3.Connection, question: str, limit: int) -> list[
             ORDER BY fts_rank
             LIMIT ?
             """,
-            (fts_query(question), max(limit * 20, 100)),
+            (fts_query(question), wanted * 5),
         ).fetchall()
     except sqlite3.OperationalError:
         return []
-    return [dict(row) for row in rows]
+    kept: list[dict[str, Any]] = []
+    per_doc: dict[str, int] = {}
+    for row in rows:
+        doc_id = str(row["doc_id"])
+        if per_doc.get(doc_id, 0) >= per_document:
+            continue
+        per_doc[doc_id] = per_doc.get(doc_id, 0) + 1
+        kept.append(dict(row))
+        if len(kept) >= wanted:
+            break
+    return kept
 
 
 def semantic_candidates(
@@ -261,26 +279,49 @@ def lsh_semantic_candidates(
     return [item for _, item in scored[: max(limit * 20, 100)]]
 
 
+def query_vector(conn: sqlite3.Connection, question: str, config: dict[str, str]) -> list[float] | None:
+    """The question's embedding when the vector index is ready, else None."""
+    embedding_cfg = model_capabilities.embedding_config(config)
+    if embedding_cfg.get("backend") != "faiss" or not embedding_cfg.get("usable"):
+        return None
+    try:
+        sqlite_chunk_count = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] or 0)
+    except sqlite3.OperationalError:
+        sqlite_chunk_count = None
+    if not vector_store.vector_status(sqlite_chunk_count=sqlite_chunk_count).get("ready"):
+        return None
+    embedded = model_capabilities.embed_query(question, config)
+    if not embedded.get("ok") or not embedded.get("vectors"):
+        return None
+    return embedded["vectors"][0]
+
+
+def score_with_vectors(rows: list[dict[str, Any]], vector: list[float] | None) -> list[dict[str, Any]]:
+    """Give every candidate the vector similarity, whichever search found it. A chunk that full-text
+    search finds by a rare name (the one overview row naming an item) would otherwise be ranked by the
+    rough local hash embedding, far below the vector search's own candidates."""
+    if vector is None:
+        return rows
+    scores = vector_store.vector_scores(vector, [str(row["chunk_id"]) for row in rows if row.get("vector_score") is None])
+    for row in rows:
+        score = scores.get(str(row["chunk_id"]))
+        if score is not None:
+            row["vector_score"] = score
+            row["semantic_score"] = max(0.0, score)
+    return rows
+
+
 def external_vector_candidates(
     conn: sqlite3.Connection,
     question: str,
     limit: int,
     config: dict[str, str],
+    vector: list[float] | None = None,
 ) -> list[dict[str, Any]]:
-    embedding_cfg = model_capabilities.embedding_config(config)
-    if embedding_cfg.get("backend") != "faiss" or not embedding_cfg.get("usable"):
+    vector = vector if vector is not None else query_vector(conn, question, config)
+    if vector is None:
         return []
-    try:
-        sqlite_chunk_count = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] or 0)
-    except sqlite3.OperationalError:
-        sqlite_chunk_count = None
-    status = vector_store.vector_status(sqlite_chunk_count=sqlite_chunk_count)
-    if not status.get("ready"):
-        return []
-    embedded = model_capabilities.embed_query(question, config)
-    if not embedded.get("ok") or not embedded.get("vectors"):
-        return []
-    vector_rows = vector_store.search_vector_index(embedded["vectors"][0], max(limit * 20, 100))
+    vector_rows = vector_store.search_vector_index(vector, max(limit * 20, 100))
     if not vector_rows.get("ok") or not vector_rows.get("rows"):
         return []
     score_by_chunk = {str(row["chunk_id"]): row for row in vector_rows["rows"]}
@@ -500,6 +541,36 @@ def expand_section_context(
     return expanded
 
 
+# A chunk that ends announcing what follows («主要在三个方面：») was cut before its list.
+CONTINUATION_ENDING = re.compile(r"(?:[:：]|如下)\s*$")
+
+CONTINUATION_MAX_CHARS = 1500
+
+
+def attach_continuations(conn: sqlite3.Connection, ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join the next chunk of the same document to a chunk that ends with a colon, so the list it
+    introduces is part of the evidence; that next chunk then no longer appears on its own."""
+    attached: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for row in ranked:
+        if str(row.get("chunk_id")) in attached:
+            continue
+        item = row
+        if CONTINUATION_ENDING.search(str(row.get("text", ""))) and row.get("doc_id") is not None:
+            last_index = int(row.get("chunk_index", 0)) + len(row.get("context_chunk_ids") or [None]) - 1
+            following = conn.execute(
+                "SELECT chunk_id, text FROM chunks WHERE doc_id = ? AND chunk_index = ?",
+                (row["doc_id"], last_index + 1),
+            ).fetchone()
+            if following is not None and len(str(following["text"])) <= CONTINUATION_MAX_CHARS:
+                item = row.copy()
+                item["text"] = f"{row['text']}\n{following['text']}"
+                item["continuation_chunk_id"] = str(following["chunk_id"])
+                attached.add(str(following["chunk_id"]))
+        result.append(item)
+    return result
+
+
 def rerank(rows: list[dict[str, Any]], question: str, limit: int, config: dict[str, str] | None = None) -> list[dict[str, Any]]:
     terms = candidate_terms(question)
     query_embedding = local_embedding(question)
@@ -591,15 +662,18 @@ def search(
         search_question = retrieval_question_with_aliases(question)
         route = model_capabilities.classify_query(question, config)
         search_limit = max(limit, ITERATIVE_RETRIEVAL_LIMIT) if iterative_retrieval_question(question) else limit
+        vector = query_vector(conn, search_question, config)
         rows = [
-            *external_vector_candidates(conn, search_question, search_limit, config),
+            *external_vector_candidates(conn, search_question, search_limit, config, vector),
             *fts_candidates(conn, search_question, search_limit),
             *semantic_candidates(conn, search_question, search_limit, metadata),
             *fallback_like_candidates(conn, search_question, search_limit),
         ]
+        rows = score_with_vectors(rows, vector)
         ranked = rerank(rows, search_question, search_limit, config)
         ranked = expand_fft_manual_table_context(conn, ranked, question)
         ranked = expand_section_context(conn, ranked, question)
+        ranked = attach_continuations(conn, ranked)
         metadata = {
             **metadata,
             "query_route": json.dumps(route, ensure_ascii=False),

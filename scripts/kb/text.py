@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from html import unescape
 import re
+from typing import Any
 
 
 TRAD_TO_SIMP = str.maketrans(
@@ -61,11 +62,17 @@ TRAD_TO_SIMP = str.maketrans(
 TRAD_PHRASES = {"通訊": "通信"}
 
 
-def to_simplified(text: str) -> str:
-    try:
-        from opencc import OpenCC  # type: ignore
+_T2S_CONVERTER: Any = None
 
-        return OpenCC("t2s").convert(text)
+
+def to_simplified(text: str) -> str:
+    global _T2S_CONVERTER
+    try:
+        if _T2S_CONVERTER is None:
+            from opencc import OpenCC  # type: ignore
+
+            _T2S_CONVERTER = OpenCC("t2s")  # loading the dictionaries once, not on every call
+        return _T2S_CONVERTER.convert(text)
     except Exception:
         for traditional, simplified in TRAD_PHRASES.items():
             text = text.replace(traditional, simplified)

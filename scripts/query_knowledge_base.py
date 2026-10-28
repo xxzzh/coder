@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import http.client
 import json
 import re
 import sqlite3
@@ -137,6 +138,7 @@ from kb.relevance import (  # noqa: F401  (re-exported for callers of this modul
     VERSIONED_NAME_PATTERN,
     ascii_term_pattern,
     content_coverage,
+    covering_row_index,
     knowledge_text,
     local_result_is_relevant,
     query_content_units,
@@ -261,7 +263,7 @@ project_runtime.apply_project_runtime_env()
 HOT_QUERY_THRESHOLD = 2
 CACHE_TTL_SECONDS = 3600
 NEGATIVE_CACHE_TTL_SECONDS = 120
-CACHE_VARIANT_VERSION = "retrieval-v56:process-sections-offline-translation"
+CACHE_VARIANT_VERSION = "retrieval-v57:mixed-documents"
 # Answers built without a model (layout, gate, cited evidence). Raising it refreshes cached local
 # answers only; cached API answers stay valid and are not paid for again.
 LOCAL_ANSWER_VERSION = "local-v3"
@@ -1059,7 +1061,9 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
         return result
 
     verified_suggestions = verified_local_suggestions(db_path, question, guidance_query_subject(question))
-    if station_test_item_question(question) and requested_station_name(question) and verified_suggestions:
+    # Only a request for a station's item list («SFT 有哪些测试项»): «X测试项目前是什么状态» asks
+    # about one item's status, not about a station called X.
+    if station_test_item_question(question) and enumeration_or_list_question(question) and requested_station_name(question) and verified_suggestions:
         result = no_local_answer(
             use_web,
             question,
@@ -1090,8 +1094,9 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
                 agent_max_rounds(config),
                 agent_evidence_max_items(config),
             )
-        except (agentic_retrieval.AgentError, RuntimeError, OSError, ValueError, KeyError) as exc:
-            # Unusable reply, timeout or network failure: answer locally instead.
+        except (agentic_retrieval.AgentError, RuntimeError, OSError, ValueError, KeyError, http.client.HTTPException) as exc:
+            # Unusable reply, timeout or network failure (a connection dropped mid-reply raises
+            # IncompleteRead, an HTTPException): answer locally instead.
             agent_error = human_text(str(exc), max_len=240)
         else:
             if outcome.decision == "answer":
@@ -1135,7 +1140,13 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
             result = augment_with_web(question, result, limit)
         return finalize_answer(question, result, config, allow_api)
 
-    if not local_result_is_relevant(rows, question, db_path):
+    covering = covering_row_index(rows, question, db_path)
+    if covering is not None and covering > 0 and rows[covering].get("doc_id") != rows[0].get("doc_id"):
+        # The answer starts from the document that covers the question, not from another document
+        # ranked above it (a fixture list above the limits the question asks for). Within one
+        # document the ranking stays: its top chunk often answers in words the gate does not count.
+        rows = [rows[covering], *rows[:covering], *rows[covering + 1 :]]
+    if covering is None:
         missing = unknown_names(question, db_path)
         result = no_local_answer(
             use_web,

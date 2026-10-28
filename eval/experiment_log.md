@@ -41,3 +41,9 @@
 | 2026-10-28 | 20261028-140817-extract-v2-local | extract-v2: PDF OCR per page without repeats, Chinese OCR without spaces, passwords hidden; 145 items | b5fa814+dirty | 64.3% | 83.9% | 0.716 | 82.3% | 84.8% | 72.3% | 81.8% | 454 |
 | 2026-10-28 | 20261028-142030-extract-v2b-local | extract-v2 with Excel password hiding limited to header-named columns; 145 items | b5fa814+dirty | 64.3% | 83.9% | 0.716 | 82.3% | 84.8% | 73.2% | 81.8% | 400 |
 | 2026-10-28 | 20261028-142416-extract-v2b-api | API mode on 11 documents (ASUS pending review); 145 items | b5fa814+dirty | 64.3% | 83.9% | 0.716 | 82.3% | 92.0% | 89.3% | 100.0% | 3592 |
+| 2026-10-28 | 20261028-151008-step3-local | step 3: gate (t2s, document names, hyphenated ids), table headers, continuations, unified vector scores, per-document FTS cap | 60907ef+dirty | 66.1% | 84.8% | 0.729 | 83.9% | 92.0% | 78.6% | 84.8% | 539 |
+| 2026-10-28 | 20261028-151441-step3-api | step 3 changes, API mode | 60907ef+dirty | 66.1% | 84.8% | 0.729 | 83.9% | 92.0% | 89.3% | 97.0% | 3734 |
+| 2026-10-28 | 20261028-152528-step3b-local | step 3: answer starts from the covering chunk; station item-list rule only for list questions | 60907ef+dirty | 66.1% | 84.8% | 0.729 | 83.9% | 92.9% | 78.6% | 84.8% | 412 |
+| 2026-10-28 | 20261028-152919-step3c-local | step 3: answer starts from the covering chunk only when another document outranks it | 60907ef+dirty | 66.1% | 84.8% | 0.729 | 83.9% | 92.9% | 80.4% | 84.8% | 548 |
+| 2026-10-28 | 20261028-153643-step3-final-local | step 3 final, local | 60907ef+dirty | 66.1% | 84.8% | 0.729 | 83.9% | 92.9% | 81.2% | 84.8% | 539 |
+| 2026-10-28 | 20261028-154028-step3-final-api | step 3 final, API | 60907ef+dirty | 66.1% | 84.8% | 0.729 | 83.9% | 92.0% | 90.2% | 97.0% | 5123 |

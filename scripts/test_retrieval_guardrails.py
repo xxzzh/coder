@@ -824,6 +824,7 @@ AcWing 是一个算法交流平台。
     check_unknown_names()
     check_agent_loop()
     check_ocr_pipeline()
+    check_mixed_documents()
     check_xlsx_drawings()
     check_offline_translation_setup()
     check_process_answers()
@@ -1357,6 +1358,27 @@ def check_structured_xlsx() -> None:
     assert query_module.enumeration_or_list_question("SFT主板功能测试包含哪些测试项")
     assert [row["chunk_id"] for row in query_module.rerank(candidates, "组一包含哪些测试项", 2, {})] == ["overview", "row"]
     assert [row["chunk_id"] for row in query_module.rerank(candidates, "组一的测试门限", 2, {})] == ["row", "overview"]
+
+
+def check_mixed_documents() -> None:
+    """Rules for a knowledge base that mixes traditional-Chinese sheets, several projects and long tables."""
+    from kb import relevance, retrieval
+    from kb_ingest import chunking
+
+    # Questions are typed in simplified Chinese; a traditional-Chinese SOP still covers them.
+    units = relevance.query_content_units("网卡测试下限")
+    assert relevance.content_coverage(units, "某型網卡測試下限值") == 1.0
+    # A hyphenated identifier is one name: TC-999 is not covered by the TC-001 every case carries.
+    assert ("ascii", "tc-999", 1.0) in relevance.query_content_units("测试用例TC-999的预期结果")
+    # A long Markdown table is chunked in row groups that each keep the section heading and header.
+    rows = "\n".join(f"| 项目{index} | " + "说明" * 40 + " |" for index in range(30))
+    groups = chunking.split_table_block(f"| 测试项 | 结论 |\n|---|---|\n{rows}", "## 总览")
+    assert len(groups) > 1 and all(group.startswith("## 总览\n| 测试项 | 结论 |\n|---|---|\n") for group in groups)
+    # A row that leaves its first cell empty belongs to the group above it.
+    lines = [line for line, _ in query_module.evidence_lines("| 节点 | 字段 |\n|---|---|\n| GroupCfg | PathField |\n| | Timeout |")]
+    assert "GroupCfg | Timeout" in lines, lines
+    # A chunk that ends announcing a list gets the next chunk joined to it.
+    assert retrieval.CONTINUATION_ENDING.search("具体来说主要在三个方面 :") and not retrieval.CONTINUATION_ENDING.search("已完成。")
 
 
 def check_block_citations() -> None:

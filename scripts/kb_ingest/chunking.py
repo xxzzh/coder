@@ -86,6 +86,11 @@ def semantic_units(text: str) -> list[str]:
             pending_heading = block
             continue
 
+        table_groups = split_table_block(block, pending_heading)
+        if table_groups:
+            units.extend(table_groups)
+            pending_heading = None
+            continue
         split_blocks = split_semantic_block(block)
         if pending_heading and split_blocks:
             split_blocks[0] = f"{pending_heading}\n{split_blocks[0]}"
@@ -95,6 +100,29 @@ def semantic_units(text: str) -> list[str]:
     if pending_heading:
         units.append(pending_heading)
     return units
+
+
+TABLE_SEPARATOR = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$")
+
+
+def split_table_block(block: str, heading: str | None = None) -> list[str]:
+    """A Markdown table too long for one chunk, as groups of rows that each repeat the section
+    heading and the table header: a row read on its own («| 项目甲 | … | 阻塞 |») otherwise loses
+    what its columns mean and which overview it belongs to. Empty for anything else."""
+    rows = [row.strip() for row in block.splitlines() if row.strip()]
+    if len(block) <= CHUNK_MAX_CHARS or len(rows) < 3 or not TABLE_SEPARATOR.match(rows[1]) or not all(row.startswith("|") for row in rows):
+        return []
+    context = "\n".join(part for part in [heading, rows[0], rows[1]] if part)
+    groups: list[str] = []
+    current: list[str] = []
+    for row in rows[2:]:
+        if current and len(context) + sum(len(item) + 1 for item in current) + len(row) > CHUNK_MAX_CHARS:
+            groups.append(context + "\n" + "\n".join(current))
+            current = []
+        current.append(row)
+    if current:
+        groups.append(context + "\n" + "\n".join(current))
+    return groups
 
 
 def split_semantic_block(block: str) -> list[str]:
