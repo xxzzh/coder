@@ -475,8 +475,15 @@ def page_html() -> str:
       padding: 0;
       list-style: none;
     }
-    .answer-list.answer-list-wide {
+    .answer-list.answer-list-wide,
+    .answer-list.answer-steps {
       grid-template-columns: 1fr;
+    }
+    .answer-steps li {
+      padding-left: 0;
+    }
+    .answer-steps li::before {
+      display: none;
     }
     .answer-code {
       margin: 8px 0 0;
@@ -1077,22 +1084,26 @@ def page_html() -> str:
           // stays a plain paragraph even when it ends with "：".
           const opening = !container.childElementCount && !paragraph.length;
           const next = lines[index + 1] || '';
-          const startsGroup = /^[-*•]\\s+/.test(next) || next.startsWith('```');
+          // "1. " / "2、" lines are steps in order (not "2.5V"); they keep their numbers in one column.
+          const isBullet = (text) => /^[-*•]\\s+/.test(text);
+          const isStep = (text) => /^\\d{1,2}[.、](?!\\d)\\s*\\S/.test(text);
+          const startsGroup = isBullet(next) || isStep(next) || next.startsWith('```');
           const bare = line.replace(/\\s*\\[\\d+\\]$/, '');
-          const groupName = !opening && startsGroup && !/^[-*•]\\s+/.test(line) && line.length <= 40 && (/[：:]$/.test(bare) || !/[。！？；，,.!?;]$/.test(bare));
+          const groupName = !opening && startsGroup && !isBullet(line) && !isStep(line) && line.length <= 40 && (/[：:]$/.test(bare) || !/[。！？；，,.!?;]$/.test(bare));
           if (groupName) {
             flush();
             list = null;
             addAnswerParagraph(container, line, 'answer-heading');
-          } else if (/^[-*•]\\s+/.test(line)) {
+          } else if (isBullet(line) || isStep(line)) {
             flush();
-            if (!list) {
+            const className = isStep(line) ? 'answer-list answer-steps' : 'answer-list';
+            if (!list || list.className !== className) {
               list = document.createElement('ul');
-              list.className = 'answer-list';
+              list.className = className;
               container.appendChild(list);
             }
             const row = document.createElement('li');
-            appendAnswerText(row, line.replace(/^[-*•]\\s+/, ''));
+            appendAnswerText(row, isStep(line) ? line : line.replace(/^[-*•]\\s+/, ''));
             list.appendChild(row);
           } else {
             list = null;
