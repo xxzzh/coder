@@ -163,6 +163,13 @@ def validate(eval_set: list[dict[str, Any]], raw_dir: Path = RAW_DIR, db_path: P
                 warnings.append(f"{item_id}: gold doc not in raw dir, item skipped: {missing_docs}")
             else:
                 texts = {doc: raw_text(raw_files[doc]) for doc in docs}
+                # A scanned PDF has no text layer for the independent reader; its words exist only as
+                # the OCR text in the index, so the keywords are checked there instead.
+                scanned = [doc for doc, text in texts.items() if text == "" and indexed.get(doc)]
+                for doc in scanned:
+                    texts[doc] = indexed[doc]
+                if scanned:
+                    warnings.append(f"{item_id}: no text layer in {scanned}, keywords checked against the indexed OCR text")
                 unreadable = [doc for doc, text in texts.items() if text is None]
                 if unreadable:
                     warnings.append(f"{item_id}: no independent reader for {unreadable}, keywords not verified")

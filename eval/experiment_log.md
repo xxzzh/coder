@@ -37,3 +37,7 @@
 | 2026-10-26 | 20261026-152719-process-sections-local | 流程类问题（流程/步骤/机制…）的补充章节整节展示（≤900 字）并单独成列表，不再截成 300 字片段：B10 答案覆盖 0.6→1.0，D01 多出完整的补充章节，其余答案不变 | d92583e+dirty | 76.4% | 92.7% | 0.813 | 91.0% | 89.1% | 76.4% | 79.2% | 341 |
 | 2026-10-27 | 20261027-161622-api-recheck | API mode full re-run, compare with 10-26 | cce1b5f | 75.4% | 93.0% | 0.811 | 91.3% | 100.0% | 93.0% | 95.8% | 5233 |
 | 2026-10-27 | 20261027-162414-api-polish-rules | API polish rules: numbered steps, values as written, refuse when only related | cce1b5f+dirty | 75.4% | 93.0% | 0.811 | 91.3% | 100.0% | 98.2% | 100.0% | 4342 |
+| 2026-10-28 | 20261028-111927-new-docs-local | 9 new documents indexed (ASUS requirement pending review); eval set 145 items | b5fa814+dirty | 64.3% | 84.8% | 0.718 | 82.9% | 84.8% | 73.2% | 81.8% | 455 |
+| 2026-10-28 | 20261028-140817-extract-v2-local | extract-v2: PDF OCR per page without repeats, Chinese OCR without spaces, passwords hidden; 145 items | b5fa814+dirty | 64.3% | 83.9% | 0.716 | 82.3% | 84.8% | 72.3% | 81.8% | 454 |
+| 2026-10-28 | 20261028-142030-extract-v2b-local | extract-v2 with Excel password hiding limited to header-named columns; 145 items | b5fa814+dirty | 64.3% | 83.9% | 0.716 | 82.3% | 84.8% | 73.2% | 81.8% | 400 |
+| 2026-10-28 | 20261028-142416-extract-v2b-api | API mode on 11 documents (ASUS pending review); 145 items | b5fa814+dirty | 64.3% | 83.9% | 0.716 | 82.3% | 92.0% | 89.3% | 100.0% | 3592 |

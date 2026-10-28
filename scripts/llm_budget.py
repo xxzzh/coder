@@ -35,6 +35,7 @@ TASKS: dict[str, dict[str, Any]] = {
     "summary": {"max_tokens": 2000, "thinking": "config", "pro_allowed": True},  # grounded answer from citations or web pages
     "rerank": {"max_tokens": 400, "thinking": "disabled", "pro_allowed": False},  # a JSON array of chunk ids
     "connection_test": {"max_tokens": 16, "thinking": "disabled", "pro_allowed": False},
+    "judge": {"max_tokens": 300, "thinking": "disabled", "pro_allowed": False},  # eval/judge.py: a JSON verdict per answer
     "chat": {"max_tokens": 2000, "thinking": "config", "pro_allowed": False},  # any other caller
 }
 
