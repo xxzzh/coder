@@ -8,7 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from kb.text import to_simplified
+from kb.text import to_simplified, traditional_variants
 from kb.terms import CONCEPT_SYNONYMS, ENGLISH_QUERY_STOP_WORDS, QUESTION_FUNCTION_PHRASES, abbreviation_query_term, iterative_retrieval_question, normalized_retrieval_question
 
 
@@ -21,6 +21,10 @@ LOCAL_CONTENT_COVERAGE_THRESHOLD = 0.5
 # quarter of the index. When every name in a question is that broad, the evidence must also
 # cover the question's Chinese part (what is asked about the name), at least half of it.
 BROAD_NAME_SHARE = 0.10
+
+# ... or in at least this many chunks, whatever the share: a large document that never mentions
+# the name (a 960-chunk requirement workbook) lowers its share without making it any narrower.
+BROAD_NAME_CHUNKS = 200
 
 # A two-character term found in at least half of the chunks (测试 in an index of test documents)
 # says nothing about what is asked; checks of the asked part ignore it.
@@ -37,7 +41,7 @@ VERSIONED_NAME_PATTERN = re.compile(
 
 KNOWLEDGE_TEXT_CACHE: dict[str, tuple[str, str]] = {}
 CHUNK_TEXTS_CACHE: dict[str, tuple[str, list[str]]] = {}
-NAME_SHARE_CACHE: dict[tuple[str, str, str], float] = {}
+NAME_SHARE_CACHE: dict[tuple[str, str, str], tuple[int, int]] = {}
 TERM_SHARE_CACHE: dict[tuple[str, str, str], float] = {}
 
 
@@ -103,6 +107,10 @@ def content_coverage(units: list[tuple[str, str, float]], text: str) -> float:
         elif kind == "concept":
             if any(concept_variant_found(variant, lowered, compact) for variant in term.split("|")):
                 matched += weight
+        elif kind == "version":
+            word, version = term.split(" ", 1)
+            if re.search(rf"(?<![a-z0-9]){re.escape(word)}\s*{re.escape(version)}(?![a-z0-9]|\.\d)", lowered):
+                matched += weight
         elif term in compact:
             matched += weight
     return matched / total
@@ -167,28 +175,43 @@ def chunk_texts(db_path: Path) -> list[str]:
     return texts
 
 
-def name_share(term: str, db_path: Path) -> float:
-    """Share of the index's chunks that mention a Latin-script name."""
+def name_chunks(term: str, db_path: Path) -> tuple[int, int]:
+    """How many of the index's chunks mention a Latin-script name, and how many chunks there are."""
     try:
         key, stamp = index_stamp(db_path)
         cache_key = (key, stamp, term)
         if cache_key not in NAME_SHARE_CACHE:
             texts = chunk_texts(db_path)
             pattern = ascii_term_pattern(term)
-            NAME_SHARE_CACHE[cache_key] = sum(bool(pattern.search(text)) for text in texts) / len(texts) if texts else 0.0
+            NAME_SHARE_CACHE[cache_key] = (sum(bool(pattern.search(text)) for text in texts), len(texts))
         return NAME_SHARE_CACHE[cache_key]
     except sqlite3.DatabaseError:
-        return 0.0
+        return 0, 0
+
+
+def name_share(term: str, db_path: Path) -> float:
+    """Share of the index's chunks that mention a Latin-script name."""
+    mentioning, total = name_chunks(term, db_path)
+    return mentioning / total if total else 0.0
+
+
+def name_is_broad(term: str, db_path: Path) -> bool:
+    mentioning, total = name_chunks(term, db_path)
+    return bool(total) and (mentioning / total >= BROAD_NAME_SHARE or mentioning >= BROAD_NAME_CHUNKS)
 
 
 def term_share(term: str, db_path: Path) -> float:
-    """Share of the index's chunks containing a Chinese term."""
+    """Share of the index's chunks containing a Chinese term, in simplified or traditional form
+    (测试 or 測試: a traditional-Chinese sheet does not make 测试 any rarer)."""
     try:
         key, stamp = index_stamp(db_path)
         cache_key = (key, stamp, term)
         if cache_key not in TERM_SHARE_CACHE:
             texts = chunk_texts(db_path)
-            TERM_SHARE_CACHE[cache_key] = sum(term in "".join(text.split()) for text in texts) / len(texts) if texts else 0.0
+            forms = (term, *traditional_variants(term))
+            TERM_SHARE_CACHE[cache_key] = (
+                sum(any(form in compact for form in forms) for compact in ("".join(text.split()) for text in texts)) / len(texts) if texts else 0.0
+            )
         return TERM_SHARE_CACHE[cache_key]
     except sqlite3.DatabaseError:
         return 0.0
@@ -217,17 +240,29 @@ def required_parts(question: str, units: list[tuple[str, str, float]], db_path: 
             parts.append(asked)
     support = SUPPORT_QUESTION_PATTERN.search(normalized_retrieval_question(question))
     if support:
-        supported = asked_part(query_content_units(support.group(1)), db_path)
-        supported += [unit for unit in query_content_units(support.group(1)) if unit[0] == "ascii"]
+        supported_units = query_content_units(support.group(1))
+        # Windows 7 with its version: a chunk about Windows power settings says nothing about Windows 7.
+        versions = versioned_units(support.group(1))
+        versioned = {term.split()[0] for _, term, _ in versions}
+        supported = asked_part(supported_units, db_path) + versions
+        supported += [unit for unit in supported_units if unit[0] == "ascii" and unit[1] not in versioned]
         if supported:
             parts.append(supported)
     return parts
 
 
+def versioned_units(text: str) -> list[tuple[str, str, float]]:
+    """Each name followed by a version (Windows 7, MES 2.0) as one unit, found only with that version."""
+    return [
+        ("version", f"{match.group(1).lower()} {(match.group(2) or match.group(3)).lower()}", 1.0)
+        for match in VERSIONED_NAME_PATTERN.finditer(normalized_retrieval_question(text))
+    ]
+
+
 def broad_names_only(units: list[tuple[str, str, float]], db_path: Path | None) -> bool:
     """The question names something, but only names too common to point at particular evidence."""
     names = [term for kind, term, _ in units if kind == "ascii"]
-    return bool(db_path is not None and names and all(name_share(name, db_path) >= BROAD_NAME_SHARE for name in names))
+    return bool(db_path is not None and names and all(name_is_broad(name, db_path) for name in names))
 
 
 def unknown_names(question: str, db_path: Path) -> list[str]:

@@ -879,6 +879,10 @@ def check_gate_synonyms() -> None:
     # A missing attribute still refuses: the subject alone covers only half of the question.
     units = relevance.query_content_units("SAMPLE01的售价是多少")
     assert relevance.content_coverage(units, "SAMPLE01 测试计划 封面") <= relevance.LOCAL_CONTENT_COVERAGE_THRESHOLD
+    # English test procedures name the command and its parameters in English.
+    units = relevance.query_content_units("样例睡眠测试的命令和参数是什么")
+    row_text = "Test subItem：样例 S3 | Test Procedure：Sleep time 60 sec | Command：sample.exe /sleep /c:5 | Parameter：/c count"
+    assert relevance.content_coverage(units, row_text) > relevance.LOCAL_CONTENT_COVERAGE_THRESHOLD, units
     # The excerpt picks the line saying the asked idea in the documents' words.
     table = "| 字段 | 说明 |\n| CaseTitle | 测试项标题 |\n| GroupNo | 分组号，相同值的测试项会并行执行 |"
     assert "并行" in citations.citation_for_text(table, "怎么让两个测试项同时执行"), citations.citation_for_text(table, "怎么让两个测试项同时执行")
@@ -915,6 +919,27 @@ def check_gate_asked_part() -> None:
         # 「X支持Y吗」 needs Y in the evidence.
         assert not relevance.local_result_is_relevant([row("样例箱模式：循环执行测试")], "样例箱模式支持双屏测试吗", db_path)
         assert relevance.local_result_is_relevant([row("样例箱模式支持并行测试，组号相同即可")], "样例箱模式支持并行测试吗", db_path)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # A large document that never mentions SAMPLEFW (2100 chunks, written in traditional Chinese)
+        # lowers its share below 10% but leaves it as broad as before: 200 chunks still mention it,
+        # and 測試 still makes 测试 a word nearly every chunk contains.
+        db_path = Path(temp_dir) / "knowledge.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript("CREATE TABLE chunks (text TEXT); CREATE TABLE metadata (key TEXT, value TEXT);")
+        texts = [f"SAMPLEFW 测试说明第 {index} 节" for index in range(relevance.BROAD_NAME_CHUNKS)]
+        texts += [f"樣例需求 測試記錄 {index}" for index in range(2100)] + ["样例框架支持 Windows 7 与 Windows 10"]
+        conn.executemany("INSERT INTO chunks (text) VALUES (?)", [(text,) for text in texts])
+        conn.execute("INSERT INTO metadata VALUES ('indexed_at', 't2')")
+        conn.commit()
+        conn.close()
+        assert relevance.name_share("samplefw", db_path) < relevance.BROAD_NAME_SHARE and relevance.name_is_broad("samplefw", db_path)
+        assert relevance.term_share("测试", db_path) >= relevance.UBIQUITOUS_TERM_SHARE
+        assert not relevance.local_result_is_relevant([row("SAMPLEFW 测试覆盖说明")], "SAMPLEFW的单元测试覆盖率是多少", db_path)
+        # 「X支持Y 7吗」 needs Y with its version: Windows power settings say nothing about Windows 7.
+        question = "样例框架支持Windows 7吗"
+        assert not relevance.local_result_is_relevant([row("样例框架启动前确认 Windows 电源策略")], question, db_path)
+        assert relevance.local_result_is_relevant([row("样例框架支持 Windows 7 与 Windows 10")], question, db_path)
 
 
 def check_local_evidence_blocks() -> None:
@@ -1379,6 +1404,18 @@ def check_mixed_documents() -> None:
     assert "GroupCfg | Timeout" in lines, lines
     # A chunk that ends announcing a list gets the next chunk joined to it.
     assert retrieval.CONTINUATION_ENDING.search("具体来说主要在三个方面 :") and not retrieval.CONTINUATION_ENDING.search("已完成。")
+    # A question naming a document by its file name (two of its words, or a whole Chinese run of four
+    # or more characters) is answered from that document before others that only mention the same tool.
+    files = {"Release_Table_Sample_V1.0.xlsx", "Sample_Test_Requirement_v0.1.xlsx", "LCT_003 样例装备测试计划_V3.xlsx"}
+    assert retrieval.named_documents("Release Table里sample.exe是什么版本", files) == {"Release_Table_Sample_V1.0.xlsx"}
+    assert retrieval.named_documents("样例装备测试计划里风扇门限是多少", files) == {"LCT_003 样例装备测试计划_V3.xlsx"}
+    assert not retrieval.named_documents("Release版本是多少", files) and not retrieval.named_documents("装备测试有哪些", files)
+    candidates = [
+        {"chunk_id": "requirement", "file_name": "Sample_Test_Requirement_v0.1.xlsx", "text": "sample.exe 的版本以发布记录为准", "semantic_score": 0.70},
+        {"chunk_id": "release", "file_name": "Release_Table_Sample_V1.0.xlsx", "text": "File Name：sample.exe | 版本：1.2.3", "semantic_score": 0.66},
+    ]
+    assert [row["chunk_id"] for row in query_module.rerank(candidates, "Release Table里sample.exe是什么版本", 2, {})][0] == "release"
+    assert [row["chunk_id"] for row in query_module.rerank(candidates, "sample.exe是什么版本", 2, {})][0] == "requirement"
 
 
 def check_block_citations() -> None:

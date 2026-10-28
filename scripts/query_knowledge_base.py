@@ -263,7 +263,7 @@ project_runtime.apply_project_runtime_env()
 HOT_QUERY_THRESHOLD = 2
 CACHE_TTL_SECONDS = 3600
 NEGATIVE_CACHE_TTL_SECONDS = 120
-CACHE_VARIANT_VERSION = "retrieval-v57:mixed-documents"
+CACHE_VARIANT_VERSION = "retrieval-v58:named-documents"
 # Answers built without a model (layout, gate, cited evidence). Raising it refreshes cached local
 # answers only; cached API answers stay valid and are not paid for again.
 LOCAL_ANSWER_VERSION = "local-v3"

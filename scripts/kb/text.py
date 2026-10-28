@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from html import unescape
 import re
 from typing import Any
@@ -77,6 +78,27 @@ def to_simplified(text: str) -> str:
         for traditional, simplified in TRAD_PHRASES.items():
             text = text.replace(traditional, simplified)
         return text.translate(TRAD_TO_SIMP)
+
+
+SIMP_TO_TRAD = str.maketrans({simplified: chr(traditional) for traditional, simplified in TRAD_TO_SIMP.items()})
+
+_S2T_CONVERTERS: Any = None
+
+
+@lru_cache(maxsize=8192)
+def traditional_variants(text: str) -> tuple[str, ...]:
+    """Text as Traditional-Chinese documents write it (風扇 for 风扇), in OpenCC's standard forms and in
+    Taiwan's (為, 裡); only forms that differ from the text."""
+    global _S2T_CONVERTERS
+    try:
+        if _S2T_CONVERTERS is None:
+            from opencc import OpenCC  # type: ignore
+
+            _S2T_CONVERTERS = [OpenCC("s2t"), OpenCC("s2tw")]
+        variants = [converter.convert(text) for converter in _S2T_CONVERTERS]
+    except Exception:
+        variants = [text.translate(SIMP_TO_TRAD)]
+    return tuple(dict.fromkeys(variant for variant in variants if variant != text))
 
 
 def strip_markdown_emphasis(text: str) -> str:

@@ -43,6 +43,10 @@ TABLE_OVERVIEW_MARKER = " 概览 | "
 
 OVERVIEW_LIST_BOOST = 1.1
 
+# A question that names a document by its file name (Release Table里…, 装备测试计划里…) asks about that
+# document: its chunks rank above other documents' chunks that only mention the same things.
+NAMED_DOCUMENT_BOOST = 1.15
+
 # Hybrid rerank weights, chosen with eval/tune_weights.py (two-fold validation on the local eval set,
 # with the corrected bm25 normalisation): MRR 0.759 -> 0.813, Hit@1 0.727 -> 0.764, Hit@5 0.836 -> 0.927
 # against the original 0.48 / 0.34 / 0.18.
@@ -571,10 +575,27 @@ def attach_continuations(conn: sqlite3.Connection, ranked: list[dict[str, Any]])
     return result
 
 
+def named_documents(question: str, file_names: set[str]) -> set[str]:
+    """File names the question names: two consecutive words of the name (Release Table), or one of
+    its Chinese runs of at least four characters as a whole (装备测试计划)."""
+    lowered = re.sub(r"[\s_\-]+", " ", question.lower())
+    compact = lowered.replace(" ", "")
+    named = set()
+    for file_name in file_names:
+        stem = Path(file_name).stem
+        words = [word.lower() for word in re.findall(r"[A-Za-z]{2,}", stem)]
+        pairs = [f"{left} {right}" for left, right in zip(words, words[1:])]
+        runs = re.findall(r"[\u4e00-\u9fff]{4,}", stem)
+        if any(pair in lowered or pair.replace(" ", "") in compact for pair in pairs) or any(run in question for run in runs):
+            named.add(file_name)
+    return named
+
+
 def rerank(rows: list[dict[str, Any]], question: str, limit: int, config: dict[str, str] | None = None) -> list[dict[str, Any]]:
     terms = candidate_terms(question)
     query_embedding = local_embedding(question)
     list_question = enumeration_or_list_question(question)
+    named = named_documents(question, {str(row.get("file_name", "")) for row in rows})
     merged: dict[str, dict[str, Any]] = {}
 
     for row in rows:
@@ -622,6 +643,8 @@ def rerank(rows: list[dict[str, Any]], question: str, limit: int, config: dict[s
             # A table overview lists every item of a group in one chunk; for "which items" questions
             # it beats any single row of that group.
             item["rerank_score"] = round(item["rerank_score"] * OVERVIEW_LIST_BOOST, 6)
+        if str(item.get("file_name", "")) in named:
+            item["rerank_score"] = round(item["rerank_score"] * NAMED_DOCUMENT_BOOST, 6)
         item["semantic_score"] = round(semantic_score, 6)
         item["keyword_score"] = round(term_score, 6)
         item["fts_score"] = round(fts_score, 6)

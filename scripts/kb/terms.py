@@ -60,15 +60,20 @@ CONCEPT_SYNONYMS: dict[str, tuple[str, ...]] = {
     "工具": ("工具", "tool"),
     "手册": ("手册", "handbook", "manual"),
     "老化": ("老化", "aging", "run-in", "runin"),
+    "命令": ("命令", "指令", "command", "cmd"),
+    "参数": ("参数", "parameter", "argument"),
+    "睡眠": ("睡眠", "sleep", "suspend"),
+    "摄像头": ("摄像头", "镜头", "camera"),
     # A book's chapters are named 「…篇」, never 「篇章」.
     "篇章": ("篇章", "章节", "篇"),
 }
 
 # Phrases users say that production documents write differently, so searching with the user's
 # word alone never reaches the evidence (操作员 -> 测试人力, 节拍 -> UPH / 测试时间, 老化 -> Aging in
-# the English-titled test flows). Only these widen the search; widening a phrase the documents do
-# use (目录, 同时执行) just adds ranking noise.
-SEARCH_EXPANDED_PHRASES = ("操作员", "节拍", "老化")
+# the English-titled test flows, 摄像头 -> Camera in English and Traditional-Chinese test requirements).
+# Only these widen the search; widening a phrase the documents do use (目录, 同时执行) just adds
+# ranking noise.
+SEARCH_EXPANDED_PHRASES = ("操作员", "节拍", "老化", "摄像头")
 
 STOP_WORDS = {
     "什么",

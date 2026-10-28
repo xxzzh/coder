@@ -47,3 +47,8 @@
 | 2026-10-28 | 20261028-152919-step3c-local | step 3: answer starts from the covering chunk only when another document outranks it | 60907ef+dirty | 66.1% | 84.8% | 0.729 | 83.9% | 92.9% | 80.4% | 84.8% | 548 |
 | 2026-10-28 | 20261028-153643-step3-final-local | step 3 final, local | 60907ef+dirty | 66.1% | 84.8% | 0.729 | 83.9% | 92.9% | 81.2% | 84.8% | 539 |
 | 2026-10-28 | 20261028-154028-step3-final-api | step 3 final, API | 60907ef+dirty | 66.1% | 84.8% | 0.729 | 83.9% | 92.0% | 90.2% | 97.0% | 5123 |
+| 2026-10-28 | 20261028-163011-asus-local | 12 documents: ASUS requirement workbook approved and indexed; local | 0aac11a+dirty | 66.1% | 86.6% | 0.739 | 85.4% | 92.9% | 80.4% | 75.8% | 918 |
+| 2026-10-28 | 20261028-163455-asus-api | 12 documents: ASUS requirement workbook approved and indexed; API | 0aac11a+dirty | 66.1% | 86.6% | 0.739 | 85.4% | 96.4% | 91.1% | 100.0% | 4421 |
+| 2026-10-28 | 20261028-164825-asus-fix-local | ASUS indexed; broad names by count too, traditional-Chinese search terms (dropped after an A/B run without them: 85 vs 83 judged correct, C10 and C33 back), named-document boost, versioned support questions, command/parameter/sleep/camera synonyms; local | 0aac11a+dirty | 67.9% | 87.5% | 0.756 | 85.6% | 92.9% | 81.2% | 87.9% | 860 |
+| 2026-10-28 | 20261028-170234-asus-final-local | ASUS indexed; broad names by chunk count too, common-word share counts traditional forms, named-document boost, versioned support questions, command/parameter/sleep/camera synonyms; local | 0aac11a+dirty | 67.0% | 87.5% | 0.748 | 86.3% | 92.9% | 81.2% | 84.8% | 844 |
+| 2026-10-28 | 20261028-170742-asus-final-api | same as asus-final-local; API | 0aac11a+dirty | 67.0% | 87.5% | 0.748 | 86.3% | 97.3% | 92.9% | 97.0% | 6089 |
