@@ -24,6 +24,7 @@ from kb_ingest.files import (  # noqa: F401  (re-exported for callers of this mo
     IngestAlreadyRunningError,
     PROCESSED_DIR,
     PROJECT_ROOT,
+    RAW_DIR,
     SMALL_FILE_HASH_BYTES,
     SUPPORTED,
     _pid_is_running,
@@ -377,7 +378,7 @@ def ingest(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Import local documents and build a SQLite FTS5 + embedding index.")
-    parser.add_argument("raw_dir", nargs="?", default="knowledge_base/raw")
+    parser.add_argument("raw_dir", nargs="?", default=str(RAW_DIR))
     parser.add_argument("--db", default=str(DB_PATH))
     parser.add_argument("--processed", default=str(PROCESSED_DIR))
     parser.add_argument("--rebuild", action="store_true", help="Drop generated index tables before importing.")

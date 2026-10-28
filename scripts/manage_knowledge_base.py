@@ -11,11 +11,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ingest_knowledge_base import DB_PATH, PROCESSED_DIR, IngestAlreadyRunningError, ingest
+from ingest_knowledge_base import DB_PATH, PROCESSED_DIR, PROJECT_ROOT, RAW_DIR, IngestAlreadyRunningError, ingest
 import vector_store
-
-
-RAW_DIR = Path("knowledge_base/raw")
 
 
 def metadata(conn: sqlite3.Connection) -> dict[str, str]:
@@ -86,12 +83,13 @@ def safe_remove_generated(db_path: Path, processed_dir: Path) -> None:
         processed_dir / "extraction_report.jsonl",
         processed_dir / "retrieval_quality_report.json",
     ]
+    # Only this install's generated files, wherever the command was started from.
     allowed_roots = [
-        (Path.cwd() / "knowledge_base" / "index").resolve(),
-        (Path.cwd() / "knowledge_base" / "processed").resolve(),
+        (PROJECT_ROOT / "knowledge_base" / "index").resolve(),
+        (PROJECT_ROOT / "knowledge_base" / "processed").resolve(),
     ]
     for target in targets:
-        resolved = (Path.cwd() / target).resolve() if not target.is_absolute() else target.resolve()
+        resolved = target.resolve()
         if not any(resolved == root or root in resolved.parents for root in allowed_roots):
             raise RuntimeError(f"Refusing to remove generated file outside knowledge_base: {resolved}")
         if resolved.exists() and resolved.is_file():

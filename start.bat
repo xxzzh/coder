@@ -1,6 +1,8 @@
 @echo off
 setlocal EnableExtensions
 chcp 65001 >nul
+rem Run from this install's folder, so a start from anywhere else uses this knowledge base.
+cd /d "%~dp0"
 
 set "ROOT=%~dp0"
 set "RAW=%ROOT%knowledge_base\raw"

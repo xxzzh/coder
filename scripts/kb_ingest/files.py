@@ -15,9 +15,12 @@ SUPPORTED = {".md", ".txt", ".doc", ".docx", ".pdf", ".xlsx"}
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]  # scripts/kb_ingest/files.py -> project root
 
-DB_PATH = Path("knowledge_base/index/knowledge.db")
+# From the install folder, not the current folder (see kb/config.py).
+DB_PATH = PROJECT_ROOT / "knowledge_base" / "index" / "knowledge.db"
 
-PROCESSED_DIR = Path("knowledge_base/processed")
+RAW_DIR = PROJECT_ROOT / "knowledge_base" / "raw"
+
+PROCESSED_DIR = PROJECT_ROOT / "knowledge_base" / "processed"
 
 SMALL_FILE_HASH_BYTES = 1024 * 1024
 

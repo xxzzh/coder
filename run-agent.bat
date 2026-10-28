@@ -1,6 +1,8 @@
 @echo off
 setlocal
 chcp 65001 >nul
+rem Run from this install's folder, so a start from anywhere else uses this knowledge base.
+cd /d "%~dp0"
 
 set "ROOT=%~dp0"
 set "INGEST=%ROOT%scripts\ingest_knowledge_base.py"

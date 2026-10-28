@@ -10,13 +10,15 @@ import llm_budget
 import model_capabilities
 
 
-DB_PATH = Path("knowledge_base/index/knowledge.db")
-
-RAW_DIR = Path("knowledge_base/raw")
-
-PROCESSED_DIR = Path("knowledge_base/processed")
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]  # scripts/kb/config.py -> project root
+
+# From the install folder, not the current folder: started from anywhere else, the tool would
+# read or rebuild another folder's knowledge_base.
+DB_PATH = PROJECT_ROOT / "knowledge_base" / "index" / "knowledge.db"
+
+RAW_DIR = PROJECT_ROOT / "knowledge_base" / "raw"
+
+PROCESSED_DIR = PROJECT_ROOT / "knowledge_base" / "processed"
 
 ENV_PATH = PROJECT_ROOT / ".env"
 
