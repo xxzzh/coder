@@ -24,7 +24,6 @@ ROOT_FILES = [
 ]
 
 ROOT_DIRS = [
-    "docs",
     "eval",
     "scripts",
     "test_materials",

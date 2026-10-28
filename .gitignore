@@ -21,3 +21,8 @@ require.txt
 
 # Packaged builds are published as GitHub Release assets, not committed.
 dist/
+
+# Presentation and competition materials stay on this machine; README is the project documentation.
+/本地知识库Agent演讲稿.md
+/本地知识库Agent介绍*.html
+/submission_assets/
