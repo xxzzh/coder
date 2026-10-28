@@ -1111,6 +1111,28 @@ def check_ocr_pipeline() -> None:
         assert abs(ingest_module.tsv_mean_confidence(tsv) - 80.0) < 1e-6  # weighted by characters: (90*4 + 60*2) / 6
         assert ingest_module.tsv_mean_confidence(Path(temp_dir) / "missing.tsv") == -1.0
 
+    # OCR of a page that has a text layer keeps only what the layer lacks: a line read again with a
+    # misread letter is dropped, the error code table drawn without a text layer stays.
+    from kb_ingest import pdf as pdf_module
+
+    layer = {1: "Connect the tester to port A and run the tool."}
+    ocr_text = "[ocr page 1]\nConnect the tester to p0rt A and run the tool.\nE12 reference file missing\n\n[ocr page 2]\nScanned page text"
+    kept = pdf_module.new_ocr_text(ocr_text, layer, {})
+    assert kept == "[ocr page 1]\nE12 reference file missing\n\n[ocr page 2]\nScanned page text", kept
+    # Readers after pdfplumber add only their missing lines, and a scanned page keeps everything.
+    assert pdf_module.lines_not_in("Port A limit -60\nChinese description", "port a limit -60") == "Chinese description"
+    assert pdf_module.lines_not_in("OK\nPass", "") == "OK\nPass"
+    # Chinese OCR loses the spaces Tesseract puts between characters; spaces next to Latin words stay.
+    assert ocr_module.close_cjk_gaps("过 去 两 年 ， Agent 基础 设施 2026 年") == "过去两年， Agent 基础设施 2026 年"
+    # Passwords and product keys never reach the index; the rest of the line stays.
+    from kb_ingest import secrets as secrets_module
+
+    assert secrets_module.redact_secrets("Password: abc123 for AAAAA-BBBBB-CCCCC-DDDDD-EEEEE") == "Password: [已隐去] for [已隐去]"
+    assert secrets_module.is_credential_label("Password") and secrets_module.is_credential_label("登录密码")
+    assert not secrets_module.is_credential_label("Username")
+    pages = pdf_module.text_by_page("[page 1]\nfirst\n\n[page 1 table 1]\na | b\n\n[page 2]\nsecond")
+    assert {number: text.split() for number, text in pages.items()} == {1: ["first", "a", "|", "b"], 2: ["second"]}, pages
+
 def check_agent_loop() -> None:
     """The agent answers from cited evidence, searches again when asked, and never ends a last round searching."""
     import agentic_retrieval as agent

@@ -11,6 +11,7 @@ from xml.etree import ElementTree as ET
 
 from kb_ingest.ocr import ocr_image_bytes
 from kb_ingest.reviews import extraction_report
+from kb_ingest.secrets import REDACTED, is_credential_label
 
 
 def _xlsx_shared_strings(zf: zipfile.ZipFile) -> list[str]:
@@ -238,7 +239,13 @@ def read_xlsx(path: Path) -> str:
         for sheet_name, sheet in sheets:
             root = ET.fromstring(zf.read(sheet))
             lines.append(f"工作表 {sheet_name}")
-            for row in root.findall(".//m:row", ns):
+            # Password columns as the table header names them (the header the record text uses too),
+            # so a dictionary that lists "Password" as an entry does not hide that whole column.
+            grid, inherited, merges = _xlsx_sheet_grid(root, ns, shared)
+            labels, last_header = _xlsx_header_labels(grid, inherited, merges) if grid else ({}, None)
+            secret_columns = {column for column, label in labels.items() if is_credential_label(label)}
+            for row_number, row in enumerate(root.findall(".//m:row", ns), start=1):
+                row_index = int(row.attrib.get("r", row_number))
                 cells: dict[int, str] = {}
                 for cell in row.findall("m:c", ns):
                     cell_type = cell.attrib.get("t")
@@ -254,6 +261,10 @@ def read_xlsx(path: Path) -> str:
                                 if 0 <= index < len(shared):
                                     value = shared[index]
                     cells[_xlsx_column_index(cell.attrib.get("r", "A1"))] = re.sub(r"\s*\r?\n\s*", " ", value).strip()
+                if last_header is not None and row_index > last_header:
+                    for column in secret_columns:
+                        if cells.get(column):
+                            cells[column] = REDACTED
                 if any(cell.strip() for cell in cells.values()):
                     lines.append(" | ".join(cells.get(index, "") for index in range(1, max(cells) + 1)))
     return "\n".join(lines)
@@ -463,6 +474,8 @@ def read_xlsx_records(path: Path) -> str:
                 parts: list[str] = []
                 for column, value in sorted(cells.items()):
                     label = labels.get(column, "")
+                    if is_credential_label(label) and label != value:
+                        value = REDACTED
                     part = f"{label}：{value}" if label and label != value else value
                     if part not in parts:  # a horizontal merge repeats one value across its columns
                         parts.append(part)

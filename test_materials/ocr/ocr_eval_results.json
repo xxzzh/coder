@@ -28,7 +28,7 @@
       "file": "scan_chinese_basic.pdf",
       "kind": "image_only_pdf",
       "description": "Clean Chinese scanned PDF.",
-      "text_chars": 161,
+      "text_chars": 119,
       "method": [
         "ocr_tesseract"
       ],
@@ -40,13 +40,13 @@
       "missed_phrases": [
         "水分条件"
       ],
-      "sample_text": "[ocr page 1]\n中 文 OCR 评测 材料\n\n水 循环 包括 蒸发 、 凝 结\n\n降水 、 径 流 和 地 下 水 补给\n\n数据 库 ACID 指 原子 性\n\n一 致 性 、 隔 离 性 和 持久 性\n\n光合 作用 受到 光照 强度\n\n二 氧化 碳 浓度 、 温 度 和 水\n\nNE\n\nJI AR\n\n件 影响 。"
+      "sample_text": "[ocr page 1]\n中文 OCR 评测材料\n\n水循环包括蒸发、凝结\n\n降水、径流和地下水补给\n\n数据库 ACID 指原子性\n\n一致性、隔离性和持久性\n\n光合作用受到光照强度\n\n二氧化碳浓度、温度和水\n\nNE\n\nJI AR\n\n件影响。"
     },
     {
       "file": "scan_mixed_table.pdf",
       "kind": "image_table_pdf",
       "description": "Scanned table with English and Chinese cells.",
-      "text_chars": 254,
+      "text_chars": 245,
       "method": [
         "ocr_tesseract"
       ],
@@ -56,7 +56,7 @@
       "matched_phrases": 17,
       "phrase_recall": 1.0,
       "missed_phrases": [],
-      "sample_text": "[ocr page 1]\nScanned Table OCR Evaluation\n\nConcept Key fact Value\n\nACID Atomicity Consistency Isolation Durability 4 properties\nOhm Voltage equals current times resistance V=IxR\nDNA A pairs with T and C pairs with G base pairing\n\n水 循环 蒸发 凝结 降水 径流 四 个 过 程"
+      "sample_text": "[ocr page 1]\nScanned Table OCR Evaluation\n\nConcept Key fact Value\n\nACID Atomicity Consistency Isolation Durability 4 properties\nOhm Voltage equals current times resistance V=IxR\nDNA A pairs with T and C pairs with G base pairing\n\n水循环蒸发凝结降水径流四个过程"
     },
     {
       "file": "scan_low_contrast.pdf",

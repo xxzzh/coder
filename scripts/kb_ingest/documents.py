@@ -9,8 +9,9 @@ from kb_ingest.chunking import normalize_text
 from kb_ingest.files import read_plain_text
 from kb_ingest.pdf import MIN_EXTRACTED_TEXT_CHARS, read_pdf, read_pdf_with_report
 from kb_ingest.reviews import extraction_report
+from kb_ingest.secrets import redact_secrets
 from kb_ingest.word import read_doc_with_report, read_docx, read_docx_with_report
-from kb_ingest.xlsx import read_xlsx, read_xlsx_with_report
+from kb_ingest.xlsx import CHUNK_TEXT_REPORT_KEY, read_xlsx, read_xlsx_with_report
 
 
 def read_document(path: Path) -> str:
@@ -44,6 +45,9 @@ def read_document_with_report(path: Path) -> tuple[str, dict[str, Any]]:
     else:
         raise ValueError(f"Unsupported file type: {path}")
 
+    text = redact_secrets(text)
+    if report.get(CHUNK_TEXT_REPORT_KEY):
+        report[CHUNK_TEXT_REPORT_KEY] = redact_secrets(report[CHUNK_TEXT_REPORT_KEY])
     report["text_chars"] = len(text)
     if len(normalize_text(text)) < MIN_EXTRACTED_TEXT_CHARS and suffix not in {".md", ".txt"}:
         report["warnings"].append("Extracted text is very short; source may be image-only, encrypted, or layout-heavy.")

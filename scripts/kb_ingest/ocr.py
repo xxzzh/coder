@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tempfile
@@ -66,16 +67,29 @@ def pdf_page_renderer() -> str | None:
     return "pypdfium2"
 
 
-def render_pdf_pages_for_ocr(path: Path, temp_dir: Path) -> list[Path]:
+def render_pdf_pages_for_ocr(path: Path, temp_dir: Path, pages: list[int] | None = None) -> list[Path]:
+    """Page images named page-0003.png by page number; `pages` (1-based) limits which are rendered."""
     renderer = pdf_page_renderer()
     if renderer == "pdftoppm":
-        output_prefix = temp_dir / "page"
-        subprocess.run(
-            [str(shutil.which("pdftoppm")), "-r", str(OCR_RENDER_DPI), "-png", str(path), str(output_prefix)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        if pages is None:
+            output_prefix = temp_dir / "page"
+            subprocess.run(
+                [str(shutil.which("pdftoppm")), "-r", str(OCR_RENDER_DPI), "-png", str(path), str(output_prefix)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return sorted(temp_dir.glob("page-*.png"))
+        for number in pages:
+            subprocess.run(
+                [
+                    str(shutil.which("pdftoppm")), "-r", str(OCR_RENDER_DPI), "-png", "-f", str(number), "-l", str(number),
+                    "-singlefile", str(path), str(temp_dir / f"page-{number:04d}"),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         return sorted(temp_dir.glob("page-*.png"))
     if renderer == "pypdfium2":
         import pypdfium2
@@ -83,7 +97,7 @@ def render_pdf_pages_for_ocr(path: Path, temp_dir: Path) -> list[Path]:
         images: list[Path] = []
         document = pypdfium2.PdfDocument(str(path))
         try:
-            for index in range(len(document)):
+            for index in range(len(document)) if pages is None else [number - 1 for number in pages if 0 < number <= len(document)]:
                 page = document[index]
                 try:
                     image_path = temp_dir / f"page-{index + 1:04d}.png"
@@ -146,7 +160,17 @@ def ocr_image(path: Path) -> str:
             # earlier mode.
             if text and confidence > best_confidence:
                 best_text, best_confidence = text, confidence
-    return best_text
+    return close_cjk_gaps(best_text)
+
+
+# Tesseract's Chinese output puts a space between characters ("过 去 两 年"), which breaks phrase
+# search and reads badly when quoted; spaces next to Latin words and numbers stay.
+_CJK = r"　-〿㐀-䶿一-鿿＀-￯"
+_CJK_GAP = re.compile(rf"(?<=[{_CJK}])[ \t]+(?=[{_CJK}])")
+
+
+def close_cjk_gaps(text: str) -> str:
+    return _CJK_GAP.sub("", text)
 
 
 def ocr_image_bytes(name: str, data: bytes) -> str:
@@ -159,7 +183,8 @@ def ocr_image_bytes(name: str, data: bytes) -> str:
         return ocr_image(image_path)
 
 
-def ocr_pdf(path: Path) -> tuple[str, list[str]]:
+def ocr_pdf(path: Path, pages: list[int] | None = None) -> tuple[str, list[str]]:
+    """OCR text of the PDF's pages, or only of `pages` (1-based), each marked with its page number."""
     warnings: list[str] = []
     if not find_tesseract():
         warnings.append("OCR skipped: tesseract executable is not installed or not on PATH.")
@@ -171,11 +196,12 @@ def ocr_pdf(path: Path) -> tuple[str, list[str]]:
     pieces: list[str] = []
     with tempfile.TemporaryDirectory(prefix="lka_ocr_") as temp:
         try:
-            images = render_pdf_pages_for_ocr(path, Path(temp))
+            images = render_pdf_pages_for_ocr(path, Path(temp), pages)
         except Exception as exc:
             warnings.append(f"OCR render failed: {portable_error_message(exc)}")
             return "", warnings
-        for page_index, image_path in enumerate(images, start=1):
+        for image_path in images:
+            page_index = int(re.sub(r"\D", "", image_path.stem) or 0)
             page_text = ocr_image(image_path)
             if page_text:
                 pieces.append(f"[ocr page {page_index}]\n{page_text}")

@@ -24,6 +24,12 @@ PROCESSED_DIR = PROJECT_ROOT / "knowledge_base" / "processed"
 
 SMALL_FILE_HASH_BYTES = 1024 * 1024
 
+# Part of every file's fingerprint: raised when extraction changes, so the next update reads each
+# file again instead of keeping text produced by the old rules. extract-v2: PDF OCR only where the
+# text layer lacks content and no repeated text layers, Chinese OCR without spaces between
+# characters, passwords and product keys hidden.
+EXTRACTION_VERSION = "extract-v2"
+
 
 def portable_error_message(exc: Exception) -> str:
     """Avoid leaking machine-specific temp/runtime paths into generated reports."""
@@ -150,6 +156,7 @@ def raw_file_stat_fingerprint(path: Path, raw_dir: Path | None = None) -> str:
     parts = [rel_path, str(stat.st_size), str(stat.st_mtime_ns)]
     if stat.st_size <= SMALL_FILE_HASH_BYTES:
         parts.append(raw_file_fingerprint(path))
+    parts.append(EXTRACTION_VERSION)
     return ":".join(parts)
 
 
