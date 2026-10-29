@@ -820,6 +820,7 @@ AcWing 是一个算法交流平台。
     check_embedding_cache()
     check_block_citations()
     check_structured_xlsx()
+    check_long_xlsx_rows()
     check_query_terms()
     check_unknown_names()
     check_agent_loop()
@@ -1383,6 +1384,60 @@ def check_structured_xlsx() -> None:
     assert query_module.enumeration_or_list_question("SFT主板功能测试包含哪些测试项")
     assert [row["chunk_id"] for row in query_module.rerank(candidates, "组一包含哪些测试项", 2, {})] == ["overview", "row"]
     assert [row["chunk_id"] for row in query_module.rerank(candidates, "组一的测试门限", 2, {})] == ["row", "overview"]
+
+
+def check_long_xlsx_rows() -> None:
+    """An Excel row longer than a chunk is split between cells into lines that each name the row's
+    item, never after a step number, so every chunk of it says which test it describes. Only Excel
+    files are read again for this."""
+    from kb_ingest import chunking, files, xlsx
+
+    def cell(ref: str, value: str) -> str:
+        return f'<c r="{ref}" t="inlineStr"><is><t>{value}</t></is></c>'
+
+    english = " ".join(f"{step}. Set sample fan mode {step} and read the speed, which should be greater than {step}000 rpm." for step in range(1, 9))
+    chinese = " ".join(f"{step}. 将样例风扇设为模式{step}并读取转速，转速需大于{step}000 rpm。" for step in range(1, 9))
+    command = " ".join(f"Step{step}. sample.exe /FAN -Set {step}, then sample.exe /FAN -Get" for step in range(1, 9))
+    sheet = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+        f'<row r="1">{cell("A1", "Test item")}{cell("B1", "Test subItem")}{cell("C1", "Test Procedure")}{cell("D1", "测试步骤")}{cell("E1", "Command")}</row>'
+        f'<row r="2">{cell("A2", "FAN")}{cell("B2", "SAMPLE_SPEED")}{cell("C2", english)}{cell("D2", chinese)}{cell("E2", command)}</row>'
+        f'<row r="3">{cell("A3", "FAN")}{cell("B3", "SAMPLE_LIGHT")}{cell("C3", "Check the LED")}{cell("D3", "检查指示灯")}{cell("E3", "sample.exe /LED")}</row>'
+        '</sheetData></worksheet>'
+    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        xlsx_path = Path(temp_dir) / "requirement.xlsx"
+        with zipfile.ZipFile(xlsx_path, "w") as archive:
+            archive.writestr(
+                "xl/workbook.xml",
+                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
+                '<sheet name="Fan" sheetId="1" r:id="rId1"/></sheets></workbook>',
+            )
+            archive.writestr(
+                "xl/_rels/workbook.xml.rels",
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="worksheet"/></Relationships>',
+            )
+            archive.writestr("xl/worksheets/sheet1.xml", sheet)
+        records = xlsx.read_xlsx_records(xlsx_path)
+        row = [line for line in records.split("\n\n") if "SAMPLE_SPEED" in line]
+        assert len(row) > 1 and all(len(line) <= xlsx.XLSX_ROW_MAX_CHARS for line in row), [len(line) for line in row]
+        assert all(line.startswith("Fan | Test item：FAN | Test subItem：SAMPLE_SPEED") for line in row), row
+        # Nothing lost, and no piece ends on a bare step number.
+        joined = " ".join(row)
+        assert all(sentence in joined for sentence in ("greater than 8000 rpm.", "转速需大于8000 rpm。", "Step8. sample.exe /FAN -Set 8"))
+        assert not any(re.search(r"(?:^|\s)\d\.$", line) for line in row), row
+        chunks = chunking.chunk_text(chunking.normalize_text(records))
+        assert all("SAMPLE_SPEED" in chunk for chunk in chunks if "rpm" in chunk), chunks
+        # A short row stays one line.
+        assert "Fan | Test item：FAN | Test subItem：SAMPLE_LIGHT | Test Procedure：Check the LED | 测试步骤：检查指示灯 | Command：sample.exe /LED" in records
+    # Only workbooks carry the row-splitting version in their fingerprint, so only they are read again.
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for name in ("plan.xlsx", "notes.md"):
+            (Path(temp_dir) / name).write_text("x", encoding="utf-8")
+        assert files.raw_file_stat_fingerprint(Path(temp_dir) / "plan.xlsx").endswith(":" + files.EXTRACTION_VERSION_BY_SUFFIX[".xlsx"])
+        assert files.raw_file_stat_fingerprint(Path(temp_dir) / "notes.md").endswith(":" + files.EXTRACTION_VERSION)
 
 
 def check_mixed_documents() -> None:

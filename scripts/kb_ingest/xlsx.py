@@ -280,6 +280,12 @@ XLSX_OVERVIEW_ITEM_MAX_CHARS = 40
 
 XLSX_OVERVIEW_DESCRIPTION_CHARS = 60
 
+# A row longer than this is written as several lines split between cells, each starting with the
+# sheet and the row's item (its group and item columns). Left whole, the chunker would break it into
+# sentences (after every step number 「2.」 too) and every piece but the first would lose which test it
+# describes. Below the chunk size, so a piece and its group heading still fit in one chunk.
+XLSX_ROW_MAX_CHARS = 900
+
 # documents.text keeps the legacy flattened workbook text that the table parsers read by column
 # position; chunks are built from the structured rows passed under this report key.
 CHUNK_TEXT_REPORT_KEY = "chunk_text"
@@ -430,6 +436,53 @@ def _xlsx_item_columns(
     return chosen
 
 
+def _xlsx_cell_segments(text: str, limit: int) -> list[str]:
+    """A cell too long for one line, in pieces of at most limit characters, cut after a sentence
+    (。；！？ or a full stop that does not end a step number such as 「2.」), else at a space."""
+    limit = max(limit, 80)
+    segments: list[str] = []
+    while len(text) > limit:
+        window = text[:limit]
+        cuts = [match.end() for match in re.finditer(r"[。；！？!?;]|(?<!\b\d)(?<!\b\d\d)\.(?=\s)", window)]
+        space = window.rfind(" ")
+        cut = cuts[-1] if cuts and cuts[-1] > limit // 3 else space if space > limit // 3 else limit
+        segments.append(text[:cut].strip())
+        text = text[cut:].strip()
+    if text:
+        segments.append(text)
+    return segments
+
+
+def _xlsx_row_lines(title: str, parts: list[tuple[str, str]], identity: list[tuple[str, str]]) -> list[str]:
+    """A row longer than XLSX_ROW_MAX_CHARS as several lines, split between cells (a long cell between
+    sentences, keeping its column title), each line after the first starting with the sheet and the
+    row's item, so a piece read alone still says which item it describes."""
+    shown = " | ".join(prefix + value for prefix, value in identity) or "".join(parts[0])
+    if len(shown) > XLSX_GROUP_HEADING_MAX_CHARS:
+        shown = shown[: XLSX_GROUP_HEADING_MAX_CHARS - 1] + "…"
+    lead = f"{title} | {shown}"
+    room = XLSX_ROW_MAX_CHARS - len(lead) - len(" | ")
+    pieces: list[str] = []
+    for prefix, value in parts:
+        if len(prefix) + len(value) <= room:
+            pieces.append(prefix + value)
+        else:
+            pieces.extend(prefix + segment for segment in _xlsx_cell_segments(value, room - len(prefix)))
+    named = {prefix + value for prefix, value in identity}
+    lines: list[str] = []
+    current = title
+    for piece in pieces:
+        if lines and piece in named:
+            continue  # already in the lead of every line after the first
+        joined = f"{current} | {piece}"
+        if len(joined) > XLSX_ROW_MAX_CHARS and current not in (title, lead):
+            lines.append(current)
+            joined = f"{lead} | {piece}"
+        current = joined
+    lines.append(current)
+    return lines
+
+
 def read_xlsx_records(path: Path) -> str:
     """Excel as self-describing rows for chunking: one line per data row, each value with its column title.
 
@@ -472,17 +525,24 @@ def read_xlsx_records(path: Path) -> str:
             for row_index in data_rows:
                 cells = grid[row_index]
                 parts: list[str] = []
+                titled: list[tuple[str, str]] = []
+                identity: list[tuple[str, str]] = []
                 for column, value in sorted(cells.items()):
                     label = labels.get(column, "")
                     if is_credential_label(label) and label != value:
                         value = REDACTED
-                    part = f"{label}：{value}" if label and label != value else value
+                    prefix = f"{label}：" if label and label != value else ""
+                    part = prefix + value
                     if part not in parts:  # a horizontal merge repeats one value across its columns
                         parts.append(part)
+                        titled.append((prefix, value))
+                        if column in item_columns or ((row_index, column) in vertical and (key_limit is None or column < key_limit)):
+                            identity.append((prefix, value))
                 line = f"{title} | " + " | ".join(parts)
                 if line in seen:
                     continue
                 seen.add(line)
+                row_lines = _xlsx_row_lines(title, titled, identity) if len(line) > XLSX_ROW_MAX_CHARS else [line]
                 key = tuple(
                     dict.fromkeys(
                         value
@@ -496,10 +556,10 @@ def read_xlsx_records(path: Path) -> str:
                     for value in item_values
                 )
                 if groups and groups[-1][0] == key:
-                    groups[-1][1].append(line)
+                    groups[-1][1].extend(row_lines)
                     groups[-1][2].append(item)
                 else:
-                    groups.append((key, [line], [item]))
+                    groups.append((key, row_lines, [item]))
 
             ungrouped_open = False
             for key, lines, _ in groups:
@@ -516,12 +576,20 @@ def read_xlsx_records(path: Path) -> str:
                     ungrouped_open = True
 
             # One block per group: the group line, then one item per line, so a cited overview lists
-            # items as separate lines instead of one long row that gets shortened.
-            overview = [
-                f"{title} 概览 | {' / '.join(key)}：\n" + "\n".join(dict.fromkeys(item for item in items if item))
-                for key, _, items in groups
-                if key and any(items)
-            ]
+            # items as separate lines instead of one long row that gets shortened. A list too long for
+            # one line is continued under the same group line.
+            overview: list[str] = []
+            for key, _, items in groups:
+                if not key or not any(items):
+                    continue
+                head = f"{title} 概览 | {' / '.join(key)}："
+                listed: list[str] = []
+                for entry in dict.fromkeys(item for item in items if item):
+                    if listed and len(head) + sum(len(item) + 1 for item in listed) + len(entry) + 1 > XLSX_ROW_MAX_CHARS:
+                        overview.append(head + "\n" + "\n".join(listed))
+                        listed = []
+                    listed.append(entry)
+                overview.append(head + "\n" + "\n".join(listed))
             if overview and len(data_rows) >= 5:
                 blocks.append(f"## 工作表 {title} 概览\n\n" + "\n\n".join(overview))
     return "\n\n".join(blocks)

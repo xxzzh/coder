@@ -30,6 +30,11 @@ SMALL_FILE_HASH_BYTES = 1024 * 1024
 # characters, passwords and product keys hidden.
 EXTRACTION_VERSION = "extract-v2"
 
+# Added for one file type when only its reading changes, so the next update reads just those files
+# again. xlsx-rows-v2: a row or item list longer than a chunk is split into lines that each name its
+# row's item or group.
+EXTRACTION_VERSION_BY_SUFFIX = {".xlsx": "xlsx-rows-v2"}
+
 
 def portable_error_message(exc: Exception) -> str:
     """Avoid leaking machine-specific temp/runtime paths into generated reports."""
@@ -157,6 +162,8 @@ def raw_file_stat_fingerprint(path: Path, raw_dir: Path | None = None) -> str:
     if stat.st_size <= SMALL_FILE_HASH_BYTES:
         parts.append(raw_file_fingerprint(path))
     parts.append(EXTRACTION_VERSION)
+    if path.suffix.lower() in EXTRACTION_VERSION_BY_SUFFIX:
+        parts.append(EXTRACTION_VERSION_BY_SUFFIX[path.suffix.lower()])
     return ":".join(parts)
 
 
