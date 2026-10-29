@@ -22,6 +22,35 @@
 | `summary.md` / `summary.json` | 汇总表、未通过题目、负样本误答 |
 | `run_meta.json` | 代码版本、索引状态、运行参数 |
 
+## 按需 API 评测（只测证据变了的题）
+
+一次全量 API 评测会把评测集的每道题都发给 API：每道题一次回答调用，再加上按意思判分（`eval/judge.py`）的调用。API 的措辞每次都略有不同，**证据没变的题，判分升降只是措辞波动，说明不了改动的好坏**。所以小改动只把证据变了的题发给 API：
+
+1. 改动后先跑本地评测（不调用 API）：`.\run-agent.bat eval --log "这次改了什么"`
+2. 和改动前的本地评测比较每道题检索到的证据：
+
+   ```bat
+   python eval\api_subset.py eval\results\<改动前的本地结果> eval\results\<改动后的本地结果>
+   ```
+
+   证据都没变时直接提示“不需要跑 API 评测”。否则把证据变了的题和几道固定的负样本（检查新的误答）写入改动后结果目录下的 `api_subset.jsonl`，并打印下一步的命令。
+3. 用 API 只跑这些题，判分后与上一次全量 API 评测逐题比较：
+
+   ```bat
+   .\run-agent.bat eval --allow-api --set eval\results\<改动后的本地结果>\api_subset.jsonl --label <名字>-api-subset
+   .venv\Scripts\python.exe eval\judge.py eval\results\<子集结果目录>
+   .venv\Scripts\python.exe eval\compare_runs.py eval\results\<上一次全量 API 结果> eval\results\<子集结果目录>
+   ```
+
+   子集运行不要加 `--log`：子集的平均数不能和全量比较。`compare_runs.py` 只比较两次都有的题，并标出每道判分变化的题证据是否相同，证据相同的是措辞波动。
+
+以下情况仍跑全量 API 评测：
+
+- 改了 API 一侧（提示词、润色规则、智能检索 Agent 的流程）：这类改动不改变证据，挑不出题；
+- 发布新版本之前。
+
+比较的是用问题本身检索到的证据，也就是 Agent 第一轮拿到的证据；Agent 自己追加搜索得到的证据没有比较。
+
 ## 调混合检索权重
 
 ```bat
