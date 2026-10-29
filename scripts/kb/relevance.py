@@ -16,6 +16,10 @@ LOCAL_SCORE_THRESHOLD = 0.16
 
 LOCAL_CONTENT_COVERAGE_THRESHOLD = 0.5
 
+# Characters that join the words of a question (测试需求里风扇, 测试前要预热, 字段在MES没有值时): a
+# two-character term made of one of them and a found word's character is not a word of the question.
+PARTICLE_CHARACTERS = frozenset("的了是在和与及或对把被从到给让为时里要前后都也就还会能该")
+
 # A name found in at least this share of the chunks (the framework's own name, a station that
 # every test sheet lists) does not pin a question to particular evidence: STPM matches a
 # quarter of the index. When every name in a question is that broad, the evidence must also
@@ -92,7 +96,14 @@ def simplified(text: str) -> str:
 
 
 def content_coverage(units: list[tuple[str, str, float]], text: str) -> float:
-    """Share of the question's subject weight found in text (0..1)."""
+    """Share of the question's subject weight found in text (0..1).
+
+    A Chinese span counts the share of its two-character terms found in the text, leaving out
+    the missing ones that only straddle its words: both characters are already in found terms
+    or are particles. In 「风扇全转转速要大于」 with 风扇, 全转, 转速 and 大于 found, 扇全, 转转, 速要
+    and 要大 are not words of the question and do not count; in 「今天上海天气」 天上 and 海天 still
+    count, since 上海 is missing.
+    """
     total = sum(weight for _, _, weight in units)
     if not total:
         return 0.0
@@ -111,9 +122,35 @@ def content_coverage(units: list[tuple[str, str, float]], text: str) -> float:
             word, version = term.split(" ", 1)
             if re.search(rf"(?<![a-z0-9]){re.escape(word)}\s*{re.escape(version)}(?![a-z0-9]|\.\d)", lowered):
                 matched += weight
-        elif term in compact:
-            matched += weight
+    for run in cjk_runs(units):
+        found = [term in compact for _, term, _ in run]
+        span = run[0][1] + "".join(term[1] for _, term, _ in run[1:])
+        covered = {position for index, hit in enumerate(found) if hit for position in (index, index + 1)}
+        counted = [
+            hit
+            for index, hit in enumerate(found)
+            if hit or not all(position in covered or span[position] in PARTICLE_CHARACTERS for position in (index, index + 1))
+        ]
+        if counted:
+            matched += sum(weight for _, _, weight in run) * sum(counted) / len(counted)
     return matched / total
+
+
+def cjk_runs(units: list[tuple[str, str, float]]) -> list[list[tuple[str, str, float]]]:
+    """The question's Chinese two-character terms grouped back into the spans they came from:
+    consecutive terms that overlap by one character (需求, 求里, 里风 -> 需求里风)."""
+    runs: list[list[tuple[str, str, float]]] = []
+    previous: tuple[str, str, float] | None = None
+    for unit in units:
+        if unit[0] != "cjk":
+            previous = None
+            continue
+        if previous is not None and previous[1][-1] == unit[1][0]:
+            runs[-1].append(unit)
+        else:
+            runs.append([unit])
+        previous = unit
+    return runs
 
 
 def concept_variant_found(variant: str, lowered: str, compact: str) -> bool:

@@ -54,3 +54,5 @@
 | 2026-10-28 | 20261028-170742-asus-final-api | same as asus-final-local; API | 0aac11a+dirty | 67.0% | 87.5% | 0.748 | 86.3% | 97.3% | 92.9% | 97.0% | 6089 |
 | 2026-10-28 | 20261028-180332-xlsx-rows-local | Excel rows and item lists longer than a chunk split between cells, each line naming its row's item or group; local | 508c9ef+dirty | 67.0% | 87.5% | 0.749 | 86.0% | 92.0% | 81.2% | 84.8% | 626 |
 | 2026-10-28 | 20261028-180657-xlsx-rows-api | same as xlsx-rows-local; API | 508c9ef+dirty | 67.0% | 87.5% | 0.749 | 86.0% | 99.1% | 94.6% | 97.0% | 3894 |
+| 2026-10-29 | 20261029-091728-straddle-local | local gate: two-character pieces that only straddle the question's words or a particle are not counted as missing; local | 508c9ef+dirty | 67.0% | 87.5% | 0.749 | 86.0% | 93.8% | 83.0% | 84.8% | 599 |
+| 2026-10-29 | 20261029-092041-straddle-api | same as straddle-local; API | 508c9ef+dirty | 67.0% | 87.5% | 0.749 | 86.0% | 98.2% | 94.6% | 97.0% | 3866 |

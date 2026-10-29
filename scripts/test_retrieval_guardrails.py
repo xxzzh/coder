@@ -880,6 +880,13 @@ def check_gate_synonyms() -> None:
     # A missing attribute still refuses: the subject alone covers only half of the question.
     units = relevance.query_content_units("SAMPLE01的售价是多少")
     assert relevance.content_coverage(units, "SAMPLE01 测试计划 封面") <= relevance.LOCAL_CONTENT_COVERAGE_THRESHOLD
+    # Two-character pieces that only straddle the question's words (扇全, 转转) or a particle (速要,
+    # 要大) are not missing words; a missing word (上海) still is, with the pieces around it.
+    units = relevance.query_content_units("样例风扇全转转速要大于多少")
+    assert relevance.content_coverage(units, "样例：风扇设为全转，读取转速，转速需大于2000 rpm") == 1.0
+    assert relevance.content_coverage(units, "样例：风扇设为全转") <= relevance.LOCAL_CONTENT_COVERAGE_THRESHOLD
+    units = relevance.query_content_units("今天上海天气怎么样")
+    assert relevance.content_coverage(units, "今天记录了天气和心情") <= relevance.LOCAL_CONTENT_COVERAGE_THRESHOLD
     # English test procedures name the command and its parameters in English.
     units = relevance.query_content_units("样例睡眠测试的命令和参数是什么")
     row_text = "Test subItem：样例 S3 | Test Procedure：Sleep time 60 sec | Command：sample.exe /sleep /c:5 | Parameter：/c count"
