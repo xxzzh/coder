@@ -56,3 +56,7 @@
 | 2026-10-28 | 20261028-180657-xlsx-rows-api | same as xlsx-rows-local; API | 508c9ef+dirty | 67.0% | 87.5% | 0.749 | 86.0% | 99.1% | 94.6% | 97.0% | 3894 |
 | 2026-10-29 | 20261029-091728-straddle-local | local gate: two-character pieces that only straddle the question's words or a particle are not counted as missing; local | 508c9ef+dirty | 67.0% | 87.5% | 0.749 | 86.0% | 93.8% | 83.0% | 84.8% | 599 |
 | 2026-10-29 | 20261029-092041-straddle-api | same as straddle-local; API | 508c9ef+dirty | 67.0% | 87.5% | 0.749 | 86.0% | 98.2% | 94.6% | 97.0% | 3866 |
+| 2026-10-29 | 20261029-113224-agent-v4-full-api | agent-v4: search again before refusing; commands/tools in 其他 (max 3); station list rule skips status questions; API | 552aa92+dirty | 67.0% | 87.5% | 0.749 | 86.0% | 100.0% | 96.4% | 97.0% | 3898 |
+| 2026-10-29 | 20261029-142146-agent-v5-full-api | agent-v5: conflicts inside one evidence, exact paths, search for the parallel case, retry search expansion; API | 552aa92+dirty | 67.0% | 87.5% | 0.750 | 86.0% | 99.1% | 95.5% | 97.0% | 4245 |
+| 2026-10-29 | 20261029-143715-agent-v6-full-api | agent-v6: v5 + English column names count, check before saying missing; retry search expansion; API | 552aa92+dirty | 67.0% | 87.5% | 0.750 | 86.0% | 98.2% | 94.6% | 97.0% | 4928 |
+| 2026-10-29 | 20261029-145415-agent-v7-full-api | agent-v7: v6 + whole tables with notes as agent evidence; API | 552aa92+dirty | 67.0% | 87.5% | 0.750 | 86.0% | 100.0% | 95.5% | 97.0% | 4672 |

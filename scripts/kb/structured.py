@@ -9,7 +9,14 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from kb.terms import abbreviation_query_term, fft_manual_function_question, requested_station_name, station_question_includes_schemes, station_test_item_question
+from kb.terms import (
+    abbreviation_query_term,
+    fft_manual_function_question,
+    requested_station_name,
+    station_item_attribute_question,
+    station_question_includes_schemes,
+    station_test_item_question,
+)
 
 
 def dictionary_entry_rows(text: str, abbreviation: str) -> list[dict[str, str]]:
@@ -270,7 +277,7 @@ def structured_station_result(
     refresh_scheduled: bool = False,
 ) -> dict[str, Any] | None:
     station_name = requested_station_name(question)
-    if not station_name or not station_test_item_question(question):
+    if not station_name or not station_test_item_question(question) or station_item_attribute_question(question):
         return None
     try:
         conn = sqlite3.connect(db_path)
@@ -745,7 +752,12 @@ def structured_fft_station_result(
     refresh_scheduled: bool = False,
 ) -> dict[str, Any] | None:
     station_name = requested_station_name(question)
-    if not station_name or station_name.lower() != "fft" or not station_test_item_question(question):
+    if (
+        not station_name
+        or station_name.lower() != "fft"
+        or not station_test_item_question(question)
+        or station_item_attribute_question(question)
+    ):
         return None
     region = legacy_xlsx_region(
         db_path,

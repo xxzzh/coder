@@ -6,7 +6,8 @@ This module is the main flow: one ingest run (_ingest_unlocked), the locked inge
 the command line. The building blocks live in kb_ingest/: files (raw files, fingerprints, the ingest
 lock), reviews (extraction reports and review approvals), ocr, word, xlsx, pdf, documents (format
 dispatch), chunking (chunks and the local embedding), store (the SQLite index), reports (processed
-files and the retrieval quality report) and vectors (model embeddings and the FAISS index).
+files and the retrieval quality report), vectors (model embeddings and the FAISS index) and
+progress (what a running ingest reports to the Web UI).
 Their names are re-exported here, so existing callers keep working.
 """
 
@@ -161,6 +162,7 @@ from kb_ingest.vectors import (  # noqa: F401  (re-exported for callers of this 
     embed_records_with_cache,
     seed_embedding_cache_from_index,
 )
+from kb_ingest import progress
 
 
 def _ingest_unlocked(
@@ -196,10 +198,12 @@ def _ingest_unlocked(
         for row in conn.execute("SELECT content_hash, file_path FROM documents WHERE duplicate_of IS NULL").fetchall()
     }
 
-    for path in sorted(raw_dir.rglob("*")):
-        if not path.is_file() or is_ignored_raw_file(path) or path.suffix.lower() not in SUPPORTED:
-            continue
-
+    candidates = [
+        path
+        for path in sorted(raw_dir.rglob("*"))
+        if path.is_file() and not is_ignored_raw_file(path) and path.suffix.lower() in SUPPORTED
+    ]
+    for position, path in enumerate(candidates):
         doc_count += 1
         rel_path = str(path.relative_to(raw_dir)).replace("\\", "/")
         current_paths.add(rel_path)
@@ -215,6 +219,7 @@ def _ingest_unlocked(
             unchanged_count += 1
             continue
 
+        progress.report("reading", done=position, total=len(candidates), file=rel_path)
         try:
             text, extract_report = read_document_with_report(path)
             structured_chunk_text = extract_report.pop(CHUNK_TEXT_REPORT_KEY, None)
@@ -293,6 +298,7 @@ def _ingest_unlocked(
                 (chunk_id, doc_id, path.name, rel_path, file_type, chunk, searchable_text(chunk)),
             )
 
+    progress.report("indexing")
     removed_count = remove_deleted_documents(conn, current_paths)
     lsh_backfilled = backfill_embedding_lsh(conn)
     if changed_doc_count or removed_count:

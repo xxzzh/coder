@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Small local Web UI for the Local Knowledge Base Agent."""
+"""Web UI of the Local Knowledge Base Agent: a chat page for questions (with follow-ups), a documents
+page (upload, processing progress, review, delete) and a settings page (API, maintenance).
+
+The page itself is scripts/web_page.html. Who may use which part is decided in web_access.py:
+by default the UI listens on this computer only; opened to the network it needs a password, and
+documents and settings can still only be managed from this computer.
+"""
 
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
+import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -17,7 +26,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from api_providers import (  # noqa: E402
     default_base_url,
@@ -25,6 +34,7 @@ from api_providers import (  # noqa: E402
     infer_provider,
     provider_options,
     read_env as read_api_env,
+    set_env_value,
     validate_chat_model,
     write_env as write_api_env,
 )
@@ -33,6 +43,14 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / "scripts"
 RAW_DIR = ROOT / "knowledge_base" / "raw"
 DB_PATH = ROOT / "knowledge_base" / "index" / "knowledge.db"
+PROCESSED_DIR = ROOT / "knowledge_base" / "processed"
+TRASH_DIR = ROOT / "knowledge_base" / "trash"
+PAGE_FILE = SCRIPTS_DIR / "web_page.html"
+DEFAULT_APP_TITLE = "知识库问答助手"
+JSON_BODY_MAX_BYTES = 1024 * 1024
+# A rejected upload this small is read and dropped, so the browser gets the reason instead of a
+# reset connection; a larger one is not read.
+REJECTED_UPLOAD_DRAIN_BYTES = 16 * 1024 * 1024
 OCR_EVAL_SCRIPT = SCRIPTS_DIR / "evaluate_ocr_test_materials.py"
 WEB_UI_STDERR_LOG = ROOT / "logs" / "web-ui.stderr.log"
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
@@ -52,14 +70,39 @@ from healthcheck_agent import (  # noqa: E402
     sqlite_has_fts5,
     unsupported_raw_files,
 )
-from manage_knowledge_base import rebuild as kb_rebuild  # noqa: E402
 from manage_knowledge_base import sources as kb_sources  # noqa: E402
-from manage_knowledge_base import update as kb_update  # noqa: E402
-from ingest_knowledge_base import approve_review_file, is_ignored_raw_file, pending_review_reports  # noqa: E402
+from ingest_knowledge_base import (  # noqa: E402
+    approve_review_file,
+    ingest_in_progress,
+    is_ignored_raw_file,
+    pending_review_reports,
+)
+from kb import followup  # noqa: E402
+from kb.config import api_enabled, runtime_config  # noqa: E402
 import model_capabilities  # noqa: E402
 import project_runtime  # noqa: E402
 from query_knowledge_base import query as kb_query  # noqa: E402
 import vector_store  # noqa: E402
+from web_access import (  # noqa: E402
+    LOOPBACK_HOST_NAMES,
+    Access,
+    cleared_cookie,
+    cross_site_reason,
+    host_name,
+    is_loopback_address,
+    is_loopback_bind,
+    session_cookie,
+)
+from web_stats import DEFAULT_MINUTES_SAVED_PER_ANSWER, QuestionLog  # noqa: E402
+from web_documents import (  # noqa: E402
+    IndexJob,
+    check_upload,
+    documents_payload,
+    remove_document,
+    review_reason,
+    save_upload,
+    upload_max_bytes,
+)
 
 project_runtime.apply_project_runtime_env()
 
@@ -129,7 +172,80 @@ def health_payload() -> dict[str, Any]:
         "api_backend_usable": api_usable,
         "api_provider": env.get("LKA_API_PROVIDER", "none"),
         "scale_warning": chunks >= 50000,
+        "pending_reviews": len(pending_review_reports(RAW_DIR, PROCESSED_DIR)),
+        "job": JOBS.snapshot(),
         "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+# An answer API call that failed falls back to answering on this computer. Users see why, in
+# words they can act on, instead of silently getting the less accurate local answer.
+API_FAILURE_KINDS = (
+    (r"HTTP 402|Insufficient Balance|insufficient_balance", "balance", "大模型 API 余额不足，需要到服务商平台充值"),
+    (r"HTTP 40[13]|Authentication|Unauthorized|invalid.{0,12}key", "key", "大模型 API Key 无效或没有权限，需要在设置页重新配置"),
+    (r"HTTP 429|rate.?limit|Too Many Requests", "rate", "大模型 API 调用太频繁被限流，稍后会自动恢复"),
+    (r"timed? ?out|URLError|Connection|getaddrinfo|Remote end closed|IncompleteRead", "network", "连不上大模型服务（网络或服务暂时不可用）"),
+)
+# How long a failure keeps showing in the status bar when no later API answer succeeded.
+API_FAILURE_SHOWN_SECONDS = 30 * 60
+_api_failure_lock = threading.Lock()
+_last_api_failure: dict[str, Any] | None = None
+
+
+def api_failure(result: dict[str, Any]) -> dict[str, str] | None:
+    text = str(result.get("agent_error") or result.get("api_error") or "")
+    if not text:
+        return None
+    for pattern, kind, message in API_FAILURE_KINDS:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return {"kind": kind, "message": message}
+    return {"kind": "other", "message": "大模型 API 调用失败"}
+
+
+def note_api_outcome(result: dict[str, Any]) -> dict[str, str] | None:
+    """Remember the latest API failure for the status bar; an answer the API gave clears it."""
+    global _last_api_failure
+    failure = api_failure(result)
+    with _api_failure_lock:
+        if failure:
+            _last_api_failure = {**failure, "time": time.time()}
+        elif result.get("api_used"):
+            _last_api_failure = None
+    return failure
+
+
+def recent_api_failure() -> dict[str, Any] | None:
+    with _api_failure_lock:
+        failure = dict(_last_api_failure) if _last_api_failure else None
+    if not failure or time.time() - float(failure["time"]) > API_FAILURE_SHOWN_SECONDS:
+        return None
+    if not api_enabled(runtime_config()):
+        return None
+    return failure
+
+
+def indexed_document_count(db_path: Path) -> int:
+    if not db_path.exists():
+        return 0
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM documents WHERE duplicate_of IS NULL").fetchone()[0] or 0)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+
+
+def status_payload() -> dict[str, Any]:
+    """What every user's page needs: whether there is anything to ask about, and whether it is changing."""
+    return {
+        "ok": True,
+        "documents": indexed_document_count(DB_PATH),
+        "needs_review": len(pending_review_reports(RAW_DIR, PROCESSED_DIR)),
+        "processing": JOBS.running() or ingest_in_progress(DB_PATH),
+        "api": api_enabled(runtime_config()),
+        "api_failure": recent_api_failure(),
     }
 
 
@@ -148,6 +264,8 @@ def api_config_payload() -> dict[str, Any]:
     return {
         "configured": configured,
         "usable": configured and api_backend_allowed(env),
+        "enabled": env.get("LKA_USE_API", "false").lower() == "true",
+        "has_key": bool(env.get("LKA_API_KEY")) and bool(env.get("LKA_API_MODEL")),
         "provider": provider,
         "base_url": env.get("LKA_API_BASE_URL", ""),
         "model": env.get("LKA_API_MODEL", ""),
@@ -171,7 +289,7 @@ def rotate_web_ui_logs() -> None:
 
 
 def reviews_payload() -> dict[str, Any]:
-    reviews = pending_review_reports(RAW_DIR, ROOT / "knowledge_base" / "processed")
+    reviews = pending_review_reports(RAW_DIR, PROCESSED_DIR)
     return {
         "pending": len(reviews),
         "reviews": [
@@ -179,6 +297,7 @@ def reviews_payload() -> dict[str, Any]:
                 "file_path": item.get("file_path"),
                 "file_type": item.get("file_type"),
                 "warnings": item.get("warnings", []),
+                "reasons": [review_reason(warning) for warning in item.get("warnings", [])],
                 "text_chars": item.get("text_chars", 0),
             }
             for item in reviews
@@ -186,17 +305,22 @@ def reviews_payload() -> dict[str, Any]:
     }
 
 
-def api_key_from_payload(payload: dict[str, Any]) -> str:
+def api_key_from_payload(payload: dict[str, Any], base_url: str) -> str:
+    """The key typed in, or else the saved one, but only for the saved address: a changed address
+    gets no key it was not given, so the saved key never goes to a server it was not meant for."""
     api_key = str(payload.get("api_key", "")).strip()
     if api_key:
         return api_key
-    return read_api_env().get("LKA_API_KEY", "")
+    env = read_api_env()
+    if base_url.rstrip("/") == env.get("LKA_API_BASE_URL", "").rstrip("/"):
+        return env.get("LKA_API_KEY", "")
+    return ""
 
 
 def save_api_config(payload: dict[str, Any]) -> dict[str, Any]:
     provider = str(payload.get("provider", "openai-compatible")).strip()
     base_url = str(payload.get("base_url", "")).strip() or default_base_url(provider)
-    api_key = api_key_from_payload(payload)
+    api_key = api_key_from_payload(payload, base_url)
     model = str(payload.get("model", "")).strip()
     if not api_key or not model:
         raise ValueError("API key 和模型不能为空。")
@@ -216,6 +340,17 @@ def save_api_config(payload: dict[str, Any]) -> dict[str, Any]:
     )
     write_api_env(env)
     return {"ok": True, "provider": provider, "base_url": base_url.rstrip("/"), "model": model}
+
+
+def set_api_mode(payload: dict[str, Any]) -> dict[str, Any]:
+    """Switch between answering with the model API and answering on this computer only; the saved
+    key and model stay, so switching back needs no new setup."""
+    enabled = bool(payload.get("enabled"))
+    env = read_api_env()
+    if enabled and not (env.get("LKA_API_KEY") and env.get("LKA_API_MODEL")):
+        raise ValueError("还没有配置 API：请先在下方填好 API Key、读取并选择模型，点“保存并验证”。")
+    set_env_value("LKA_USE_API", "true" if enabled else "false")
+    return {"ok": True, **api_config_payload()}
 
 
 def verify_embedding_api() -> dict[str, Any]:
@@ -277,971 +412,200 @@ def run_ocr_eval() -> dict[str, Any]:
     return data
 
 
-def page_html() -> str:
-    return """<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Local Knowledge Base Agent</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f6f7f9;
-      --panel: #ffffff;
-      --text: #1d2329;
-      --muted: #66717f;
-      --line: #d8dee6;
-      --accent: #1769aa;
-      --accent-strong: #0f4f82;
-      --ok: #177245;
-      --warn: #a35d00;
-      --bad: #b42318;
-      --code: #eef2f6;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font: 14px/1.5 "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
-    }
-    header {
-      border-bottom: 1px solid var(--line);
-      background: var(--panel);
-    }
-    .wrap {
-      max-width: 1180px;
-      margin: 0 auto;
-      padding: 18px 20px;
-    }
-    header .wrap {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-    }
-    h1 {
-      margin: 0;
-      font-size: 20px;
-      font-weight: 700;
-      letter-spacing: 0;
-    }
-    h2 {
-      margin: 0 0 12px;
-      font-size: 16px;
-      letter-spacing: 0;
-    }
-    button, input, textarea, select {
-      font: inherit;
-    }
-    button {
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #fff;
-      color: var(--text);
-      min-height: 36px;
-      padding: 7px 12px;
-      cursor: pointer;
-    }
-    button.primary {
-      border-color: var(--accent);
-      background: var(--accent);
-      color: #fff;
-    }
-    button:hover { border-color: var(--accent-strong); }
-    button.primary:hover { background: var(--accent-strong); }
-    button:disabled { opacity: .55; cursor: wait; }
-    main.wrap {
-      display: grid;
-      grid-template-columns: minmax(0, 1.4fr) minmax(320px, .8fr);
-      gap: 18px;
-    }
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 16px;
-      min-width: 0;
-    }
-    .stack { display: grid; gap: 14px; }
-    .cards {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 10px;
-    }
-    .metric {
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 10px;
-      min-height: 78px;
-      background: #fbfcfd;
-    }
-    .metric .label {
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .metric .value {
-      margin-top: 7px;
-      font-size: 20px;
-      font-weight: 700;
-      overflow-wrap: anywhere;
-    }
-    .status {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      padding: 5px 9px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      background: #fff;
-      font-weight: 600;
-      white-space: nowrap;
-    }
-    .dot {
-      width: 9px;
-      height: 9px;
-      border-radius: 50%;
-      background: var(--muted);
-      display: inline-block;
-    }
-    .status.ok .dot { background: var(--ok); }
-    .status.warn .dot { background: var(--warn); }
-    .status.bad .dot { background: var(--bad); }
-    textarea {
-      width: 100%;
-      min-height: 96px;
-      resize: vertical;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 10px;
-      background: #fff;
-      color: var(--text);
-    }
-    input, select {
-      width: 100%;
-      min-height: 36px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 7px 9px;
-      background: #fff;
-      color: var(--text);
-    }
-    .row {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    .row.between { justify-content: space-between; }
-    label.check {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      color: var(--muted);
-      user-select: none;
-    }
-    .answer {
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #fbfcfd;
-      min-height: 120px;
-      padding: 14px;
-      color: var(--text);
-      overflow-wrap: anywhere;
-    }
-    .answer p {
-      margin: 0;
-      line-height: 1.75;
-    }
-    .answer p + p,
-    .answer p + .answer-list,
-    .answer .answer-list + p {
-      margin-top: 10px;
-    }
-    .answer-lead {
-      color: #344054;
-    }
-    .answer-heading {
-      margin-top: 10px;
-      font-weight: 700;
-      color: var(--text);
-    }
-    .answer-list {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 7px 16px;
-      margin: 10px 0 0;
-      padding: 0;
-      list-style: none;
-    }
-    .answer-list.answer-list-wide,
-    .answer-list.answer-steps {
-      grid-template-columns: 1fr;
-    }
-    .answer-steps li {
-      padding-left: 0;
-    }
-    .answer-steps li::before {
-      display: none;
-    }
-    .answer-code {
-      margin: 8px 0 0;
-      padding: 10px 12px;
-      background: var(--code);
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      font: 12.5px/1.5 Consolas, "Courier New", monospace;
-      white-space: pre;
-      overflow-x: auto;
-    }
-    .answer-list li {
-      position: relative;
-      padding-left: 15px;
-      line-height: 1.55;
-      break-inside: avoid;
-    }
-    .answer-list li::before {
-      content: "";
-      position: absolute;
-      left: 0;
-      top: .68em;
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--accent);
-    }
-    .citation-badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 19px;
-      height: 19px;
-      margin: 0 2px;
-      padding: 0 5px;
-      border: 1px solid #b8d3e8;
-      border-radius: 999px;
-      background: #eaf4fb;
-      color: var(--accent-strong);
-      font-size: 12px;
-      font-weight: 700;
-      vertical-align: text-bottom;
-    }
-    .source-list {
-      display: grid;
-      gap: 10px;
-      margin-top: 10px;
-    }
-    .guidance {
-      margin-top: 10px;
-      padding: 10px 12px;
-      border-radius: 6px;
-      border: 1px solid #f3b4ad;
-      background: #fff4f2;
-      color: var(--bad);
-      font-weight: 600;
-      line-height: 1.6;
-      overflow-wrap: anywhere;
-    }
-    .guidance:empty {
-      display: none;
-    }
-    .source-item {
-      border-left: 3px solid var(--accent);
-      padding: 8px 10px;
-      background: #f8fafc;
-      overflow-wrap: anywhere;
-    }
-    .source-title {
-      font-weight: 700;
-      margin-bottom: 4px;
-    }
-    .muted { color: var(--muted); }
-    .mono {
-      font-family: Consolas, "Cascadia Mono", monospace;
-      background: var(--code);
-      padding: 2px 5px;
-      border-radius: 4px;
-      overflow-wrap: anywhere;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
-    }
-    th, td {
-      border-bottom: 1px solid var(--line);
-      padding: 7px 6px;
-      text-align: left;
-      vertical-align: top;
-    }
-    th { color: var(--muted); font-weight: 600; }
-    .log {
-      max-height: 260px;
-      overflow: auto;
-      background: #101418;
-      color: #e8edf2;
-      border-radius: 6px;
-      padding: 10px;
-      font-family: Consolas, "Cascadia Mono", monospace;
-      font-size: 12px;
-      white-space: pre-wrap;
-    }
-    @media (max-width: 860px) {
-      header .wrap, main.wrap { display: block; }
-      header .wrap > * + *, main.wrap > * + * { margin-top: 14px; }
-      .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .answer-list { grid-template-columns: 1fr; }
-    }
-    @media (max-width: 520px) {
-      .cards { grid-template-columns: 1fr; }
-      .row { align-items: stretch; }
-      .row button { flex: 1 1 auto; }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <div class="wrap">
-      <h1>Local Knowledge Base Agent</h1>
-      <div id="readyBadge" class="status warn"><span class="dot"></span><span>检查中</span></div>
-    </div>
-  </header>
-  <main class="wrap">
-    <section class="stack">
-      <div class="panel">
-        <div class="row between">
-          <h2>提问</h2>
-          <div class="row">
-            <label class="check" title="本地知识库始终优先检索"><input id="allowLocal" type="checkbox" checked disabled> 本地知识库</label>
-            <label class="check"><input id="allowWeb" type="checkbox"> online</label>
-          </div>
-        </div>
-        <textarea id="question" placeholder="输入问题"></textarea>
-        <div class="row" style="margin-top:10px">
-          <button id="askBtn" class="primary" onclick="ask()">查询</button>
-          <button onclick="clearAnswer()">清空</button>
-          <span id="askMeta" class="muted"></span>
-        </div>
-      </div>
-      <div class="panel">
-        <h2>答案</h2>
-        <div id="answer" class="answer muted">等待查询</div>
-        <div id="guidance" class="guidance"></div>
-        <div id="sources" class="source-list"></div>
-      </div>
-      <div class="panel">
-        <div class="row between">
-          <h2>索引来源</h2>
-          <button onclick="loadSources()">刷新来源</button>
-        </div>
-        <div id="sourceTable" class="muted">等待加载</div>
-      </div>
-    </section>
-    <aside class="stack">
-      <div class="panel">
-        <div class="row between">
-          <h2>状态</h2>
-          <button onclick="loadHealth()">刷新</button>
-        </div>
-        <div class="cards">
-          <div class="metric"><div class="label">资料</div><div id="rawCount" class="value">-</div></div>
-          <div class="metric"><div class="label">文档</div><div id="docCount" class="value">-</div></div>
-          <div class="metric"><div class="label">分块</div><div id="chunkCount" class="value">-</div></div>
-          <div class="metric"><div class="label">待复核</div><div id="reviewCount" class="value">-</div></div>
-        </div>
-        <div id="healthDetail" style="margin-top:12px"></div>
-      </div>
-      <div class="panel">
-        <h2>操作</h2>
-        <div class="stack">
-          <button onclick="openRawFolder()">打开资料目录</button>
-          <button onclick="runAction('/api/update', '增量更新')">增量更新</button>
-          <button onclick="runAction('/api/rebuild-strict', '严格重建')">严格重建</button>
-          <button onclick="runAction('/api/vector-rebuild', '重建向量索引')">重建向量索引</button>
-          <button onclick="runAction('/api/embedding-verify', '验证 Embedding API')">验证 Embedding API</button>
-          <button onclick="runAction('/api/vector-verify', '验证向量索引')">验证向量索引</button>
-          <button onclick="runDiagnostics()">检索诊断</button>
-          <button onclick="runAction('/api/ocr-eval', 'OCR 评测')">OCR 评测</button>
-        </div>
-      </div>
-      <div class="panel">
-        <div class="row between">
-          <h2>待复核资料</h2>
-          <button onclick="loadReviews()">刷新</button>
-        </div>
-        <div id="reviewList" class="stack muted">等待加载</div>
-      </div>
-      <div class="panel">
-        <h2>API 精炼</h2>
-        <div class="stack">
-          <select id="apiProvider" onchange="providerChanged()"></select>
-          <input id="apiBaseUrl" placeholder="API base URL">
-          <input id="apiKey" type="password" placeholder="API key">
-          <button onclick="discoverApiModels()">读取可用模型</button>
-          <select id="apiModel"><option value="">请先读取模型</option></select>
-          <button class="primary" onclick="saveApiConfig()">保存并验证</button>
-          <div id="apiConfigMeta" class="muted"></div>
-        </div>
-      </div>
-      <div class="panel">
-        <h2>运行日志</h2>
-        <div id="log" class="log">Web UI 已启动。</div>
-      </div>
-    </aside>
-  </main>
-  <script>
-    const $ = (id) => document.getElementById(id);
-    const setBusy = (busy) => {
-      document.querySelectorAll('button').forEach((btn) => btn.disabled = busy);
-    };
-    const log = (message, data) => {
-      const line = `[${new Date().toLocaleTimeString()}] ${message}`;
-      $('log').textContent = data ? `${line}\\n${JSON.stringify(data, null, 2)}\\n\\n${$('log').textContent}` : `${line}\\n${$('log').textContent}`;
-    };
-    async function api(path, options = {}) {
-      const response = await fetch(path, {
-        headers: {'Content-Type': 'application/json'},
-        ...options
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || response.statusText);
-      return data;
-    }
-    let apiProviders = [];
-    async function loadApiConfig() {
-      try {
-        const data = await api('/api/api-config');
-        apiProviders = data.providers || [];
-        $('apiProvider').innerHTML = apiProviders.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
-        $('apiProvider').value = data.provider || 'openai-compatible';
-        $('apiBaseUrl').value = data.base_url || providerBaseUrl();
-        $('apiConfigMeta').textContent = data.usable ? `当前模型：${data.model || '-'}` : (data.configured ? '已有配置不可用于应用后端，请重新配置有效 API key' : '未配置可用 API');
-        if (data.model) $('apiModel').innerHTML = `<option value="${escapeHtml(data.model)}">${escapeHtml(data.model)}</option>`;
-      } catch (error) {
-        $('apiConfigMeta').textContent = `加载失败：${error.message}`;
-      }
-    }
-    function providerBaseUrl() {
-      return (apiProviders.find((item) => item.id === $('apiProvider').value) || {}).base_url || '';
-    }
-    function providerChanged() {
-      $('apiBaseUrl').value = providerBaseUrl();
-      $('apiModel').innerHTML = '<option value="">请先读取模型</option>';
-    }
-    async function discoverApiModels() {
-      setBusy(true);
-      $('apiConfigMeta').textContent = '正在读取可用模型...';
-      try {
-        const data = await api('/api/api-models', {method: 'POST', body: JSON.stringify({
-          provider: $('apiProvider').value,
-          base_url: $('apiBaseUrl').value,
-          api_key: $('apiKey').value
-        })});
-        $('apiModel').innerHTML = (data.models || []).map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join('');
-        $('apiConfigMeta').textContent = data.warning || `已读取 ${(data.models || []).length} 个模型`;
-      } catch (error) {
-        $('apiConfigMeta').textContent = `读取失败：${error.message}`;
-      } finally {
-        setBusy(false);
-      }
-    }
-    async function saveApiConfig() {
-      setBusy(true);
-      $('apiConfigMeta').textContent = '正在验证模型调用...';
-      try {
-        const data = await api('/api/api-save', {method: 'POST', body: JSON.stringify({
-          provider: $('apiProvider').value,
-          base_url: $('apiBaseUrl').value,
-          api_key: $('apiKey').value,
-          model: $('apiModel').value
-        })});
-        $('apiKey').value = '';
-        $('apiConfigMeta').textContent = `已启用：${data.provider} · ${data.model}`;
-        log('API 配置已保存', {provider: data.provider, model: data.model});
-        loadHealth();
-      } catch (error) {
-        $('apiConfigMeta').textContent = `保存失败：${error.message}`;
-      } finally {
-        setBusy(false);
-      }
-    }
-    function setBadge(ok, text) {
-      const badge = $('readyBadge');
-      badge.className = `status ${ok ? 'ok' : 'bad'}`;
-      badge.querySelector('span:last-child').textContent = text;
-    }
-    let lastHealth = null;
-    function formatShanghaiTimestamp(value) {
-      if (!value) return '未建立';
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return value;
-      const parts = new Intl.DateTimeFormat('en-CA', {
-        timeZone: 'Asia/Shanghai',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false
-      }).formatToParts(date).reduce((acc, part) => {
-        if (part.type !== 'literal') acc[part.type] = part.value;
-        return acc;
-      }, {});
-      return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}`;
-    }
-    function onlineChecked() {
-      return Boolean($('allowWeb')?.checked);
-    }
-    function translationStatus(data) {
-      if (data.offline_translation?.en_to_zh_ready) return '可用（离线）';
-      if (onlineChecked() && data.online_translation?.en_to_zh_ready) return '可用（online）';
-      return '不可用';
-    }
-    function ocrStatus(data) {
-      return data.optional_extractors?.ocr_ready ? '可用（离线/online）' : '不可用';
-    }
-    function renderHealth(data) {
-      lastHealth = data;
-      setBadge(data.ok, data.ok ? '可使用' : '需处理');
-      $('rawCount').textContent = data.raw_supported_files ?? 0;
-      $('docCount').textContent = data.index?.documents ?? 0;
-      $('chunkCount').textContent = data.index?.chunks ?? 0;
-      $('reviewCount').textContent = data.extraction_report?.requires_review ?? 0;
-      const lines = [
-        `索引时间：${formatShanghaiTimestamp(data.index?.indexed_at)}`,
-        `分块：${data.index?.chunk_strategy || '-'}`,
-        `Embedding：${data.embedding?.enabled ? `${data.embedding?.provider || '-'} · ${data.embedding?.model || '-'} · ${data.embedding?.requested_dimensions || '-'}维` : '未启用'}`,
-        `向量库：${data.vector_index?.backend || 'faiss'} · ${data.vector_index?.ready ? 'ready' : `降级（${data.vector_index?.reason || '-'}）`}`,
-        `LLM 分块：${data.llm_capabilities?.chunking_enabled ? '开启' : '关闭'} · 查询路由：${data.llm_capabilities?.query_routing_enabled ? '开启' : '关闭'} · Rerank：${data.llm_capabilities?.rerank_enabled ? '开启' : '关闭'}`,
-        `OCR：${ocrStatus(data)}`,
-        `英译中：${translationStatus(data)}`,
-        `API：${data.api_configured ? (data.api_backend_usable ? data.api_provider : '当前配置不可用于应用后端') : '未配置'}`
-      ];
-      if (data.scale_warning) lines.push('规模提示：chunk 已超过 50000，建议评估独立向量库。');
-      if ((data.extraction_report?.requires_review ?? 0) > 0) lines.push('存在待复核抽取结果，请先处理后再交付使用。');
-      if ((data.raw_unsupported_files ?? []).length > 0) lines.push(`未进入索引的不支持文件：${data.raw_unsupported_files.join('；')}`);
-      $('healthDetail').innerHTML = lines.map((item) => `<div class="muted">${item}</div>`).join('');
-    }
-    async function loadHealth() {
-      try {
-        const data = await api('/api/health');
-        renderHealth(data);
-      } catch (error) {
-        setBadge(false, '检查失败');
-        log('状态检查失败', {error: error.message});
-      }
-    }
-    async function loadReviews() {
-      try {
-        const data = await api('/api/reviews');
-        const items = data.reviews || [];
-        const list = $('reviewList');
-        if (!items.length) {
-          list.className = 'stack muted';
-          list.textContent = '没有待复核资料';
-          return;
-        }
-        list.className = 'stack';
-        list.innerHTML = '';
-        items.forEach((item) => {
-          const node = document.createElement('div');
-          node.className = 'source-item';
-          const title = document.createElement('div');
-          title.className = 'source-title';
-          title.textContent = item.file_path || '';
-          const warning = document.createElement('div');
-          warning.className = 'muted';
-          warning.textContent = (item.warnings || []).join('；');
-          const actions = document.createElement('div');
-          actions.className = 'row';
-          actions.style.marginTop = '8px';
-          const approve = document.createElement('button');
-          approve.textContent = '确认可用';
-          approve.onclick = () => approveReview(item.file_path);
-          actions.appendChild(approve);
-          node.append(title, warning, actions);
-          list.appendChild(node);
-        });
-      } catch (error) {
-        $('reviewList').textContent = `加载失败：${error.message}`;
-      }
-    }
-    async function approveReview(filePath) {
-      if (!window.confirm(`确认已检查并允许索引此文件？\\n${filePath}`)) return;
-      setBusy(true);
-      log('复核确认开始', {file_path: filePath});
-      try {
-        const data = await api('/api/reviews/approve', {method: 'POST', body: JSON.stringify({file_path: filePath})});
-        log('复核确认完成', data.summary || data);
-        await loadHealth();
-        await loadReviews();
-        await loadSources();
-      } catch (error) {
-        log('复核确认失败', {error: error.message});
-      } finally {
-        setBusy(false);
-      }
-    }
-    async function openRawFolder() {
-      try {
-        await api('/api/open-raw-folder', {method: 'POST', body: '{}'});
-      } catch (error) {
-        log('打开资料目录失败', {error: error.message});
-      }
-    }
-    async function ask() {
-      const question = $('question').value.trim();
-      if (!question) return;
-      setBusy(true);
-      $('answer').className = 'answer muted';
-      $('answer').textContent = '正在准备查询...';
-      renderGuidance(null);
-      $('sources').textContent = '';
-      $('askMeta').textContent = '';
-      try {
-        const response = await fetch('/api/query-stream', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({
-            question,
-            use_web: $('allowWeb').checked,
-            allow_api: true,
-            limit: 5
-          })
-        });
-        if (!response.ok || !response.body) {
-          const data = await response.json();
-          throw new Error(data.error || response.statusText);
-        }
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let streamedAnswer = '';
-        while (true) {
-          const {value, done} = await reader.read();
-          buffer += decoder.decode(value || new Uint8Array(), {stream: !done});
-          const blocks = buffer.split('\\n\\n');
-          buffer = blocks.pop() || '';
-          blocks.forEach((block) => {
-            if (!block.trim()) return;
-            const lines = block.split('\\n');
-            const eventName = (lines.find((line) => line.startsWith('event: ')) || 'event: message').slice(7);
-            const dataLine = lines.find((line) => line.startsWith('data: '));
-            if (!dataLine) return;
-            const data = JSON.parse(dataLine.slice(6));
-            if (eventName === 'status') {
-              $('answer').className = 'answer muted';
-              $('answer').textContent = data.message;
-              $('askMeta').textContent = data.elapsed_seconds ? `已等待 ${data.elapsed_seconds} 秒` : '';
-            } else if (eventName === 'meta') {
-              const parts = [
-                data.source_type || '-',
-                data.web_search_provider || '',
-                data.cache_hit ? 'cache' : '',
-                data.api_used ? 'api' : '',
-                data.agent_rounds ? `agent ${data.agent_rounds} 轮` : '',
-                data.index_status === 'updating' ? 'index updating' : ''
-              ].filter(Boolean);
-              $('askMeta').textContent = parts.join(' · ');
-              renderGuidance(data.user_guidance || null);
-              if (data.index_message) log('索引后台更新', {message: data.index_message});
-            } else if (eventName === 'sources') {
-              renderSources(data.sources || []);
-            } else if (eventName === 'answer-start') {
-              streamedAnswer = '';
-              $('answer').className = 'answer';
-              $('answer').textContent = '';
-            } else if (eventName === 'answer-delta') {
-              streamedAnswer += data.text || '';
-              renderAnswer(streamedAnswer);
-            } else if (eventName === 'error') {
-              throw new Error(data.error || '查询失败');
-            } else if (eventName === 'done') {
-              log('查询完成', {source_type: data.source_type, sources: data.sources_count});
-            }
-          });
-          if (done) break;
-        }
-      } catch (error) {
-        $('answer').className = 'answer muted';
-        $('answer').textContent = `查询失败：${error.message}`;
-        renderGuidance(null);
-        log('查询失败', {error: error.message});
-      } finally {
-        setBusy(false);
-        loadHealth();
-      }
-    }
-    function renderSources(items) {
-      if (!items.length) {
-        $('sources').innerHTML = '<div class="muted">没有引用来源</div>';
-        return;
-      }
-      $('sources').innerHTML = '';
-      items.forEach((item) => {
-        const node = document.createElement('div');
-        node.className = 'source-item';
-        const title = document.createElement('div');
-        title.className = 'source-title';
-        title.textContent = `${item.source_id || ''}. ${item.file || item.title || 'source'}`;
-        const path = document.createElement('div');
-        path.className = 'muted';
-        path.textContent = item.file_path || item.url || '';
-        const quote = document.createElement('div');
-        quote.textContent = item.excerpt || item.citation || item.snippet || '';
-        node.append(title, path, quote);
-        $('sources').appendChild(node);
-      });
-    }
-    function renderGuidance(guidance) {
-      const node = $('guidance');
-      node.textContent = '';
-      if (!guidance || !guidance.message) return;
-      node.textContent = guidance.message;
-    }
-    function appendAnswerText(parent, text) {
-      const parts = String(text || '').split(/(\\[\\d+\\])/g);
-      parts.forEach((part) => {
-        const citation = part.match(/^\\[(\\d+)\\]$/);
-        if (citation) {
-          const badge = document.createElement('span');
-          badge.className = 'citation-badge';
-          badge.textContent = citation[1];
-          parent.appendChild(badge);
-        } else if (part) {
-          parent.appendChild(document.createTextNode(part));
-        }
-      });
-    }
-    function addAnswerParagraph(container, text, className = '') {
-      const value = String(text || '').trim();
-      if (!value) return;
-      const paragraph = document.createElement('p');
-      if (className) paragraph.className = className;
-      appendAnswerText(paragraph, value);
-      container.appendChild(paragraph);
-    }
-    function renderAnswer(text) {
-      const container = $('answer');
-      container.innerHTML = '';
-      const normalized = String(text || '').replace(/\\r\\n/g, '\\n').trim();
-      if (!normalized) return;
-      const listMarker = '包含以下测试项：';
-      const markerIndex = normalized.indexOf(listMarker);
-      if (markerIndex >= 0) {
-        const lead = normalized.slice(0, markerIndex).trim();
-        const remainder = normalized.slice(markerIndex + listMarker.length).trim();
-        addAnswerParagraph(container, lead, 'answer-lead');
-        addAnswerParagraph(container, '测试项', 'answer-heading');
-        const list = document.createElement('ul');
-        list.className = 'answer-list';
-        remainder.split('；').map((item) => item.trim()).filter(Boolean).forEach((item) => {
-          const row = document.createElement('li');
-          appendAnswerText(row, item);
-          list.appendChild(row);
-        });
-        container.appendChild(list);
-        return;
-      }
-      normalized.split(/\\n{2,}/).forEach((block) => {
-        const lines = block.split('\\n').map((line) => line.trim()).filter(Boolean);
-        // Runs of bullet lines become lists; the other lines of the block stay paragraphs, so
-        // a lead sentence followed by bullets renders as a sentence and then a list.
-        let paragraph = [];
-        let list = null;
-        const flush = () => {
-          if (paragraph.length) addAnswerParagraph(container, paragraph.join(' '));
-          paragraph = [];
-        };
-        let code = null;
-        const addCode = () => {
-          const block = document.createElement('pre');
-          block.className = 'answer-code';
-          block.textContent = code.join('\\n');
-          container.appendChild(block);
-          code = null;
-        };
-        lines.forEach((line, index) => {
-          // Fenced code (local answers keep code from the documents as-is) shows as a code block.
-          if (line.startsWith('```')) {
-            if (code === null) {
-              flush();
-              list = null;
-              code = [];
-            } else {
-              addCode();
-            }
-            return;
-          }
-          if (code !== null) {
-            code.push(line);
-            return;
-          }
-          // A short line right before bullets or code names the group below it: one ending in "：",
-          // or a title or step name without sentence punctuation. The answer's opening sentence
-          // stays a plain paragraph even when it ends with "：".
-          const opening = !container.childElementCount && !paragraph.length;
-          const next = lines[index + 1] || '';
-          // "1. " / "2、" lines are steps in order (not "2.5V"); they keep their numbers in one column.
-          const isBullet = (text) => /^[-*•]\\s+/.test(text);
-          const isStep = (text) => /^\\d{1,2}[.、](?!\\d)\\s*\\S/.test(text);
-          const startsGroup = isBullet(next) || isStep(next) || next.startsWith('```');
-          const bare = line.replace(/\\s*\\[\\d+\\]$/, '');
-          const groupName = !opening && startsGroup && !isBullet(line) && !isStep(line) && line.length <= 40 && (/[：:]$/.test(bare) || !/[。！？；，,.!?;]$/.test(bare));
-          if (groupName) {
-            flush();
-            list = null;
-            addAnswerParagraph(container, line, 'answer-heading');
-          } else if (isBullet(line) || isStep(line)) {
-            flush();
-            const className = isStep(line) ? 'answer-list answer-steps' : 'answer-list';
-            if (!list || list.className !== className) {
-              list = document.createElement('ul');
-              list.className = className;
-              container.appendChild(list);
-            }
-            const row = document.createElement('li');
-            appendAnswerText(row, isStep(line) ? line : line.replace(/^[-*•]\\s+/, ''));
-            list.appendChild(row);
-          } else {
-            list = null;
-            paragraph.push(line);
-          }
-        });
-        if (code !== null) addCode();
-        flush();
-      });
-      // Two columns suit short items such as test-item names; long points read better in one.
-      container.querySelectorAll('.answer-list').forEach((list) => {
-        if ([...list.children].some((item) => item.textContent.length > 36)) list.classList.add('answer-list-wide');
-      });
-    }
-    async function loadSources() {
-      try {
-        const data = await api('/api/sources');
-        const rows = data.sources || [];
-        if (!rows.length) {
-          $('sourceTable').textContent = '没有索引来源';
-          return;
-        }
-        const html = [`<table><thead><tr><th>文件</th><th>类型</th><th>分块</th><th>状态</th></tr></thead><tbody>`];
-        rows.slice(0, 80).forEach((row) => {
-          html.push(`<tr><td>${escapeHtml(row.file_path || row.file_name || '')}</td><td>${escapeHtml(row.file_type || '')}</td><td>${row.chunk_count || 0}</td><td>${row.duplicate_of ? '重复' : '已索引'}</td></tr>`);
-        });
-        html.push('</tbody></table>');
-        if (rows.length > 80) html.push(`<div class="muted">仅显示前 80 条，共 ${rows.length} 条。</div>`);
-        $('sourceTable').innerHTML = html.join('');
-      } catch (error) {
-        $('sourceTable').textContent = `加载失败：${error.message}`;
-      }
-    }
-    async function runAction(path, name) {
-      setBusy(true);
-      log(`${name}开始`);
-      try {
-        const data = await api(path, {method: 'POST', body: '{}'});
-        log(`${name}完成`, data.summary || data);
-        await loadHealth();
-        await loadReviews();
-        if (path !== '/api/ocr-eval') await loadSources();
-      } catch (error) {
-        log(`${name}失败`, {error: error.message});
-      } finally {
-        setBusy(false);
-      }
-    }
-    async function runDiagnostics() {
-      const question = $('question').value.trim() || '本地知识库状态';
-      setBusy(true);
-      log('检索诊断开始', {question});
-      try {
-        const data = await api('/api/retrieval-diagnostics', {method: 'POST', body: JSON.stringify({question})});
-        log('检索诊断完成', data);
-      } catch (error) {
-        log('检索诊断失败', {error: error.message});
-      } finally {
-        setBusy(false);
-      }
-    }
-    function clearAnswer() {
-      $('question').value = '';
-      $('answer').className = 'answer muted';
-      $('answer').textContent = '等待查询';
-      renderGuidance(null);
-      $('sources').textContent = '';
-      $('askMeta').textContent = '';
-    }
-    function escapeHtml(value) {
-      return String(value).replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch]));
-    }
-    $('question').addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) ask();
-    });
-    $('allowWeb').addEventListener('change', () => {
-      if (lastHealth) renderHealth(lastHealth);
-    });
-    loadHealth();
-    loadReviews();
-    loadSources();
-    loadApiConfig();
-  </script>
-</body>
-</html>
-"""
+
+
+JOBS = IndexJob(RAW_DIR, DB_PATH, PROCESSED_DIR, redact=redact_secrets)
+# Set in main(): the access password, and whether the UI listens on this computer only.
+ACCESS = Access("")
+LOCAL_ONLY = True
+
+
+def web_setting(name: str, default: str = "") -> str:
+    return os.environ.get(name) or load_env(ROOT / ".env").get(name, "") or default
+
+
+def app_title() -> str:
+    return web_setting("LKA_APP_TITLE", DEFAULT_APP_TITLE)[:60]
+
+
+QUESTIONS = QuestionLog(
+    ROOT / "logs" / "questions.jsonl",
+    ROOT / "logs" / "answer_feedback.jsonl",
+    enabled=web_setting("LKA_QUESTION_LOG", "on").lower() != "off",
+)
+
+
+def minutes_saved_per_answer() -> float:
+    try:
+        return max(0.0, float(web_setting("LKA_MINUTES_SAVED_PER_ANSWER", str(DEFAULT_MINUTES_SAVED_PER_ANSWER))))
+    except ValueError:
+        return float(DEFAULT_MINUTES_SAVED_PER_ANSWER)
+
+
+def page_html(admin: bool) -> str:
+    title = app_title()
+    config = {
+        "admin": admin,
+        "title": title,
+        "loginRequired": ACCESS.required,
+        "uploadMaxMb": upload_max_bytes() // 1024 // 1024,
+    }
+    # "</" escaped: a title can never end the script element.
+    blob = json.dumps(config, ensure_ascii=False).replace("</", "<\\/")
+    page = PAGE_FILE.read_text(encoding="utf-8")
+    page = re.sub(r"/\*LKA_CONFIG\*/\{[^\n]*\};", lambda _: f"{blob};", page, count=1)
+    page = page.replace("<title>知识库问答助手</title>", f"<title>{html.escape(title)}</title>", 1)
+    return page.replace('<h1 id="appTitle">知识库问答助手</h1>', f'<h1 id="appTitle">{html.escape(title)}</h1>', 1)
+
+
+def login_html() -> str:
+    title = html.escape(app_title())
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  body {{ margin:0; min-height:100vh; display:grid; place-items:center; background:#f5f6f8;
+         font:14px/1.6 "Segoe UI","Microsoft YaHei",Arial,sans-serif; color:#1d2329; }}
+  form {{ background:#fff; border:1px solid #dde3ea; border-radius:12px; padding:28px; width:min(360px, 90vw); }}
+  h1 {{ font-size:18px; margin:0 0 6px; }}
+  p {{ color:#66717f; margin:0 0 16px; }}
+  input {{ width:100%; box-sizing:border-box; padding:9px 10px; border:1px solid #dde3ea; border-radius:6px; font:inherit; }}
+  button {{ margin-top:12px; width:100%; padding:9px; border:0; border-radius:6px; background:#1769aa; color:#fff; font:inherit; cursor:pointer; }}
+  .error {{ color:#b42318; min-height:1.6em; margin-top:8px; }}
+</style></head>
+<body><form id="form"><h1>{title}</h1><p>请输入访问密码</p>
+<input id="password" type="password" autocomplete="current-password" autofocus>
+<button type="submit">进入</button><div id="error" class="error"></div></form>
+<script>
+document.getElementById('form').onsubmit = async (event) => {{
+  event.preventDefault();
+  const response = await fetch('/api/login', {{method: 'POST', headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{password: document.getElementById('password').value}})}});
+  const data = await response.json().catch(() => ({{}}));
+  if (response.ok) location.reload(); else document.getElementById('error').textContent = data.error || '登录失败';
+}};
+</script></body></html>"""
+
+
+# Everyone signed in may ask; managing documents and settings is limited to this computer.
+SHARED_GET = {"/api/status", "/api/query"}
+SHARED_POST = {"/api/query-stream", "/api/query", "/api/logout", "/api/feedback"}
+LEGACY_JOB_PATHS = {"/api/update": "update", "/api/rebuild-strict": "rebuild", "/api/vector-rebuild": "vector-rebuild"}
+
+
+class RequestRejected(Exception):
+    def __init__(self, message: str, status: HTTPStatus) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class AgentHandler(BaseHTTPRequestHandler):
-    server_version = "LocalKnowledgeAgent/1.0"
+    server_version = "LocalKnowledgeAgent/1.2"
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), redact_secrets(fmt % args)))
 
+    # ---- who may do what ----
+
+    def client_is_local(self) -> bool:
+        return is_loopback_address(self.client_address[0])
+
+    def check_request(self, path: str) -> None:
+        if LOCAL_ONLY and host_name(str(self.headers.get("Host") or "")) not in LOOPBACK_HOST_NAMES:
+            raise RequestRejected("请用 http://127.0.0.1 打开本页面。", HTTPStatus.FORBIDDEN)
+        if path.startswith("/api/") or self.command == "POST":
+            if cross_site_reason(self.headers, LOCAL_ONLY):
+                raise RequestRejected("请求被拒绝：只接受本页面发出的请求。", HTTPStatus.FORBIDDEN)
+        if self.command == "POST":
+            content_type = str(self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            expected = "application/octet-stream" if path == "/api/upload" else "application/json"
+            if content_type != expected:
+                raise RequestRejected("请求格式不正确。", HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+
+    def check_signed_in(self) -> None:
+        if not ACCESS.signed_in(self.headers.get("Cookie")):
+            raise RequestRejected("请先登录。", HTTPStatus.UNAUTHORIZED)
+
+    def check_manager(self) -> None:
+        if not self.client_is_local():
+            raise RequestRejected("资料和设置只能在运行本服务的电脑上管理。", HTTPStatus.FORBIDDEN)
+
+    # ---- routes ----
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path in {"/", "/index.html"}:
-            self.send_html(page_html())
-        elif parsed.path == "/favicon.ico":
-            self.send_empty(HTTPStatus.NO_CONTENT)
-        elif parsed.path == "/api/health":
-            self.send_json(health_payload())
-        elif parsed.path == "/api/sources":
-            self.send_json(kb_sources(DB_PATH))
-        elif parsed.path == "/api/reviews":
-            self.send_json(reviews_payload())
-        elif parsed.path == "/api/api-config":
-            self.send_json(api_config_payload())
-        elif parsed.path == "/api/query":
-            params = parse_qs(parsed.query)
-            question = params.get("question", [""])[0].strip()
-            if not question:
-                self.send_error_json("Missing question", HTTPStatus.BAD_REQUEST)
+        path = parsed.path
+        try:
+            self.check_request(path)
+            if path in {"/", "/index.html"}:
+                if ACCESS.signed_in(self.headers.get("Cookie")):
+                    self.send_html(page_html(admin=self.client_is_local()))
+                else:
+                    self.send_html(login_html())
                 return
-            self.send_json(
-                kb_query(
-                    DB_PATH,
-                    question,
-                    limit=int(params.get("limit", ["5"])[0] or 5),
-                    use_web=params.get("use_web", ["false"])[0].lower() == "true",
-                    allow_api=params.get("allow_api", ["true"])[0].lower() != "false",
+            if path == "/favicon.ico":
+                self.send_empty(HTTPStatus.NO_CONTENT)
+                return
+            self.check_signed_in()
+            if path not in SHARED_GET:
+                self.check_manager()
+            if path == "/api/status":
+                self.send_json(status_payload())
+            elif path == "/api/query":
+                params = parse_qs(parsed.query)
+                question = params.get("question", [""])[0].strip()
+                if not question:
+                    raise RequestRejected("Missing question", HTTPStatus.BAD_REQUEST)
+                self.send_json(
+                    kb_query(
+                        DB_PATH,
+                        question,
+                        limit=int(params.get("limit", ["5"])[0] or 5),
+                        use_web=params.get("use_web", ["false"])[0].lower() == "true",
+                        allow_api=params.get("allow_api", ["true"])[0].lower() != "false",
+                    )
                 )
-            )
-        else:
-            self.send_error_json("Not found", HTTPStatus.NOT_FOUND)
+            elif path == "/api/health":
+                self.send_json(health_payload())
+            elif path == "/api/sources":
+                self.send_json(kb_sources(DB_PATH))
+            elif path == "/api/documents":
+                self.send_json(documents_payload(RAW_DIR, DB_PATH, PROCESSED_DIR, JOBS.running()))
+            elif path == "/api/reviews":
+                self.send_json(reviews_payload())
+            elif path == "/api/api-config":
+                self.send_json(api_config_payload())
+            elif path == "/api/jobs":
+                self.send_json(JOBS.snapshot())
+            elif path == "/api/stats":
+                days_text = parse_qs(parsed.query).get("days", ["30"])[0]
+                days = int(days_text) if days_text.isdigit() and int(days_text) > 0 else None
+                self.send_json(QUESTIONS.stats(days, minutes_saved_per_answer()))
+            else:
+                raise RequestRejected("Not found", HTTPStatus.NOT_FOUND)
+        except RequestRejected as exc:
+            self.send_error_json(str(exc), exc.status)
+        except Exception as exc:  # noqa: BLE001
+            self.send_error_json(str(exc), HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def do_POST(self) -> None:
-        parsed = urlparse(self.path)
+        path = urlparse(self.path).path
+        self.body_read = False
         try:
-            if parsed.path == "/api/query-stream":
-                payload = self.read_json()
-                self.stream_query(payload)
-            elif parsed.path == "/api/query":
+            self.check_request(path)
+            if path == "/api/login":
+                self.login()
+                return
+            self.check_signed_in()
+            if path not in SHARED_POST:
+                self.check_manager()
+            if path == "/api/query-stream":
+                self.stream_query(self.read_json())
+            elif path == "/api/query":
                 payload = self.read_json()
                 question = str(payload.get("question", "")).strip()
                 if not question:
-                    self.send_error_json("Missing question", HTTPStatus.BAD_REQUEST)
-                    return
+                    raise RequestRejected("Missing question", HTTPStatus.BAD_REQUEST)
                 self.send_json(
                     kb_query(
                         DB_PATH,
@@ -1251,74 +615,136 @@ class AgentHandler(BaseHTTPRequestHandler):
                         allow_api=bool(payload.get("allow_api", True)),
                     )
                 )
-            elif parsed.path == "/api/update":
-                result = kb_update(RAW_DIR, DB_PATH, ROOT / "knowledge_base" / "processed", strict_extraction=True)
-                self.send_json({"ok": True, "summary": compact_ingest_result(result), "result": result})
-            elif parsed.path == "/api/rebuild-strict":
-                result = kb_rebuild(RAW_DIR, DB_PATH, ROOT / "knowledge_base" / "processed", strict_extraction=True)
-                self.send_json({"ok": True, "summary": compact_ingest_result(result), "result": result})
-            elif parsed.path == "/api/vector-rebuild":
-                vector_store.reset_vector_index()
-                result = kb_update(RAW_DIR, DB_PATH, ROOT / "knowledge_base" / "processed", strict_extraction=True)
-                self.send_json({"ok": True, "summary": compact_ingest_result(result), "result": result, "vector_index": verify_vector_index()})
-            elif parsed.path == "/api/embedding-verify":
-                self.send_json(verify_embedding_api())
-            elif parsed.path == "/api/vector-verify":
-                self.send_json(verify_vector_index())
-            elif parsed.path == "/api/retrieval-diagnostics":
-                self.send_json(retrieval_diagnostics(self.read_json()))
-            elif parsed.path == "/api/ocr-eval":
-                self.send_json(run_ocr_eval())
-            elif parsed.path == "/api/reviews/approve":
+            elif path == "/api/feedback":
                 payload = self.read_json()
-                approval = approve_review_file(
-                    RAW_DIR,
-                    ROOT / "knowledge_base" / "processed",
-                    str(payload.get("file_path", "")),
-                )
-                result = kb_update(RAW_DIR, DB_PATH, ROOT / "knowledge_base" / "processed", strict_extraction=True)
-                self.send_json({"ok": True, "approval": approval, "summary": compact_ingest_result(result), "result": result})
-            elif parsed.path == "/api/open-raw-folder":
+                QUESTIONS.feedback(str(payload.get("id", "")), bool(payload.get("helpful")))
+                self.send_json({"ok": True})
+            elif path == "/api/logout":
+                ACCESS.sign_out(self.headers.get("Cookie"))
+                self.send_json({"ok": True}, headers={"Set-Cookie": cleared_cookie()})
+            elif path == "/api/upload":
+                self.upload()
+            elif path == "/api/documents/delete":
+                removed = remove_document(str(self.read_json().get("file_path", "")), RAW_DIR, TRASH_DIR)
+                self.send_json({"ok": True, "removed": removed, "job": JOBS.start("update")})
+            elif path == "/api/jobs":
+                self.send_json(JOBS.start(str(self.read_json().get("kind", "update"))))
+            elif path in LEGACY_JOB_PATHS:
+                self.send_json(JOBS.start(LEGACY_JOB_PATHS[path]))
+            elif path == "/api/reviews/approve":
+                approval = approve_review_file(RAW_DIR, PROCESSED_DIR, str(self.read_json().get("file_path", "")))
+                self.send_json({"ok": True, "approval": approval, "job": JOBS.start("update")})
+            elif path == "/api/embedding-verify":
+                self.send_json(verify_embedding_api())
+            elif path == "/api/vector-verify":
+                self.send_json(verify_vector_index())
+            elif path == "/api/retrieval-diagnostics":
+                self.send_json(retrieval_diagnostics(self.read_json()))
+            elif path == "/api/ocr-eval":
+                self.send_json(run_ocr_eval())
+            elif path == "/api/open-raw-folder":
+                RAW_DIR.mkdir(parents=True, exist_ok=True)
                 os.startfile(RAW_DIR)  # type: ignore[attr-defined]
                 self.send_json({"ok": True})
-            elif parsed.path == "/api/api-models":
+            elif path == "/api/api-models":
                 payload = self.read_json()
                 provider = str(payload.get("provider", "openai-compatible")).strip()
                 base_url = str(payload.get("base_url", "")).strip() or default_base_url(provider)
-                api_key = api_key_from_payload(payload)
+                api_key = api_key_from_payload(payload, base_url)
                 if not api_key:
-                    raise ValueError("请输入 API key。")
+                    raise ValueError("请输入 API Key（换了 API 地址时需要重新输入）。")
                 result = discover_models(provider, base_url, api_key)
                 if not result.get("ok"):
                     raise ValueError(str(result.get("error", "没有找到可用模型。")))
                 self.send_json(result)
-            elif parsed.path == "/api/api-save":
+            elif path == "/api/api-save":
                 self.send_json(save_api_config(self.read_json()))
+            elif path == "/api/api-mode":
+                self.send_json(set_api_mode(self.read_json()))
             else:
-                self.send_error_json("Not found", HTTPStatus.NOT_FOUND)
+                raise RequestRejected("Not found", HTTPStatus.NOT_FOUND)
+        except RequestRejected as exc:
+            self.discard_unread_body()
+            self.send_error_json(str(exc), exc.status)
+        except ValueError as exc:
+            self.discard_unread_body()
+            self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
         except Exception as exc:  # noqa: BLE001
+            self.discard_unread_body()
             self.send_error_json(str(exc), HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def discard_unread_body(self) -> None:
+        """A request refused before its body was read: read and drop a small body first. Windows
+        resets a connection closed with unread data, and the browser would then see a network error
+        instead of the reason; a large body is not read and the connection is closed."""
+        if getattr(self, "body_read", True):
+            return
+        self.body_read = True
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if 0 < length <= REJECTED_UPLOAD_DRAIN_BYTES:
+            self.rfile.read(length)
+        elif length > 0:
+            self.close_connection = True
+
+    def login(self) -> None:
+        if not ACCESS.required:
+            self.send_json({"ok": True})
+            return
+        client = self.client_address[0]
+        if ACCESS.locked_out(client):
+            raise RequestRejected("密码错误次数太多，请 10 分钟后再试。", HTTPStatus.TOO_MANY_REQUESTS)
+        token = ACCESS.sign_in(client, str(self.read_json().get("password", "")))
+        if not token:
+            raise RequestRejected("密码不正确。", HTTPStatus.UNAUTHORIZED)
+        self.send_json({"ok": True}, headers={"Set-Cookie": session_cookie(token)})
+
+    def upload(self) -> None:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        file_name = unquote(str(self.headers.get("X-File-Name") or ""))
+        # Name and size are checked before reading, so a refused file's body is still unread and
+        # discard_unread_body() can drop it; once reading starts, the body counts as read.
+        check_upload(file_name, length)
+        self.body_read = True
+        saved = save_upload(self.rfile, length, file_name, RAW_DIR)
+        self.send_json({"ok": True, **saved})
+
+    # ---- responses ----
 
     def read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or 0)
         if length <= 0:
             return {}
+        if length > JSON_BODY_MAX_BYTES:
+            raise RequestRejected("请求内容太大。", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        self.body_read = True
         raw = self.rfile.read(length).decode("utf-8", errors="replace")
-        return json.loads(raw) if raw.strip() else {}
+        data = json.loads(raw) if raw.strip() else {}
+        return data if isinstance(data, dict) else {}
+
+    def send_common_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
 
     def send_html(self, content: str) -> None:
         body = content.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_common_headers()
         self.end_headers()
         self.wfile.write(body)
 
-    def send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.send_common_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -1338,12 +764,12 @@ class AgentHandler(BaseHTTPRequestHandler):
     def stream_query(self, payload: dict[str, Any]) -> None:
         question = str(payload.get("question", "")).strip()
         if not question:
-            self.send_error_json("Missing question", HTTPStatus.BAD_REQUEST)
-            return
+            raise RequestRejected("请输入问题。", HTTPStatus.BAD_REQUEST)
 
         limit = int(payload.get("limit", 5) or 5)
         use_web = bool(payload.get("use_web", False))
         allow_api = bool(payload.get("allow_api", True))
+        history = payload.get("history")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -1356,64 +782,55 @@ class AgentHandler(BaseHTTPRequestHandler):
 
         def run_query() -> None:
             try:
-                result_box["result"] = kb_query(DB_PATH, question, limit=limit, use_web=use_web, allow_api=allow_api)
+                # A follow-up («它最多重试几次») is searched as the complete question it stands for.
+                understood = followup.standalone_question(question, history, runtime_config(), allow_api)
+                result_box["understood"] = understood
+                result_box["result"] = kb_query(DB_PATH, understood["question"], limit=limit, use_web=use_web, allow_api=allow_api)
             except Exception as exc:  # noqa: BLE001
                 error_box["error"] = exc
 
         started_at = time.monotonic()
-        initial_status = (
-            "正在检索本地索引；本地不足时将联网搜索、抓取网页正文并整理证据..."
-            if use_web
-            else "正在检索本地索引并整理引用..."
-        )
-        self.send_stream_event("status", {"message": initial_status})
+        self.send_stream_event("status", {"message": "正在查找资料，资料不足时会联网搜索…" if use_web else "正在查找资料…"})
         worker = threading.Thread(target=run_query, daemon=True)
         worker.start()
         while worker.is_alive():
             worker.join(timeout=1.0)
             if worker.is_alive():
                 elapsed = max(1, int(time.monotonic() - started_at))
-                self.send_stream_event(
-                    "status",
-                    {
-                        "message": "仍在处理中：正在等待检索、资料更新或 API 总结完成...",
-                        "elapsed_seconds": elapsed,
-                    },
-                )
+                self.send_stream_event("status", {"message": "正在整理答案…", "elapsed_seconds": elapsed})
 
         if error_box:
             self.send_stream_event("error", {"error": redact_secrets(str(error_box["error"]))})
             return
 
         result = result_box["result"]
+        understood = result_box["understood"]
         sources = result.get("sources", [])
+        failure = note_api_outcome(result)
         sys.stderr.write(
             "query "
             + json.dumps(
                 {
                     "question": question,
+                    "understood_as": understood["question"] if understood["rewritten"] else None,
+                    "followup_method": understood["method"],
                     "source_type": result.get("source_type"),
                     "web_search_provider": result.get("web_search_provider"),
                     "web_search_reason": result.get("web_search_reason"),
                     "sources": len(sources),
+                    "api_failure": failure["kind"] if failure else None,
                 },
                 ensure_ascii=False,
             )
             + "\n"
         )
         sys.stderr.flush()
-        if result.get("async_update_scheduled"):
-            self.send_stream_event(
-                "status",
-                {
-                    "message": result.get("index_message") or "资料已变化，正在后台更新，稍后重试可得到最新结果。",
-                    "elapsed_seconds": max(0, int(time.monotonic() - started_at)),
-                },
-            )
+        if understood["rewritten"]:
+            self.send_stream_event("understood", {"question": understood["question"], "method": understood["method"]})
         self.send_stream_event(
             "status",
             {
-                "message": f"已找到 {len(sources)} 条引用，正在生成答案...",
+                "message": f"找到 {len(sources)} 处相关资料，正在生成答案…" if sources else "正在生成答案…",
                 "elapsed_seconds": max(0, int(time.monotonic() - started_at)),
             },
         )
@@ -1430,7 +847,16 @@ class AgentHandler(BaseHTTPRequestHandler):
                 "async_update_scheduled": result.get("async_update_scheduled", False),
                 "index_status": result.get("index_status", "ready"),
                 "index_message": result.get("index_message"),
+                "api_failure": failure,
             },
+        )
+        record_id = QUESTIONS.record(
+            question,
+            understood["question"] if understood["rewritten"] else None,
+            result,
+            time.monotonic() - started_at,
+            remote=not self.client_is_local(),
+            api_failure=failure["kind"] if failure else None,
         )
         self.send_stream_event("sources", {"sources": sources})
         self.send_stream_event("answer-start", {})
@@ -1444,44 +870,45 @@ class AgentHandler(BaseHTTPRequestHandler):
                 "source_type": result.get("source_type"),
                 "sources_count": len(sources),
                 "elapsed_seconds": round(time.monotonic() - started_at, 2),
+                "record_id": record_id,
             },
         )
 
 
-def compact_ingest_result(result: dict[str, Any]) -> dict[str, Any]:
-    keys = (
-        "documents",
-        "indexed_documents",
-        "chunks",
-        "duplicates",
-        "skipped",
-        "extraction_warnings",
-        "requires_review",
-        "approved_reviews",
-        "unsupported_files",
-        "quality_summary",
-        "quality_report",
-        "vector_index_status",
-        "vector_index_reason",
-        "vector_backend",
-        "vector_embedding_model",
-        "vector_embedding_dimension",
-        "indexed_at",
-    )
-    return {key: result.get(key) for key in keys if key in result}
+def network_addresses() -> list[str]:
+    try:
+        names = socket.gethostbyname_ex(socket.gethostname())[2]
+    except OSError:
+        return []
+    return sorted({name for name in names if not name.startswith("127.")})
 
 
 def main() -> None:
+    global ACCESS, LOCAL_ONLY
     rotate_web_ui_logs()
-    parser = argparse.ArgumentParser(description="Run the local Web UI for Local Knowledge Base Agent.")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind host. Default keeps the UI local-only.")
+    parser = argparse.ArgumentParser(description="Run the Web UI of the Local Knowledge Base Agent.")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address. The default keeps the UI on this computer; 0.0.0.0 opens it to the network and needs LKA_WEB_PASSWORD.",
+    )
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--open", action="store_true", help="Open the Web UI in the default browser.")
     args = parser.parse_args()
 
+    LOCAL_ONLY = is_loopback_bind(args.host)
+    password = web_setting("LKA_WEB_PASSWORD")
+    if not LOCAL_ONLY and not password:
+        print(f"对外开放（--host {args.host}）时必须设置访问密码：在 .env 中加一行 LKA_WEB_PASSWORD=你的密码，然后重新启动。")
+        sys.exit(2)
+    ACCESS = Access(password)
+
     server = ThreadingHTTPServer((args.host, args.port), AgentHandler)
-    url = f"http://{args.host}:{args.port}/"
+    url = f"http://127.0.0.1:{args.port}/"
     print(f"Local Knowledge Base Agent Web UI: {url}")
+    if not LOCAL_ONLY:
+        for address in network_addresses():
+            print(f"同一网络的电脑可以打开：http://{address}:{args.port}/（需要访问密码；只能提问，资料和设置只能在本机管理）")
     print("Press Ctrl+C to stop.")
     if args.open:
         webbrowser.open(url)

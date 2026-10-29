@@ -158,13 +158,14 @@ def main() -> None:
         assert query_module.suggested_local_questions("SR有哪些测试项?", query_module.DB_PATH)[0] == "SR是什么"
     guidance = query_module.no_index_user_guidance("SWDL2")
     assert guidance["severity"] == "error"
-    assert "与「SWDL2」相关的索引和 FAQ" in guidance["message"]
-    assert "SWDL2有哪些测试项" in guidance["message"]
-    assert "HPD有哪些测试项" in query_module.no_index_user_guidance("hpd test")["message"]
+    assert "还没有可用的资料" in guidance["message"] and "上传" in guidance["message"]
+    assert guidance["suggested_questions"] == []
     no_match_guidance = query_module.local_no_match_user_guidance("我的个人密码是")
     assert no_match_guidance["kind"] == "local_no_match"
-    assert "与「个人密码」相关" in no_match_guidance["message"]
-    assert "个人密码是什么" in no_match_guidance["message"]
+    assert no_match_guidance["severity"] == "info"
+    assert "换个问法" in no_match_guidance["hint"] and "个人密码是什么" not in no_match_guidance["hint"]
+    assert "「个人密码是什么」" in no_match_guidance["message"]
+    assert no_match_guidance["suggested_questions"] == ["个人密码是什么"]
     if index_has_sr:
         sr_guidance = query_module.local_no_match_user_guidance("SR是什么意思", query_module.DB_PATH)
         assert "SR是什么" in sr_guidance["message"]
@@ -175,7 +176,7 @@ def main() -> None:
     if query_module.DB_PATH.exists():
         missing_guidance = query_module.local_no_match_user_guidance("ZZZ999有哪些测试项", query_module.DB_PATH)
         assert missing_guidance["suggested_questions"] == []
-        assert "你是否想问" not in missing_guidance["message"]
+        assert "试试问" not in missing_guidance["message"]
     original_processed_dir = query_module.PROCESSED_DIR
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -183,7 +184,8 @@ def main() -> None:
             missing_index_result = query_module.query(Path(temp_dir) / "missing.db", "SWDL2", use_web=False, allow_api=False)
             assert missing_index_result["degrade_reason"] == "local_index_missing"
             assert missing_index_result["user_guidance"]["kind"] == "no_index_no_faq"
-            assert "SWDL2有哪些测试项" in missing_index_result["user_guidance"]["message"]
+            assert "请先上传文档" in missing_index_result["user_guidance"]["message"]
+            assert "还没有可用的资料" in missing_index_result["answer"]
     finally:
         query_module.PROCESSED_DIR = original_processed_dir
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -1170,6 +1172,17 @@ def check_ocr_pipeline() -> None:
 def check_agent_loop() -> None:
     """The agent answers from cited evidence, searches again when asked, and never ends a last round searching."""
     import agentic_retrieval as agent
+
+    # Replies that are still the same JSON object: a raw line break inside the answer, words around it.
+    raw_newline = '{"decision": "answer", "answer": "结论。\n- 要点 [#1]", "evidence_ids": [1]}'
+    assert agent.parse_reply(raw_newline)["answer"] == "结论。\n- 要点 [#1]"
+    assert agent.parse_reply('好的：{"decision": "refuse", "reason": "缺少"} 以上')["decision"] == "refuse"
+    try:
+        agent.parse_reply('{"decision": "answer", "answer": "被截断')
+    except agent.AgentError:
+        pass
+    else:
+        raise AssertionError("a truncated reply was accepted")
 
     corpus = {
         "开机流程": [{"chunk_id": "a", "file_name": "guide.md", "evidence": "开机流程：先自检，再加载配置"}],

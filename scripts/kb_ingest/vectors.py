@@ -8,6 +8,23 @@ from typing import Any
 import model_capabilities
 import vector_store
 
+from kb_ingest import progress
+
+# New chunks are embedded this many at a time, so a large document reports its progress.
+EMBED_PROGRESS_SLICE = 64
+
+
+def embed_texts_with_progress(texts: list[str], config: dict[str, str]) -> dict[str, Any]:
+    vectors: list[list[float]] = []
+    progress.report("embedding", done=0, total=len(texts))
+    for start in range(0, len(texts), EMBED_PROGRESS_SLICE):
+        embedded = model_capabilities.embed_texts(texts[start : start + EMBED_PROGRESS_SLICE], config)
+        if not embedded.get("ok"):
+            return embedded
+        vectors.extend(embedded["vectors"])
+        progress.report("embedding", done=len(vectors), total=len(texts))
+    return {"ok": True, "vectors": vectors}
+
 
 def embed_records_with_cache(
     records: list[dict[str, Any]],
@@ -22,14 +39,14 @@ def embed_records_with_cache(
         vectors_by_hash = cache.get_many(hashes)
         missing = [digest for digest in dict.fromkeys(hashes) if digest not in vectors_by_hash]
         if missing:
-            embedded = model_capabilities.embed_texts([texts_by_hash[digest] for digest in missing], config)
+            embedded = embed_texts_with_progress([texts_by_hash[digest] for digest in missing], config)
             if not embedded.get("ok"):
                 return {"ok": False, "error": embedded.get("error")}
             fresh = dict(zip(missing, embedded["vectors"]))
             dimensions = {len(vector) for vector in fresh.values()} | {len(vector) for vector in vectors_by_hash.values()}
             if len(dimensions) > 1:
                 # Cached vectors of another dimension (e.g. an API that changed its output size): start over.
-                embedded = model_capabilities.embed_texts(list(texts_by_hash.values()), config)
+                embedded = embed_texts_with_progress(list(texts_by_hash.values()), config)
                 if not embedded.get("ok"):
                     return {"ok": False, "error": embedded.get("error")}
                 fresh = dict(zip(texts_by_hash.keys(), embedded["vectors"]))

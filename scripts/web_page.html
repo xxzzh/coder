@@ -1,0 +1,1374 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>知识库问答助手</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f6f8;
+      --panel: #ffffff;
+      --text: #1d2329;
+      --muted: #66717f;
+      --line: #dde3ea;
+      --accent: #1769aa;
+      --accent-strong: #0f4f82;
+      --accent-soft: #eaf4fb;
+      --ok: #177245;
+      --warn: #a35d00;
+      --bad: #b42318;
+      --code: #eef2f6;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.6 "Segoe UI", "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      flex: none;
+    }
+    .header-inner {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      flex-wrap: wrap;
+    }
+    h1 { margin: 0; font-size: 18px; font-weight: 700; }
+    h2 { margin: 0 0 10px; font-size: 15px; }
+    nav { display: flex; gap: 4px; }
+    nav button {
+      border: 0;
+      background: transparent;
+      padding: 7px 12px;
+      border-radius: 6px;
+      color: var(--muted);
+      font-weight: 600;
+      min-height: 0;
+    }
+    nav button.active { background: var(--accent-soft); color: var(--accent-strong); }
+    .spacer { flex: 1; }
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+    .status-chip.ok .dot { background: var(--ok); }
+    .status-chip.warn .dot { background: var(--warn); }
+    .status-chip.bad .dot { background: var(--bad); }
+    button, input, textarea, select { font: inherit; }
+    button {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      min-height: 34px;
+      padding: 6px 12px;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--accent-strong); }
+    button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+    button.primary:hover { background: var(--accent-strong); }
+    button.link { border: 0; background: none; color: var(--accent); padding: 0; min-height: 0; }
+    button.danger { color: var(--bad); }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    input, select {
+      width: 100%;
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 6px 9px;
+      background: #fff;
+      color: var(--text);
+    }
+    main { flex: 1; min-height: 0; display: flex; }
+    .view { display: none; width: 100%; }
+    .view.active { display: flex; }
+    .muted { color: var(--muted); }
+    .small { font-size: 12.5px; }
+    .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .row.between { justify-content: space-between; }
+    label.check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); user-select: none; }
+    label.check input { width: auto; min-height: 0; }
+
+    /* Chat */
+    #chatView { flex-direction: column; }
+    .thread {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 20px 8px;
+    }
+    .thread-inner { max-width: 860px; margin: 0 auto; display: grid; gap: 16px; }
+    .welcome {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 22px;
+    }
+    .welcome h2 { font-size: 17px; }
+    .welcome ul { margin: 8px 0 0; padding-left: 20px; color: var(--muted); }
+    .turn { display: grid; gap: 8px; }
+    .bubble-user {
+      justify-self: end;
+      max-width: 80%;
+      background: var(--accent);
+      color: #fff;
+      padding: 9px 14px;
+      border-radius: 14px 14px 4px 14px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .bubble-bot {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 4px 14px 14px 14px;
+      padding: 14px 16px;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+    }
+    .understood { font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+    .waiting { color: var(--muted); display: flex; align-items: center; gap: 8px; }
+    .spinner {
+      width: 14px; height: 14px; border-radius: 50%;
+      border: 2px solid var(--line); border-top-color: var(--accent);
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .answer p { margin: 0; line-height: 1.75; }
+    .answer p + p, .answer p + .answer-list, .answer .answer-list + p { margin-top: 10px; }
+    .answer-heading { margin-top: 10px; font-weight: 700; }
+    .answer-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px 16px;
+      margin: 8px 0 0;
+      padding: 0;
+      list-style: none;
+    }
+    .answer-list.answer-list-wide, .answer-list.answer-steps { grid-template-columns: 1fr; }
+    .answer-list li { position: relative; padding-left: 15px; line-height: 1.6; }
+    .answer-list li::before {
+      content: ""; position: absolute; left: 0; top: .7em;
+      width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+    }
+    .answer-steps li { padding-left: 0; }
+    .answer-steps li::before { display: none; }
+    .answer-code {
+      margin: 8px 0 0; padding: 10px 12px; background: var(--code);
+      border: 1px solid var(--line); border-radius: 6px;
+      font: 12.5px/1.5 Consolas, "Courier New", monospace; white-space: pre; overflow-x: auto;
+    }
+    .citation-badge {
+      display: inline-flex; align-items: center; justify-content: center;
+      min-width: 18px; height: 18px; margin: 0 2px; padding: 0 5px;
+      border: 1px solid #b8d3e8; border-radius: 999px; background: var(--accent-soft);
+      color: var(--accent-strong); font-size: 11.5px; font-weight: 700; vertical-align: text-bottom;
+      cursor: pointer;
+    }
+    .hint {
+      margin-top: 10px; padding: 9px 12px; border-radius: 8px;
+      background: #f7f9fb; border: 1px solid var(--line); color: var(--muted);
+    }
+    .hint.error { background: #fff6f4; border-color: #f3c4bd; color: var(--bad); }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .chip {
+      border: 1px solid #b8d3e8; background: var(--accent-soft); color: var(--accent-strong);
+      border-radius: 999px; padding: 3px 12px; min-height: 0; font-size: 13px;
+    }
+    details.sources { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 8px; }
+    details.sources summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+    .source-item {
+      border-left: 3px solid var(--accent); padding: 7px 10px; margin-top: 8px;
+      background: #f8fafc; border-radius: 0 6px 6px 0;
+    }
+    .source-item.flash { background: var(--accent-soft); }
+    .source-title { font-weight: 600; font-size: 13px; }
+    .source-text { font-size: 13px; color: #344054; white-space: pre-wrap; max-height: 9.5em; overflow: hidden; }
+    .source-item.open .source-text { max-height: none; }
+    .turn-meta { margin-top: 8px; font-size: 12px; color: var(--muted); }
+    .composer {
+      flex: none;
+      background: var(--panel);
+      border-top: 1px solid var(--line);
+      padding: 12px 20px 14px;
+    }
+    .composer-inner { max-width: 860px; margin: 0 auto; }
+    .composer-box {
+      display: flex; gap: 10px; align-items: flex-end;
+      border: 1px solid var(--line); border-radius: 10px; padding: 8px 8px 8px 12px; background: #fff;
+    }
+    .composer-box:focus-within { border-color: var(--accent); }
+    .composer-box textarea {
+      flex: 1; border: 0; outline: none; resize: none; min-height: 24px; max-height: 180px;
+      padding: 5px 0; background: transparent; color: var(--text); line-height: 1.5;
+    }
+    .composer-meta { display: flex; gap: 16px; align-items: center; margin-top: 8px; font-size: 13px; }
+
+    /* Documents and settings */
+    .page { overflow-y: auto; width: 100%; padding: 20px; }
+    .page-inner { max-width: 1000px; margin: 0 auto; display: grid; gap: 16px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; min-width: 0; }
+    .drop {
+      border: 2px dashed #c4d3e1; border-radius: 10px; padding: 26px; text-align: center;
+      background: #fbfcfe; transition: background .15s, border-color .15s;
+    }
+    .drop.over { background: var(--accent-soft); border-color: var(--accent); }
+    .drop .big { font-size: 15px; margin-bottom: 6px; }
+    .upload-row { display: grid; grid-template-columns: minmax(0, 1fr) 160px 90px; gap: 10px; align-items: center; margin-top: 8px; font-size: 13px; }
+    .bar { height: 6px; background: #e8edf2; border-radius: 999px; overflow: hidden; }
+    .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+    .bar.indeterminate > div { width: 30%; animation: slide 1.4s ease-in-out infinite; }
+    @keyframes slide { from { margin-left: -30%; } to { margin-left: 100%; } }
+    .job-text { margin-bottom: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; }
+    td.num { white-space: nowrap; color: var(--muted); }
+    .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap; border: 1px solid var(--line); }
+    .tag.ready { color: var(--ok); border-color: #b7e0c8; background: #f1faf4; }
+    .tag.warn { color: var(--warn); border-color: #f0d6aa; background: #fffaf0; }
+    .tag.bad { color: var(--bad); border-color: #f3c4bd; background: #fff6f4; }
+    .review-item { border: 1px solid #f0d6aa; background: #fffaf0; border-radius: 8px; padding: 10px 12px; margin-top: 8px; }
+    .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .metric { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fbfcfd; }
+    .metric .label { color: var(--muted); font-size: 12px; }
+    .metric .value { margin-top: 4px; font-size: 20px; font-weight: 700; }
+    .stack { display: grid; gap: 10px; }
+    .grid-buttons { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
+    .log {
+      max-height: 280px; overflow: auto; background: #101418; color: #e8edf2; border-radius: 6px;
+      padding: 10px; font: 12px/1.5 Consolas, "Cascadia Mono", monospace; white-space: pre-wrap;
+    }
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .feedback { display: inline-flex; gap: 10px; margin-left: 12px; }
+    .feedback button { border: 0; background: none; padding: 0; min-height: 0; color: var(--muted); font-size: 12px; }
+    .feedback button:hover { color: var(--accent); }
+    .feedback button.chosen { color: var(--accent-strong); font-weight: 700; }
+    .stat-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-top: 12px; }
+    .metric .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .chart-wrap { position: relative; }
+    .chart-wrap svg { display: block; width: 100%; height: 190px; }
+    .chart-tip {
+      position: absolute; pointer-events: none; background: #1d2329; color: #fff; font-size: 12px;
+      padding: 6px 9px; border-radius: 6px; white-space: nowrap; transform: translate(-50%, -100%); display: none;
+    }
+    .segmented { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+    .segmented button { border: 0; border-radius: 0; min-height: 34px; padding: 6px 16px; background: #fff; color: var(--muted); }
+    .segmented button + button { border-left: 1px solid var(--line); }
+    .segmented button.active { background: var(--accent); color: #fff; }
+    @media (max-width: 760px) {
+      .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .two-col { grid-template-columns: 1fr; }
+      .answer-list { grid-template-columns: 1fr; }
+      .upload-row { grid-template-columns: 1fr; }
+      .bubble-user { max-width: 92%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <h1 id="appTitle">知识库问答助手</h1>
+      <nav id="tabs">
+        <button data-view="chatView" class="active">问答</button>
+        <button data-view="docsView" class="admin-only">资料</button>
+        <button data-view="statsView" class="admin-only">统计</button>
+        <button data-view="settingsView" class="admin-only">设置</button>
+      </nav>
+      <div class="spacer"></div>
+      <div id="statusChip" class="status-chip warn"><span class="dot"></span><span>检查中</span></div>
+      <button id="logoutBtn" class="link" hidden>退出登录</button>
+    </div>
+  </header>
+  <main>
+    <section id="chatView" class="view active">
+      <div id="thread" class="thread">
+        <div id="threadInner" class="thread-inner">
+          <div id="welcome" class="welcome"></div>
+        </div>
+      </div>
+      <div class="composer">
+        <div class="composer-inner">
+          <div class="composer-box">
+            <textarea id="question" rows="1" placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
+            <button id="sendBtn" class="primary">发送</button>
+          </div>
+          <div class="composer-meta">
+            <button id="newChatBtn" class="link">开始新对话</button>
+            <label class="check" title="资料里找不到时，到网上搜索补充（问题会发送给搜索引擎）"><input id="allowWeb" type="checkbox"> 联网补充</label>
+            <span id="composerHint" class="muted small"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="docsView" class="view">
+      <div class="page"><div class="page-inner">
+        <div class="panel">
+          <h2>上传资料</h2>
+          <div id="dropZone" class="drop">
+            <div class="big">把文件拖到这里，或 <button id="pickBtn" class="primary">选择文件</button></div>
+            <div class="muted small">支持 PDF、Word（.docx / .doc）、Excel（.xlsx）、Markdown（.md）、TXT；单个文件不超过 <span id="uploadMax">200</span> MB。同名文件会替换为新版本。上传后自动处理。</div>
+            <input id="fileInput" type="file" multiple hidden accept=".pdf,.docx,.doc,.xlsx,.md,.txt">
+          </div>
+          <div id="uploadList"></div>
+        </div>
+        <div class="panel" id="jobPanel" hidden>
+          <h2>处理进度</h2>
+          <div id="jobText" class="job-text"></div>
+          <div id="jobBarWrap" class="bar"><div id="jobBar"></div></div>
+          <div id="jobDetail" class="muted small" style="margin-top:6px"></div>
+        </div>
+        <div class="panel" id="reviewPanel" hidden>
+          <h2>需要确认的资料</h2>
+          <div class="muted small">这些文件有部分内容没能读取（例如扫描页、图片、嵌入的附件）。确认读出的内容可用后，点“确认可用”才会用来回答问题。</div>
+          <div id="reviewList"></div>
+        </div>
+        <div class="panel">
+          <div class="row between">
+            <h2 style="margin:0">资料列表</h2>
+            <div class="row">
+              <span id="docCounts" class="muted small"></span>
+              <button id="reprocessBtn">重新处理</button>
+              <button id="refreshDocsBtn">刷新</button>
+            </div>
+          </div>
+          <div id="docTable" class="muted" style="margin-top:10px">正在加载…</div>
+        </div>
+      </div></div>
+    </section>
+
+    <section id="statsView" class="view">
+      <div class="page"><div class="page-inner">
+        <div class="panel">
+          <div class="row between">
+            <h2 style="margin:0">使用统计</h2>
+            <div class="segmented" id="statsRange">
+              <button data-days="7">近 7 天</button>
+              <button data-days="30" class="active">近 30 天</button>
+              <button data-days="0">全部</button>
+            </div>
+          </div>
+          <div id="statCards" class="stat-cards"></div>
+          <div id="statsNote" class="muted small" style="margin-top:10px"></div>
+        </div>
+        <div class="panel">
+          <h2>每日提问</h2>
+          <div id="dailyChart" class="chart-wrap"></div>
+          <details style="margin-top:6px"><summary class="muted small">查看数据</summary><div id="dailyTable" style="margin-top:6px"></div></details>
+        </div>
+        <div class="panel">
+          <h2>答不出的问题</h2>
+          <div class="muted small">资料里找不到答案的问题，通常说明缺了相关文档。把对应资料上传后再问，就能答出来。</div>
+          <div id="gapTable" style="margin-top:8px"></div>
+        </div>
+        <div class="two-col">
+          <div class="panel"><h2>常问问题</h2><div id="topTable"></div></div>
+          <div class="panel"><h2>最常用到的资料</h2><div id="docUseTable"></div></div>
+        </div>
+        <div class="panel">
+          <h2>被标为“没用”的答案</h2>
+          <div id="unhelpfulTable"></div>
+        </div>
+      </div></div>
+    </section>
+
+    <section id="settingsView" class="view">
+      <div class="page"><div class="page-inner">
+        <div class="panel">
+          <div class="row between"><h2 style="margin:0">系统状态</h2><button id="refreshHealthBtn">刷新</button></div>
+          <div class="cards" style="margin-top:10px">
+            <div class="metric"><div class="label">资料文件</div><div id="rawCount" class="value">-</div></div>
+            <div class="metric"><div class="label">已索引文档</div><div id="docCount" class="value">-</div></div>
+            <div class="metric"><div class="label">分块</div><div id="chunkCount" class="value">-</div></div>
+            <div class="metric"><div class="label">待确认</div><div id="reviewCount" class="value">-</div></div>
+          </div>
+          <div id="healthDetail" class="small" style="margin-top:12px"></div>
+        </div>
+        <div class="two-col">
+          <div class="panel">
+            <h2>回答方式</h2>
+            <div class="segmented" id="modeSwitch">
+              <button data-mode="api">大模型 API 模式</button>
+              <button data-mode="local">本机模式</button>
+            </div>
+            <div id="modeHint" class="muted small" style="margin:8px 0 14px"></div>
+            <h2>大模型 API 设置</h2>
+            <div class="stack">
+              <select id="apiProvider"></select>
+              <input id="apiBaseUrl" placeholder="API 地址">
+              <input id="apiKey" type="password" placeholder="API Key（留空则沿用已保存的）" autocomplete="off">
+              <button id="discoverBtn">读取可用模型</button>
+              <select id="apiModel"><option value="">请先读取模型</option></select>
+              <button id="saveApiBtn" class="primary">保存并验证</button>
+              <div id="apiConfigMeta" class="muted small"></div>
+            </div>
+          </div>
+          <div class="panel">
+            <h2>维护</h2>
+            <div class="grid-buttons">
+              <button data-job="update">增量更新</button>
+              <button data-job="rebuild">全部重新处理</button>
+              <button data-job="vector-rebuild">重建向量索引</button>
+              <button data-action="/api/embedding-verify" data-name="验证向量模型">验证向量模型</button>
+              <button data-action="/api/vector-verify" data-name="验证向量索引">验证向量索引</button>
+              <button id="diagnosticsBtn">检索诊断</button>
+              <button data-action="/api/ocr-eval" data-name="OCR 评测">OCR 评测</button>
+              <button id="openRawBtn">打开资料文件夹</button>
+            </div>
+            <div class="muted small" style="margin-top:8px">检索诊断使用问答页输入框里的问题。</div>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>运行日志</h2>
+          <div id="log" class="log">Web UI 已启动。</div>
+        </div>
+      </div></div>
+    </section>
+  </main>
+
+  <script>
+    const LKA = /*LKA_CONFIG*/{"admin": true, "title": "知识库问答助手", "loginRequired": false, "uploadMaxMb": 200};
+    const $ = (id) => document.getElementById(id);
+    const MAX_HISTORY = 3;
+    let history = [];
+    let asking = false;
+    let lastHealth = null;
+    let lastStatus = null;
+    let jobTimer = null;
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, (ch) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'}[ch]));
+    }
+    function log(message, data) {
+      const line = `[${new Date().toLocaleTimeString()}] ${message}`;
+      const text = data ? `${line}\n${JSON.stringify(data, null, 2)}\n` : line;
+      $('log').textContent = `${text}\n${$('log').textContent}`;
+    }
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        headers: {'Content-Type': 'application/json'},
+        ...options
+      });
+      if (response.status === 401) {
+        location.reload();
+        throw new Error('请先登录');
+      }
+      const data = await response.json();
+      if (!response.ok || data.ok === false) throw new Error(data.error || response.statusText);
+      return data;
+    }
+    function formatTime(value) {
+      if (!value) return '-';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    }
+    function formatSize(bytes) {
+      if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+      if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+      return `${bytes} B`;
+    }
+
+    // ---- Tabs and status ----
+    function showView(id) {
+      document.querySelectorAll('.view').forEach((view) => view.classList.toggle('active', view.id === id));
+      document.querySelectorAll('#tabs button').forEach((button) => button.classList.toggle('active', button.dataset.view === id));
+      if (id === 'docsView') loadDocuments();
+      if (id === 'settingsView') { loadHealth(); loadApiConfig(); }
+      if (id === 'statsView') loadStats();
+      if (id === 'chatView') $('question').focus();
+    }
+    function setChip(kind, text) {
+      $('statusChip').className = `status-chip ${kind}`;
+      $('statusChip').querySelector('span:last-child').textContent = text;
+    }
+    async function loadStatus() {
+      try {
+        const data = await api('/api/status');
+        lastStatus = data;
+        if (data.processing) setChip('warn', '正在处理资料');
+        else if (!data.documents) setChip('warn', '还没有资料');
+        else if (data.api_failure) setChip('bad', `${API_FAILURE_LABELS[data.api_failure.kind] || 'API 调用失败'}，已改用本机回答`);
+        else if (data.needs_review && LKA.admin) setChip('warn', `${data.needs_review} 份资料待确认`);
+        else setChip('ok', `可以提问 · ${data.documents} 份资料 · ${data.api ? 'API 模式' : '本机模式'}`);
+        renderWelcome();
+        if (data.processing && LKA.admin) watchJob();
+      } catch (error) {
+        setChip('bad', '服务不可用');
+      }
+    }
+
+    const API_FAILURE_LABELS = {
+      balance: 'API 余额不足', key: 'API Key 无效', rate: 'API 被限流', network: 'API 连不上', other: 'API 调用失败'
+    };
+    function renderApiFailure(bot, failure) {
+      if (!failure) return;
+      const node = document.createElement('div');
+      node.className = 'hint error';
+      // Colleagues on the network cannot fix the account; they only need to know the answer is the local one.
+      node.textContent = LKA.admin
+        ? `${failure.message}。这次改用本机方式回答，准确率会低一些。`
+        : '大模型服务暂时不可用，这次改用本机方式回答，准确率会低一些。';
+      bot.appendChild(node);
+    }
+
+    // ---- Chat ----
+    function renderWelcome() {
+      const welcome = $('welcome');
+      if (!welcome) return;
+      const docs = lastStatus?.documents || 0;
+      if (lastStatus && !docs) {
+        welcome.innerHTML = `<h2>知识库里还没有资料</h2>
+          <div class="muted">${LKA.admin ? '先上传你的文档（PDF、Word、Excel 等），处理完成后就可以提问。' : '请联系管理员上传资料后再提问。'}</div>
+          ${LKA.admin ? '<div style="margin-top:12px"><button class="primary" onclick="showView(\'docsView\')">去上传资料</button></div>' : ''}`;
+        return;
+      }
+      welcome.innerHTML = `<h2>有什么想问的？</h2>
+        <div class="muted">答案只依据${docs ? ` ${docs} 份` : ''}已上传的资料，并标出出处；资料里没有的内容会直接说明。</div>
+        <ul>
+          <li>可以问流程步骤、参数数值、判定标准、名词解释等。</li>
+          <li>可以接着追问，例如“它最多重试几次？”“那另一个型号呢？”。</li>
+          <li>点答案里的编号可以查看对应的原文。</li>
+        </ul>`;
+    }
+    function scrollThread() {
+      const thread = $('thread');
+      thread.scrollTop = thread.scrollHeight;
+    }
+    function autoResize() {
+      const box = $('question');
+      box.style.height = 'auto';
+      box.style.height = `${Math.min(box.scrollHeight, 180)}px`;
+    }
+    function newChat() {
+      if (asking) return;
+      history = [];
+      $('threadInner').innerHTML = '<div id="welcome" class="welcome"></div>';
+      renderWelcome();
+      $('composerHint').textContent = '';
+      $('question').focus();
+    }
+    function appendTurn(question) {
+      $('welcome')?.remove();
+      const turn = document.createElement('div');
+      turn.className = 'turn';
+      const user = document.createElement('div');
+      user.className = 'bubble-user';
+      user.textContent = question;
+      const bot = document.createElement('div');
+      bot.className = 'bubble-bot';
+      bot.innerHTML = '<div class="waiting"><span class="spinner"></span><span class="waiting-text">正在查找资料…</span></div>';
+      turn.append(user, bot);
+      $('threadInner').appendChild(turn);
+      scrollThread();
+      return bot;
+    }
+    async function ask(text) {
+      const question = (text ?? $('question').value).trim();
+      if (!question || asking) return;
+      asking = true;
+      $('sendBtn').disabled = true;
+      $('question').value = '';
+      autoResize();
+      const bot = appendTurn(question);
+      const started = performance.now();
+      let understood = '';
+      let meta = {};
+      let sources = [];
+      let answer = '';
+      let recordId = '';
+      try {
+        const response = await fetch('/api/query-stream', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({question, history: history.slice(-MAX_HISTORY), use_web: $('allowWeb').checked, allow_api: true, limit: 5})
+        });
+        if (response.status === 401) { location.reload(); return; }
+        if (!response.ok || !response.body) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(data.error || response.statusText);
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let answerNode = null;
+        while (true) {
+          const {value, done} = await reader.read();
+          buffer += decoder.decode(value || new Uint8Array(), {stream: !done});
+          const blocks = buffer.split('\n\n');
+          buffer = blocks.pop() || '';
+          for (const block of blocks) {
+            if (!block.trim()) continue;
+            const lines = block.split('\n');
+            const eventName = (lines.find((line) => line.startsWith('event: ')) || 'event: message').slice(7);
+            const dataLine = lines.find((line) => line.startsWith('data: '));
+            if (!dataLine) continue;
+            const data = JSON.parse(dataLine.slice(6));
+            if (eventName === 'status') {
+              const node = bot.querySelector('.waiting-text');
+              if (node) node.textContent = data.message + (data.elapsed_seconds ? `（${data.elapsed_seconds} 秒）` : '');
+            } else if (eventName === 'understood') {
+              understood = data.question || '';
+            } else if (eventName === 'meta') {
+              meta = data;
+            } else if (eventName === 'sources') {
+              sources = data.sources || [];
+            } else if (eventName === 'answer-start') {
+              bot.innerHTML = '';
+              if (understood) {
+                const note = document.createElement('div');
+                note.className = 'understood';
+                note.textContent = `按“${understood}”理解你的问题`;
+                bot.appendChild(note);
+              }
+              answerNode = document.createElement('div');
+              answerNode.className = 'answer';
+              bot.appendChild(answerNode);
+            } else if (eventName === 'answer-delta') {
+              answer += data.text || '';
+              renderAnswer(answerNode, answer);
+              scrollThread();
+            } else if (eventName === 'done') {
+              recordId = data.record_id || '';
+            } else if (eventName === 'error') {
+              throw new Error(data.error || '查询失败');
+            }
+          }
+          if (done) break;
+        }
+        renderApiFailure(bot, meta.api_failure);
+        renderGuidance(bot, meta.user_guidance, answer);
+        renderSources(bot, sources);
+        const seconds = ((performance.now() - started) / 1000).toFixed(1);
+        const metaLine = document.createElement('div');
+        metaLine.className = 'turn-meta';
+        const parts = [`用时 ${seconds} 秒`];
+        if (meta.source_type === 'web_search' || meta.web_search_provider) parts.push('含联网搜索结果');
+        if (meta.index_status === 'updating') parts.push('资料正在更新，稍后再问可得到最新结果');
+        metaLine.textContent = parts.join(' · ');
+        if (recordId) metaLine.appendChild(feedbackButtons(recordId));
+        bot.appendChild(metaLine);
+        history.push({question: understood || question, answer: answer.slice(0, 600)});
+        if (history.length > MAX_HISTORY) history = history.slice(-MAX_HISTORY);
+        log('提问完成', {question, understood_as: understood || undefined, source_type: meta.source_type, sources: sources.length, api: meta.api_used, cache: meta.cache_hit, agent_rounds: meta.agent_rounds});
+      } catch (error) {
+        bot.innerHTML = '';
+        const node = document.createElement('div');
+        node.className = 'hint error';
+        node.textContent = `没有得到答案：${error.message}`;
+        bot.appendChild(node);
+        log('提问失败', {question, error: error.message});
+      } finally {
+        asking = false;
+        $('sendBtn').disabled = false;
+        scrollThread();
+        $('question').focus();
+      }
+    }
+    function renderGuidance(bot, guidance, answer) {
+      if (!guidance || !(guidance.hint || guidance.message)) return;
+      const text = guidance.hint || guidance.message;
+      const squash = (value) => String(value || '').replace(/[\s，。,.]/g, '');
+      // The answer may already say it («知识库里还没有可用的资料…»): then only the buttons are added.
+      const repeated = squash(answer).includes(squash(text).slice(0, 12));
+      const suggestions = guidance.suggested_questions || [];
+      const showUpload = guidance.kind === 'no_index_no_faq' && LKA.admin;
+      if (repeated && !suggestions.length && !showUpload) return;
+      const node = document.createElement('div');
+      node.className = `hint ${guidance.severity === 'error' && !repeated ? 'error' : ''}`;
+      if (!repeated) node.textContent = text;
+      if (suggestions.length) {
+        const chips = document.createElement('div');
+        chips.className = 'chips';
+        suggestions.forEach((item) => {
+          const chip = document.createElement('button');
+          chip.className = 'chip';
+          chip.textContent = item;
+          chip.onclick = () => ask(item);
+          chips.appendChild(chip);
+        });
+        node.appendChild(chips);
+      }
+      if (showUpload) {
+        const go = document.createElement('div');
+        if (!repeated) go.style.marginTop = '8px';
+        go.innerHTML = '<button class="primary">去上传资料</button>';
+        go.querySelector('button').onclick = () => showView('docsView');
+        node.appendChild(go);
+      }
+      bot.appendChild(node);
+    }
+    function renderSources(bot, items) {
+      if (!items.length) return;
+      const details = document.createElement('details');
+      details.className = 'sources';
+      const summary = document.createElement('summary');
+      const files = [...new Set(items.map((item) => item.file || item.title || item.url).filter(Boolean))];
+      summary.textContent = `出处（${items.length}）：${files.slice(0, 3).join('、')}${files.length > 3 ? ' 等' : ''}`;
+      details.appendChild(summary);
+      items.forEach((item) => {
+        const node = document.createElement('div');
+        node.className = 'source-item';
+        node.dataset.sourceId = item.source_id;
+        const title = document.createElement('div');
+        title.className = 'source-title';
+        title.textContent = `[${item.source_id}] ${item.file || item.title || '来源'}`;
+        const where = document.createElement('div');
+        where.className = 'muted small';
+        where.textContent = item.url || item.file_path || '';
+        const text = document.createElement('div');
+        text.className = 'source-text';
+        text.textContent = item.excerpt || item.citation || item.snippet || '';
+        node.append(title, where, text);
+        node.onclick = () => node.classList.toggle('open');
+        node.title = '点击展开或收起全文';
+        details.appendChild(node);
+      });
+      bot.appendChild(details);
+      bot.querySelectorAll('.citation-badge').forEach((badge) => {
+        badge.onclick = () => {
+          details.open = true;
+          const target = details.querySelector(`.source-item[data-source-id="${badge.textContent}"]`);
+          if (!target) return;
+          target.classList.add('open', 'flash');
+          target.scrollIntoView({behavior: 'smooth', block: 'center'});
+          setTimeout(() => target.classList.remove('flash'), 1200);
+        };
+      });
+    }
+    function appendAnswerText(parent, text) {
+      String(text || '').split(/(\[\d+\])/g).forEach((part) => {
+        const citation = part.match(/^\[(\d+)\]$/);
+        if (citation) {
+          const badge = document.createElement('span');
+          badge.className = 'citation-badge';
+          badge.textContent = citation[1];
+          badge.title = '查看出处';
+          parent.appendChild(badge);
+        } else if (part) {
+          parent.appendChild(document.createTextNode(part));
+        }
+      });
+    }
+    function addParagraph(container, text, className = '') {
+      const value = String(text || '').trim();
+      if (!value) return;
+      const paragraph = document.createElement('p');
+      if (className) paragraph.className = className;
+      appendAnswerText(paragraph, value);
+      container.appendChild(paragraph);
+    }
+    function renderAnswer(container, text) {
+      container.innerHTML = '';
+      const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
+      if (!normalized) return;
+      const listMarker = '包含以下测试项：';
+      const markerIndex = normalized.indexOf(listMarker);
+      if (markerIndex >= 0) {
+        addParagraph(container, normalized.slice(0, markerIndex).trim());
+        addParagraph(container, '测试项', 'answer-heading');
+        const list = document.createElement('ul');
+        list.className = 'answer-list';
+        normalized.slice(markerIndex + listMarker.length).split('；').map((item) => item.trim()).filter(Boolean).forEach((item) => {
+          const row = document.createElement('li');
+          appendAnswerText(row, item);
+          list.appendChild(row);
+        });
+        container.appendChild(list);
+        return;
+      }
+      normalized.split(/\n{2,}/).forEach((block) => {
+        const lines = block.split('\n').map((line) => line.trim()).filter(Boolean);
+        // Runs of bullet lines become lists; a lead sentence followed by bullets stays a paragraph.
+        let paragraph = [];
+        let list = null;
+        let code = null;
+        const flush = () => {
+          if (paragraph.length) addParagraph(container, paragraph.join(' '));
+          paragraph = [];
+        };
+        const addCode = () => {
+          const pre = document.createElement('pre');
+          pre.className = 'answer-code';
+          pre.textContent = code.join('\n');
+          container.appendChild(pre);
+          code = null;
+        };
+        const isBullet = (line) => /^[-*•]\s+/.test(line);
+        // "1. " / "2、" lines are steps in order (not "2.5V"); they keep their numbers in one column.
+        const isStep = (line) => /^\d{1,2}[.、](?!\d)\s*\S/.test(line);
+        lines.forEach((line, index) => {
+          if (line.startsWith('```')) {
+            if (code === null) { flush(); list = null; code = []; } else { addCode(); }
+            return;
+          }
+          if (code !== null) { code.push(line); return; }
+          // A short line right before bullets or code names the group below it.
+          const opening = !container.childElementCount && !paragraph.length;
+          const next = lines[index + 1] || '';
+          const startsGroup = isBullet(next) || isStep(next) || next.startsWith('```');
+          const bare = line.replace(/\s*\[\d+\]$/, '');
+          const groupName = !opening && startsGroup && !isBullet(line) && !isStep(line) && line.length <= 40 && (/[：:]$/.test(bare) || !/[。！？；，,.!?;]$/.test(bare));
+          if (groupName) {
+            flush();
+            list = null;
+            addParagraph(container, line, 'answer-heading');
+          } else if (isBullet(line) || isStep(line)) {
+            flush();
+            const className = isStep(line) ? 'answer-list answer-steps' : 'answer-list';
+            if (!list || list.className !== className) {
+              list = document.createElement('ul');
+              list.className = className;
+              container.appendChild(list);
+            }
+            const row = document.createElement('li');
+            appendAnswerText(row, isStep(line) ? line : line.replace(/^[-*•]\s+/, ''));
+            list.appendChild(row);
+          } else {
+            list = null;
+            paragraph.push(line);
+          }
+        });
+        if (code !== null) addCode();
+        flush();
+      });
+      // Two columns suit short items such as test-item names; long points read better in one.
+      container.querySelectorAll('.answer-list').forEach((list) => {
+        if ([...list.children].some((item) => item.textContent.length > 36)) list.classList.add('answer-list-wide');
+      });
+    }
+
+    function feedbackButtons(recordId) {
+      const box = document.createElement('span');
+      box.className = 'feedback';
+      [['有用', true], ['没用', false]].forEach(([label, helpful]) => {
+        const button = document.createElement('button');
+        button.textContent = label;
+        button.title = helpful ? '这个答案有帮助' : '这个答案不对或没帮助';
+        button.onclick = async () => {
+          try {
+            await api('/api/feedback', {method: 'POST', body: JSON.stringify({id: recordId, helpful})});
+            box.querySelectorAll('button').forEach((node) => node.classList.toggle('chosen', node === button));
+          } catch (error) {
+            log('反馈失败', {error: error.message});
+          }
+        };
+        box.appendChild(button);
+      });
+      return box;
+    }
+
+    // ---- Statistics ----
+    let statsDays = 30;
+    let lastDays = null;
+    window.addEventListener('resize', () => {
+      if (lastDays && $('statsView').classList.contains('active')) renderDailyChart(lastDays);
+    });
+    function percent(value) {
+      return value === null || value === undefined ? '-' : `${Math.round(value * 100)}%`;
+    }
+    function simpleTable(rows, columns, empty) {
+      if (!rows.length) return `<div class="muted small">${empty}</div>`;
+      const head = columns.map(([label]) => `<th>${label}</th>`).join('');
+      const body = rows.map((row) => `<tr>${columns.map(([, render, cls]) => `<td class="${cls || ''}">${render(row)}</td>`).join('')}</tr>`).join('');
+      return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+    }
+    function renderDailyChart(days) {
+      const box = $('dailyChart');
+      if (!days.length) { box.innerHTML = '<div class="muted small">暂无数据</div>'; return; }
+      // Drawn at the panel's own width, so text and bars keep their proportions.
+      const width = Math.max(320, Math.round(box.clientWidth || 900)), height = 190, left = 34, right = 8, top = 12, bottom = 26;
+      const plotW = width - left - right, plotH = height - top - bottom;
+      const totals = days.map((day) => day.answered + day.refused);
+      const max = Math.max(1, ...totals);
+      const niceMax = max <= 5 ? max : Math.ceil(max / 5) * 5;
+      const slot = plotW / days.length;
+      const barW = Math.max(2, Math.min(28, slot - 2));
+      const y = (value) => top + plotH - (value / niceMax) * plotH;
+      const parts = [];
+      // Recessive grid: the baseline and the top value only.
+      parts.push(`<line x1="${left}" x2="${width - right}" y1="${top + plotH}" y2="${top + plotH}" stroke="#c9d1db" stroke-width="1"/>`);
+      parts.push(`<line x1="${left}" x2="${width - right}" y1="${top}" y2="${top}" stroke="#eef1f4" stroke-width="1"/>`);
+      parts.push(`<text x="${left - 6}" y="${top + 4}" text-anchor="end" font-size="11" fill="#66717f">${niceMax}</text>`);
+      parts.push(`<text x="${left - 6}" y="${top + plotH + 4}" text-anchor="end" font-size="11" fill="#66717f">0</text>`);
+      const labelEvery = Math.ceil(days.length / 8);
+      days.forEach((day, index) => {
+        const total = totals[index];
+        const x = left + index * slot + (slot - barW) / 2;
+        if (total > 0) {
+          const barTop = y(total);
+          const h = top + plotH - barTop;
+          const r = Math.min(4, barW / 2, h);
+          // Rounded data end on top, square on the baseline.
+          parts.push(`<path d="M${x},${top + plotH} V${barTop + r} Q${x},${barTop} ${x + r},${barTop} H${x + barW - r} Q${x + barW},${barTop} ${x + barW},${barTop + r} V${top + plotH} Z" fill="#1769aa"/>`);
+        }
+        const lastIndex = days.length - 1;
+        // Every few days a date; the last day always, without a regular label crowding it.
+        if ((index % labelEvery === 0 && lastIndex - index >= labelEvery / 2) || index === lastIndex) {
+          parts.push(`<text x="${left + index * slot + slot / 2}" y="${height - 8}" text-anchor="middle" font-size="11" fill="#66717f">${day.day.slice(5)}</text>`);
+        }
+        // Hit target: the whole column, wider than the bar.
+        parts.push(`<rect class="hit" data-index="${index}" x="${left + index * slot}" y="${top}" width="${slot}" height="${plotH}" fill="transparent"/>`);
+      });
+      box.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="每日提问数">${parts.join('')}</svg><div class="chart-tip"></div>`;
+      lastDays = days;
+      const tip = box.querySelector('.chart-tip');
+      box.querySelectorAll('.hit').forEach((hit) => {
+        hit.addEventListener('mouseenter', () => {
+          const day = days[Number(hit.dataset.index)];
+          const rect = box.getBoundingClientRect();
+          const hitRect = hit.getBoundingClientRect();
+          tip.innerHTML = `${day.day}<br>提问 ${day.answered + day.refused} 次：答出 ${day.answered}，未答出 ${day.refused}`;
+          tip.style.left = `${hitRect.left - rect.left + hitRect.width / 2}px`;
+          tip.style.top = `${Math.max(0, y(day.answered + day.refused) / height * rect.height - 6)}px`;
+          tip.style.display = 'block';
+          hit.setAttribute('fill', 'rgba(23,105,170,0.06)');
+        });
+        hit.addEventListener('mouseleave', () => { tip.style.display = 'none'; hit.setAttribute('fill', 'transparent'); });
+      });
+      $('dailyTable').innerHTML = simpleTable([...days].reverse(), [
+        ['日期', (row) => row.day], ['答出', (row) => row.answered, 'num'], ['未答出', (row) => row.refused, 'num']
+      ], '暂无数据');
+    }
+    async function loadStats() {
+      try {
+        const data = await api(`/api/stats?days=${statsDays}`);
+        const totals = data.totals || {};
+        const cards = [
+          ['提问次数', totals.questions ?? 0, `答出 ${totals.answered ?? 0} · 未答出 ${totals.refused ?? 0}`],
+          ['答出率', percent(totals.answer_rate), totals.followups ? `其中追问 ${totals.followups} 次` : '资料里有答案的比例'],
+          ['估计节省时间', `${totals.hours_saved ?? 0} 小时`, `按每个答案省 ${totals.minutes_per_answer} 分钟估算`],
+          ['答案好评率', percent(totals.helpful_rate), `${totals.rated ?? 0} 次评价`],
+          ['回答用时', totals.median_seconds === null || totals.median_seconds === undefined ? '-' : `${totals.median_seconds} 秒`, '中位数']
+        ];
+        $('statCards').innerHTML = cards.map(([label, value, sub]) => `<div class="metric"><div class="label">${label}</div><div class="value">${escapeHtml(value)}</div><div class="sub">${escapeHtml(sub)}</div></div>`).join('');
+        const notes = [];
+        if (!data.recording) notes.push('提问记录已关闭（LKA_QUESTION_LOG=off），统计不再更新。');
+        if (totals.remote_questions) notes.push(`其中 ${totals.remote_questions} 次来自局域网里的其他电脑。`);
+        if (totals.api_failures) {
+          const kinds = Object.entries(totals.api_failure_kinds || {}).map(([kind, count]) => `${API_FAILURE_LABELS[kind] || kind} ${count} 次`).join('、');
+          notes.push(`有 ${totals.api_failures} 次因大模型 API 不可用改用本机回答（${kinds}）。`);
+        }
+        notes.push('统计只记录问答页里的提问，保存在本机 logs 文件夹，不会发送到别处。');
+        $('statsNote').textContent = notes.join(' ');
+        renderDailyChart(data.per_day || []);
+        $('gapTable').innerHTML = simpleTable(data.unanswered || [], [
+          ['问题', (row) => escapeHtml(row.question)], ['次数', (row) => row.count, 'num'], ['最近一次', (row) => row.last_time, 'num']
+        ], '没有答不出的问题。');
+        $('topTable').innerHTML = simpleTable(data.top_questions || [], [
+          ['问题', (row) => escapeHtml(row.question)], ['次数', (row) => row.count, 'num']
+        ], '还没有提问。');
+        $('docUseTable').innerHTML = simpleTable(data.top_documents || [], [
+          ['资料', (row) => escapeHtml(row.file)], ['被引用', (row) => `${row.count} 次`, 'num']
+        ], '还没有答案引用资料。');
+        $('unhelpfulTable').innerHTML = simpleTable(data.unhelpful || [], [
+          ['问题', (row) => escapeHtml(row.question)], ['答案开头', (row) => `<span class="muted">${escapeHtml(row.answer_start || '')}</span>`], ['时间', (row) => row.time, 'num']
+        ], '没有被标为“没用”的答案。');
+      } catch (error) {
+        $('statCards').innerHTML = `<div class="muted">统计读取失败：${escapeHtml(error.message)}</div>`;
+      }
+    }
+
+    // ---- Documents ----
+    const STATUS_TEXT = {
+      ready: ['可用', 'ready'],
+      processing: ['处理中', 'warn'],
+      outdated: ['待更新', 'warn'],
+      needs_review: ['待确认', 'warn'],
+      duplicate: ['重复', ''],
+      failed: ['未能读取', 'bad'],
+      unsupported: ['不支持的格式', 'bad']
+    };
+    async function loadDocuments() {
+      try {
+        const data = await api('/api/documents');
+        const items = data.documents || [];
+        const counts = data.counts || {};
+        $('docCounts').textContent = items.length ? `共 ${items.length} 个文件，${counts.ready || 0} 个可用` : '';
+        if (!items.length) {
+          $('docTable').className = 'muted';
+          $('docTable').textContent = '还没有资料。上传后会显示在这里。';
+        } else {
+          const rows = items.map((item) => {
+            const [label, kind] = STATUS_TEXT[item.status] || [item.status, ''];
+            const reasons = (item.reasons || []).length ? `<div class="muted small">${item.reasons.map(escapeHtml).join('<br>')}</div>` : '';
+            return `<tr>
+              <td>${escapeHtml(item.file_name)}<div class="muted small">${escapeHtml(item.file_path)}</div>${reasons}</td>
+              <td><span class="tag ${kind}">${label}</span></td>
+              <td class="num">${formatSize(item.size)}</td>
+              <td class="num">${formatTime(item.modified_at)}</td>
+              <td><button class="link danger" data-delete="${escapeHtml(item.file_path)}">删除</button></td>
+            </tr>`;
+          });
+          $('docTable').className = '';
+          $('docTable').innerHTML = `<table><thead><tr><th>文件</th><th>状态</th><th>大小</th><th>修改时间</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+          $('docTable').querySelectorAll('[data-delete]').forEach((button) => {
+            button.onclick = () => deleteDocument(button.dataset.delete);
+          });
+        }
+        await loadReviews();
+      } catch (error) {
+        $('docTable').textContent = `加载失败：${error.message}`;
+      }
+    }
+    async function loadReviews() {
+      const data = await api('/api/reviews');
+      const items = data.reviews || [];
+      $('reviewPanel').hidden = !items.length;
+      $('reviewList').innerHTML = '';
+      items.forEach((item) => {
+        const node = document.createElement('div');
+        node.className = 'review-item';
+        node.innerHTML = `<div class="row between"><strong>${escapeHtml(item.file_path)}</strong><button class="primary">确认可用</button></div>
+          <div class="muted small" style="margin-top:4px">${(item.reasons || item.warnings || []).map(escapeHtml).join('<br>')}</div>`;
+        node.querySelector('button').onclick = () => approveReview(item.file_path);
+        $('reviewList').appendChild(node);
+      });
+    }
+    async function approveReview(filePath) {
+      if (!confirm(`确认这个文件读出的内容可用，并加入知识库？\n${filePath}`)) return;
+      try {
+        await api('/api/reviews/approve', {method: 'POST', body: JSON.stringify({file_path: filePath})});
+        log('已确认资料', {file_path: filePath});
+        watchJob();
+      } catch (error) {
+        alert(`确认失败：${error.message}`);
+      }
+    }
+    async function deleteDocument(filePath) {
+      if (!confirm(`删除后这个文件不再用来回答问题。\n文件会移到 knowledge_base\\trash 文件夹，需要时可以手动找回。\n\n${filePath}`)) return;
+      try {
+        await api('/api/documents/delete', {method: 'POST', body: JSON.stringify({file_path: filePath})});
+        log('已删除资料', {file_path: filePath});
+        await loadDocuments();
+        watchJob();
+      } catch (error) {
+        alert(`删除失败：${error.message}`);
+      }
+    }
+    function uploadOne(file, row) {
+      return new Promise((resolve) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/upload');
+        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+        const bar = row.querySelector('.bar > div');
+        const state = row.querySelector('.state');
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) bar.style.width = `${Math.round(event.loaded / event.total * 100)}%`;
+        };
+        xhr.onload = () => {
+          let data = {};
+          try { data = JSON.parse(xhr.responseText); } catch (error) { data = {}; }
+          if (xhr.status === 200 && data.ok !== false) {
+            bar.style.width = '100%';
+            state.textContent = data.replaced ? '已替换' : '已上传';
+            resolve(true);
+          } else {
+            state.textContent = '失败';
+            state.title = data.error || xhr.statusText;
+            row.querySelector('.reason').textContent = data.error || xhr.statusText;
+            resolve(false);
+          }
+        };
+        xhr.onerror = () => {
+          state.textContent = '失败';
+          row.querySelector('.reason').textContent = '网络错误';
+          resolve(false);
+        };
+        xhr.send(file);
+      });
+    }
+    const UPLOAD_TYPES = ['.pdf', '.docx', '.doc', '.xlsx', '.md', '.txt'];
+    function uploadProblem(file) {
+      const dot = file.name.lastIndexOf('.');
+      const suffix = dot >= 0 ? file.name.slice(dot).toLowerCase() : '';
+      if (!UPLOAD_TYPES.includes(suffix)) return `不支持这种文件（${suffix || '没有扩展名'}）`;
+      if (!file.size) return '文件是空的';
+      if (file.size > LKA.uploadMaxMb * 1024 * 1024) return `文件超过 ${LKA.uploadMaxMb} MB`;
+      return '';
+    }
+    async function uploadFiles(files) {
+      if (!files.length) return;
+      const list = $('uploadList');
+      list.innerHTML = '';
+      const rows = [...files].map((file) => {
+        const row = document.createElement('div');
+        row.className = 'upload-row';
+        row.innerHTML = `<div>${escapeHtml(file.name)} <span class="muted small">${formatSize(file.size)}</span><div class="reason muted small" style="color:var(--bad)"></div></div>
+          <div class="bar"><div></div></div><div class="state muted small">等待上传</div>`;
+        list.appendChild(row);
+        return row;
+      });
+      let uploaded = 0;
+      for (let index = 0; index < files.length; index += 1) {
+        const problem = uploadProblem(files[index]);
+        if (problem) {
+          rows[index].querySelector('.state').textContent = '未上传';
+          rows[index].querySelector('.reason').textContent = problem;
+          continue;
+        }
+        rows[index].querySelector('.state').textContent = '上传中';
+        if (await uploadOne(files[index], rows[index])) uploaded += 1;
+      }
+      log('上传完成', {uploaded, total: files.length});
+      if (uploaded) {
+        await startJob('update');
+        loadDocuments();
+      }
+    }
+    async function startJob(kind) {
+      try {
+        const data = await api('/api/jobs', {method: 'POST', body: JSON.stringify({kind})});
+        log(data.queued ? '已排队：当前处理完成后继续' : '开始处理资料', {kind});
+        watchJob();
+      } catch (error) {
+        alert(error.message);
+      }
+    }
+    function phaseText(job) {
+      const phase = job.phase;
+      const info = job[phase] || {};
+      const reading = job.reading || {};
+      if (phase === 'waiting') return ['等待另一个更新完成…', null];
+      if (phase === 'reading') return [`正在读取：${reading.file || ''}（第 ${(reading.done || 0) + 1}/${reading.total || '?'} 个文件）`, reading.total ? (reading.done || 0) / reading.total : null];
+      if (phase === 'ocr') return [`正在识别扫描内容：${reading.file || ''}（第 ${(info.done || 0) + 1}/${info.total || '?'} 页）`, info.total ? (info.done || 0) / info.total : null];
+      if (phase === 'indexing') return ['正在建立索引…', null];
+      if (phase === 'embedding' && !info.done) return [`正在生成向量：0/${info.total || '?'}（第一批要先加载向量模型，可能需要一两分钟）`, null];
+      if (phase === 'embedding') return [`正在生成向量：${info.done}/${info.total || '?'}`, info.total ? info.done / info.total : null];
+      return ['准备处理…', null];
+    }
+    function renderJob(job) {
+      const panel = $('jobPanel');
+      if (!job || job.state === 'idle') { panel.hidden = true; return; }
+      panel.hidden = false;
+      const wrap = $('jobBarWrap');
+      const bar = $('jobBar');
+      const elapsed = job.elapsed_seconds ? `已用 ${Math.round(job.elapsed_seconds)} 秒` : '';
+      if (job.state === 'running') {
+        const [text, fraction] = phaseText(job);
+        $('jobText').textContent = `${job.label || '处理资料'}：${text}`;
+        wrap.classList.toggle('indeterminate', fraction === null);
+        bar.style.width = fraction === null ? '' : `${Math.round(fraction * 100)}%`;
+        $('jobDetail').textContent = [elapsed, job.queued ? '还有新上传的文件，完成后继续处理' : '', '处理期间可以照常提问'].filter(Boolean).join(' · ');
+      } else if (job.state === 'done') {
+        const summary = job.summary || {};
+        wrap.classList.remove('indeterminate');
+        bar.style.width = '100%';
+        const parts = [`处理完成：${summary.indexed_documents ?? summary.documents ?? 0} 份资料可用`];
+        if (summary.requires_review) parts.push(`${summary.requires_review} 份需要确认`);
+        if (summary.skipped && summary.skipped > (summary.requires_review || 0)) parts.push(`${summary.skipped - (summary.requires_review || 0)} 份未能读取`);
+        $('jobText').textContent = parts.join('，') + '。';
+        $('jobDetail').textContent = elapsed;
+      } else if (job.state === 'failed') {
+        wrap.classList.remove('indeterminate');
+        bar.style.width = '0';
+        $('jobText').textContent = `处理失败：${job.error || '未知错误'}`;
+        $('jobDetail').textContent = '可以稍后点“重新处理”再试；问题持续时请查看设置页的运行日志。';
+      }
+    }
+    function watchJob() {
+      if (jobTimer) return;
+      const tick = async () => {
+        try {
+          const job = await api('/api/jobs');
+          renderJob(job);
+          if (job.state === 'running') {
+            if (!lastStatus?.processing) loadStatus();
+            return;
+          }
+          clearInterval(jobTimer);
+          jobTimer = null;
+          log(job.state === 'failed' ? '处理失败' : '处理完成', job.summary || {error: job.error});
+          loadStatus();
+          if ($('docsView').classList.contains('active')) loadDocuments();
+        } catch (error) {
+          clearInterval(jobTimer);
+          jobTimer = null;
+        }
+      };
+      jobTimer = setInterval(tick, 1000);
+      tick();
+    }
+
+    // ---- Settings ----
+    function translationStatus(data) {
+      if (data.offline_translation?.en_to_zh_ready) return '可用（离线）';
+      if (data.online_translation?.en_to_zh_ready) return '可用（online）';
+      return '不可用';
+    }
+    async function loadHealth() {
+      try {
+        const data = await api('/api/health');
+        lastHealth = data;
+        $('rawCount').textContent = data.raw_supported_files ?? 0;
+        $('docCount').textContent = data.index?.documents ?? 0;
+        $('chunkCount').textContent = data.index?.chunks ?? 0;
+        $('reviewCount').textContent = data.pending_reviews ?? 0;
+        const lines = [
+          `索引时间：${formatTime(data.index?.indexed_at)}`,
+          `向量模型：${data.embedding?.enabled ? `${data.embedding?.model || '-'}（${data.embedding?.requested_dimensions || '-'} 维）` : '未启用'}`,
+          `向量索引：${data.vector_index?.ready ? '可用' : `降级（${data.vector_index?.reason || '-'}）`}`,
+          `OCR：${data.optional_extractors?.ocr_ready ? '可用（离线/online）' : '不可用'}`,
+          `英译中：${translationStatus(data)}`,
+          `大模型 API：${data.api_configured ? (data.api_backend_usable ? data.api_provider : '当前配置不可用') : '未配置（本机模式）'}`,
+          `资料文件夹：${data.raw_dir || '-'}`
+        ];
+        if ((data.raw_unsupported_files ?? []).length) lines.push(`不支持的文件（没有处理）：${data.raw_unsupported_files.join('；')}`);
+        $('healthDetail').innerHTML = lines.map((line) => `<div class="muted">${escapeHtml(line)}</div>`).join('');
+      } catch (error) {
+        $('healthDetail').textContent = `状态读取失败：${error.message}`;
+      }
+    }
+    let apiProviders = [];
+    function providerBaseUrl() {
+      return (apiProviders.find((item) => item.id === $('apiProvider').value) || {}).base_url || '';
+    }
+    const MODE_HINTS = {
+      api: '更准确：由大模型判断资料够不够、整理成要点作答，并理解追问。问题和检索到的资料片段会发送给所选的大模型服务，按调用计费（DeepSeek 每题不到 1 分钱）。',
+      local: '资料和问题都不离开这台电脑，不产生费用；答案直接摘取资料原文，追问按规则补全，准确率比 API 模式低一些。'
+    };
+    function renderMode(data) {
+      const mode = data.enabled && data.has_key ? 'api' : 'local';
+      document.querySelectorAll('#modeSwitch button').forEach((button) => button.classList.toggle('active', button.dataset.mode === mode));
+      $('modeHint').textContent = MODE_HINTS[mode] + (mode === 'local' && !data.has_key ? ' 要使用 API 模式，先在下方配置 API。' : '');
+    }
+    async function setMode(mode) {
+      try {
+        const data = await api('/api/api-mode', {method: 'POST', body: JSON.stringify({enabled: mode === 'api'})});
+        renderMode(data);
+        log(mode === 'api' ? '已切换到大模型 API 模式' : '已切换到本机模式');
+        loadStatus();
+      } catch (error) {
+        $('modeHint').textContent = error.message;
+      }
+    }
+    async function loadApiConfig() {
+      try {
+        const data = await api('/api/api-config');
+        renderMode(data);
+        apiProviders = data.providers || [];
+        $('apiProvider').innerHTML = apiProviders.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
+        $('apiProvider').value = data.provider || 'openai-compatible';
+        $('apiBaseUrl').value = data.base_url || providerBaseUrl();
+        $('apiConfigMeta').textContent = data.usable ? `当前模型：${data.model || '-'}` : (data.configured ? '已有配置不可用，请重新配置有效的 API Key' : '未配置，当前为本机模式');
+        if (data.model) $('apiModel').innerHTML = `<option value="${escapeHtml(data.model)}">${escapeHtml(data.model)}</option>`;
+      } catch (error) {
+        $('apiConfigMeta').textContent = `加载失败：${error.message}`;
+      }
+    }
+    async function discoverApiModels() {
+      $('apiConfigMeta').textContent = '正在读取可用模型…';
+      try {
+        const data = await api('/api/api-models', {method: 'POST', body: JSON.stringify({
+          provider: $('apiProvider').value, base_url: $('apiBaseUrl').value, api_key: $('apiKey').value
+        })});
+        $('apiModel').innerHTML = (data.models || []).map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join('');
+        $('apiConfigMeta').textContent = data.warning || `已读取 ${(data.models || []).length} 个模型`;
+      } catch (error) {
+        $('apiConfigMeta').textContent = `读取失败：${error.message}`;
+      }
+    }
+    async function saveApiConfig() {
+      $('apiConfigMeta').textContent = '正在验证模型调用…';
+      try {
+        const data = await api('/api/api-save', {method: 'POST', body: JSON.stringify({
+          provider: $('apiProvider').value, base_url: $('apiBaseUrl').value, api_key: $('apiKey').value, model: $('apiModel').value
+        })});
+        $('apiKey').value = '';
+        $('apiConfigMeta').textContent = `已启用：${data.provider} · ${data.model}`;
+        log('API 配置已保存', {provider: data.provider, model: data.model});
+        loadHealth();
+        loadApiConfig();
+        loadStatus();
+      } catch (error) {
+        $('apiConfigMeta').textContent = `保存失败：${error.message}`;
+      }
+    }
+    async function runAction(path, name, body = '{}') {
+      log(`${name}开始`);
+      try {
+        const data = await api(path, {method: 'POST', body});
+        log(`${name}完成`, data.summary || data);
+      } catch (error) {
+        log(`${name}失败`, {error: error.message});
+      }
+    }
+
+    // ---- Wiring ----
+    document.title = LKA.title;
+    $('appTitle').textContent = LKA.title;
+    $('uploadMax').textContent = LKA.uploadMaxMb;
+    if (!LKA.admin) document.querySelectorAll('.admin-only').forEach((node) => node.remove());
+    if (LKA.loginRequired) {
+      $('logoutBtn').hidden = false;
+      $('logoutBtn').onclick = async () => { await fetch('/api/logout', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}); location.reload(); };
+    }
+    document.querySelectorAll('#tabs button').forEach((button) => button.onclick = () => showView(button.dataset.view));
+    $('sendBtn').onclick = () => ask();
+    $('newChatBtn').onclick = newChat;
+    $('question').addEventListener('input', autoResize);
+    $('question').addEventListener('keydown', (event) => {
+      // Enter sends; Shift+Enter is a new line; Enter while an input method is composing picks a word.
+      if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+        event.preventDefault();
+        ask();
+      }
+    });
+    if (LKA.admin) {
+      const drop = $('dropZone');
+      $('pickBtn').onclick = () => $('fileInput').click();
+      $('fileInput').onchange = () => { uploadFiles([...$('fileInput').files]); $('fileInput').value = ''; };
+      ['dragenter', 'dragover'].forEach((name) => drop.addEventListener(name, (event) => { event.preventDefault(); drop.classList.add('over'); }));
+      ['dragleave', 'drop'].forEach((name) => drop.addEventListener(name, (event) => { event.preventDefault(); drop.classList.remove('over'); }));
+      drop.addEventListener('drop', (event) => uploadFiles([...event.dataTransfer.files]));
+      $('reprocessBtn').onclick = () => startJob('update');
+      $('refreshDocsBtn').onclick = loadDocuments;
+      $('refreshHealthBtn').onclick = loadHealth;
+      $('apiProvider').onchange = () => { $('apiBaseUrl').value = providerBaseUrl(); $('apiModel').innerHTML = '<option value="">请先读取模型</option>'; };
+      $('discoverBtn').onclick = discoverApiModels;
+      document.querySelectorAll('#modeSwitch button').forEach((button) => button.onclick = () => setMode(button.dataset.mode));
+      document.querySelectorAll('#statsRange button').forEach((button) => button.onclick = () => {
+        statsDays = Number(button.dataset.days);
+        document.querySelectorAll('#statsRange button').forEach((node) => node.classList.toggle('active', node === button));
+        loadStats();
+      });
+      $('saveApiBtn').onclick = saveApiConfig;
+      document.querySelectorAll('[data-job]').forEach((button) => {
+        button.onclick = () => {
+          if (button.dataset.job === 'rebuild' && !confirm('全部重新处理会重新读取所有资料，资料多时需要较长时间。继续？')) return;
+          startJob(button.dataset.job);
+        };
+      });
+      document.querySelectorAll('[data-action]').forEach((button) => button.onclick = () => runAction(button.dataset.action, button.dataset.name));
+      $('diagnosticsBtn').onclick = () => runAction('/api/retrieval-diagnostics', '检索诊断', JSON.stringify({question: $('question').value.trim()}));
+      $('openRawBtn').onclick = () => runAction('/api/open-raw-folder', '打开资料文件夹');
+      // Files dropped outside the drop zone would otherwise open in the browser.
+      window.addEventListener('dragover', (event) => event.preventDefault());
+      window.addEventListener('drop', (event) => event.preventDefault());
+    }
+    renderWelcome();
+    loadStatus();
+    setInterval(() => { if (!asking) loadStatus(); }, 30000);
+    $('question').focus();
+  </script>
+</body>
+</html>

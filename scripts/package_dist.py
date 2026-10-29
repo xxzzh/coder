@@ -35,8 +35,9 @@ OPTIONAL_ROOT_DIRS = [
     ".codex",
 ]
 
-# The evaluation set and its results describe the indexed documents; they stay on this machine.
-EVAL_LOCAL_ONLY = {"results", "eval_set.jsonl"}
+# The evaluation set, its results and the experiment log describe the indexed documents; they stay
+# on this machine, so the package carries no trace of them.
+EVAL_LOCAL_ONLY = {"results", "eval_set.jsonl", "experiment_log.md"}
 
 RAW_SUBDIRS = [
     "excel",

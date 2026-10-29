@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 import llm_budget
 
-AGENT_VERSION = "agent-v3"  # v3: numbered steps, values as written, refuse when only related; older cached answers are not reused
+AGENT_VERSION = "agent-v8"  # v8: v7 with made-up names in the prompt examples; older cached answers are not reused
 FIRST_ROUND_RESULTS = 10
 FOLLOW_UP_QUERIES = 3
 FOLLOW_UP_RESULTS = 5
@@ -58,8 +58,15 @@ SYSTEM_PROMPT = """你是本地知识库的检索问答助手。用户问题和�
    - 参数名、标识符、文件路径、数值、单位和门限照证据原文写，连同前面的标签一起照抄（如“CH1 :[-30,-60] CH2 :[-30,-60]”），不要翻译或改写，也不要把几个值合并成“均为……”。
    - 不要用 Markdown 表格、# 标题或加粗。
    - 每条要点末尾标注支持它的证据编号，写成 [#3]，多个来源写成 [#1][#3]；只引用真正支持该要点的编号。方括号里的数值区间等原文内容照抄即可，不要写成 [#…] 的形式。
-   - 只回答问到的内容；证据之间有冲突时分别列出并注明编号，不要擅自取舍。
+   - 只回答问到的内容；证据之间、或同一条证据内部（如表格的某一列和备注）给出不同的值时，分别列出各自的说法和出处并说明不一致，不要只取其一。
+   - 问位置、目录、路径时，照证据原文写出完整路径（如 Output/Cache/），不要改写成“程序目录下”之类的说法；不同证据的写法不同时都写出来。
+   - 问题用的说法在证据里没有、证据用的是另一个说法时（如问“节拍”，证据给的是测试时间和 UPH），开头先说明证据里对应的是哪一项，再给数值。
+   - 问到的项可能写在表格的英文列名下（版本—Version、工具—Tool/File Name、备注—Remark），按意思对应就算有。写“知识库里没有写明某项”之前，逐条核对每条证据和表格的每一列；证据里有，就直接回答，不能说没有。
+   - 只写回答这个问题需要的内容：问判定标准就写判定条件，问时长、数值、位置就写那个值和它的条件，不要附带执行步骤、测试用例或边界测试，除非问题问的就是步骤或流程。
+   - 回答完问到的内容后，证据里如果还写了做这件事直接用到的命令、工具或程序名、结果文件、测试条件（如距离、AP 类型），在最后的“其他：”组里补上，最多 3 条，每条一句；不要借此展开问题没问到的流程。
 2. decision 为 "search"：现有证据不足，但答案可能在知识库其他位置。在 queries 里给出 1 到 3 个新的检索语句，尽量用文档里可能出现的写法（英文标识符、参数名、章节标题式的说法），不要重复 searched_queries 里已有的。
+   final_round 为 false 时，只要证据提到了问题问的对象或同类内容、却缺少问到的那项信息（例如只出现字段名、没有对应的取值或映射；或者只讲了别的机型、别的工位的同类测试），就先选 "search"：用该对象在证据里的原名（英文名、参数名、章节名）加上缺少的那项去检索，例如“PANEL_SIZE 16 代码值”“X100 Aging 结果文件 判定”。证据里完全没有相关内容时，才在这一轮直接选 "refuse"。
+   同样在 final_round 为 false 时：证据的标题或说法表明还有并列的另一种情况（如“全局重试”说明还有单项重试，“精简测试方案”说明还有完整方案），而这种情况与问题有关、证据里又没有时，先选 "search"，用这些原名查一轮，再一起回答。
 3. decision 为 "refuse"：知识库里没有这项信息。证据只讲了相关的其他内容、没有问到的那项信息时，也选 "refuse"，不要改去回答相关内容；证据没有提到的事，不要推断成“不会”“没有”“不支持”来作答，这种情况也选 "refuse"。在 reason 里先说缺少什么，再用半句话提一下证据里相关的内容，例如“没有说明备份文件会保留多久，证据只提到每天凌晨自动备份”。
 
 final_round 为 true 时不能选 "search"，只能选 "answer" 或 "refuse"。
@@ -117,8 +124,15 @@ def parse_reply(content: str) -> dict[str, Any]:
         text = fenced.group(1)
     try:
         reply = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise AgentError(f"model reply is not JSON: {text[:120]!r}") from exc
+    except json.JSONDecodeError:
+        # Still the same reply: a line break or tab written raw inside the answer string, or a few
+        # words around the object. Read the outermost object and allow those characters.
+        start, end = text.find("{"), text.rfind("}")
+        candidate = text[start : end + 1] if 0 <= start < end else text
+        try:
+            reply = json.loads(candidate, strict=False)
+        except json.JSONDecodeError as exc:
+            raise AgentError(f"model reply is not JSON: {text[:120]!r}") from exc
     if not isinstance(reply, dict) or reply.get("decision") not in {"answer", "search", "refuse"}:
         raise AgentError(f"model reply has no valid decision: {text[:120]!r}")
     return reply

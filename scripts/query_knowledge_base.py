@@ -76,6 +76,7 @@ from kb.terms import (  # noqa: F401  (re-exported for callers of this module)
     requested_station_name,
     retrieval_question_with_aliases,
     section_context_question,
+    station_item_attribute_question,
     station_question_includes_schemes,
     station_test_item_question,
     strip_query_trailing_phrases,
@@ -263,7 +264,7 @@ project_runtime.apply_project_runtime_env()
 HOT_QUERY_THRESHOLD = 2
 CACHE_TTL_SECONDS = 3600
 NEGATIVE_CACHE_TTL_SECONDS = 120
-CACHE_VARIANT_VERSION = "retrieval-v59:word-boundary-coverage"
+CACHE_VARIANT_VERSION = "retrieval-v60:retry-search-expansion"
 # Answers built without a model (layout, gate, cited evidence). Raising it refreshes cached local
 # answers only; cached API answers stay valid and are not paid for again.
 LOCAL_ANSWER_VERSION = "local-v3"
@@ -466,7 +467,7 @@ def canonical_question_for_cache(question: str) -> str:
     if fft_manual_function_question(normalized):
         return "test-item:fft-manual-function"
     station_name = requested_station_name(normalized)
-    if station_name and station_test_item_question(normalized):
+    if station_name and station_test_item_question(normalized) and not station_item_attribute_question(normalized):
         detail = "schemes" if station_question_includes_schemes(normalized) else "items"
         return f"station:{station_name.lower()}:{detail}"
     return re.sub(r"\s+", " ", normalized.strip().lower())
@@ -576,46 +577,34 @@ def suggested_local_questions(question: str, db_path: Path | None = None) -> lis
     return candidates
 
 
-def guidance_subject(question: str, suggestions: list[str]) -> str:
-    if suggestions:
-        subject = re.split(r"有哪些测试项|的测试方案是什么|是什么", suggestions[0], maxsplit=1)[0].strip()
-        if subject:
-            return subject
-    return guidance_query_subject(question)
-
-
 def no_index_user_guidance(question: str, faq_missing: bool = True) -> dict[str, Any]:
-    suggestions = suggested_local_questions(question)
-    subject = guidance_subject(question, suggestions)
-    target = suggestions[0] if suggestions else ""
-    message = f"本地索引和 FAQ 都不可用，当前没有与「{subject}」相关的索引和 FAQ，无法从资料中判断这个问题。"
-    if not faq_missing:
-        message = f"本地索引不可用，FAQ 也没有命中与「{subject}」相关的足够依据。"
-    if target:
-        message += f" 你是否想问：{target}？请先建立索引后，再用这种更完整的问法查询。"
+    # Without an index there is nothing to suggest: the knowledge base needs documents first.
+    if faq_missing:
+        message = "知识库里还没有可用的资料。请先上传文档，处理完成后再提问。"
     else:
-        message += " 请先建立索引后，再换成更完整、包含对象和问题类型的问法查询。"
+        message = "知识库暂时不可用，常见问题里也没有找到相关内容。请稍后再试，或重新处理资料。"
     return {
         "kind": "no_index_no_faq" if faq_missing else "no_index_faq_no_match",
         "severity": "error",
         "message": message,
-        "suggested_questions": suggestions,
+        "hint": message,
+        "suggested_questions": [],
     }
 
 
 def local_no_match_user_guidance(question: str, db_path: Path | None = None) -> dict[str, Any]:
+    """What to try after a refusal. `hint` is the advice alone (the Web UI shows the suggested
+    questions as buttons next to it); `message` also names them, for the command line."""
     suggestions = suggested_local_questions(question, db_path)
-    subject = guidance_subject(question, suggestions)
-    target = suggestions[0] if suggestions else ""
-    message = f"本地索引存在，但当前问法没有命中与「{subject}」相关的足够依据。"
-    if target:
-        message += f" 你是否想问：{target}？请换成这种更完整的问法查询我们已有的索引答案。"
-    else:
-        message += " 请换成更完整、包含对象和问题类型的问法查询我们已有的索引答案。"
+    hint = "资料里可能没有这部分内容。可以换个问法，或确认相关资料已经上传。"
+    message = hint
+    if suggestions:
+        message += " 资料中有相关内容，可以试试问：" + "；".join(f"「{item}」" for item in suggestions) + "。"
     return {
         "kind": "local_no_match",
-        "severity": "error",
+        "severity": "info",
         "message": message,
+        "hint": hint,
         "suggested_questions": suggestions,
     }
 
@@ -859,9 +848,10 @@ def agent_retriever(db_path: Path, config: dict[str, str]) -> agentic_retrieval.
         rows, _ = search(db_path, query_text, limit, config)
         rows = rows[:limit]
         for row in rows:
-            # The whole section or table, as a local answer would cite it, so the model sees
-            # complete steps and rows rather than a fragment.
-            row["evidence"] = block_citation(full_section_text(db_path, row), query_text, max_chars)
+            # The whole section or table, so the model sees complete steps and rows rather than a
+            # fragment. Unlike a local answer's citation, a table that fits is not narrowed to the
+            # matching rows: a note under it («映射举例：尺寸"16"→0x02») is often the answer.
+            row["evidence"] = block_citation(full_section_text(db_path, row), query_text, max_chars, focus_rows=False)
         return rows
 
     return retrieve
@@ -1006,7 +996,7 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
                 **no_local_answer(
                     use_web,
                     question,
-                    "本地知识库索引不存在，请先运行 ingest。",
+                    "知识库里还没有可用的资料，请先上传文档。",
                     config=config,
                     allow_api=allow_api,
                     limit=limit,
@@ -1019,7 +1009,7 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
             else no_local_answer(
                 use_web,
                 question,
-                "本地知识库索引不存在，请先运行 ingest。",
+                "知识库里还没有可用的资料，请先上传文档。",
                 config=config,
                 allow_api=allow_api,
                 limit=limit,

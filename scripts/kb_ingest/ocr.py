@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from kb_ingest import progress
 from kb_ingest.files import PROJECT_ROOT, portable_error_message
 
 
@@ -200,7 +201,8 @@ def ocr_pdf(path: Path, pages: list[int] | None = None) -> tuple[str, list[str]]
         except Exception as exc:
             warnings.append(f"OCR render failed: {portable_error_message(exc)}")
             return "", warnings
-        for image_path in images:
+        for done, image_path in enumerate(images):
+            progress.report("ocr", done=done, total=len(images))
             page_index = int(re.sub(r"\D", "", image_path.stem) or 0)
             page_text = ocr_image(image_path)
             if page_text:

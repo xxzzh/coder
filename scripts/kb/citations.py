@@ -154,12 +154,14 @@ def focus_table_rows(lines: list[tuple[str, int]], question: str, terms: list[st
     return [line for index, (line, _) in enumerate(lines) if index in keep]
 
 
-def block_citation(text: str, question: str, max_chars: int, outline: bool = True) -> str:
+def block_citation(text: str, question: str, max_chars: int, outline: bool = True, focus_rows: bool = True) -> str:
     """A whole section or table as cited evidence, kept within max_chars.
 
     Lead-in lines that belong to the previous section are dropped. When the section is
     longer than the budget and outline is set, the sub-headings that did not fit are listed
-    so a step-by-step answer still shows every step.
+    so a step-by-step answer still shows every step. A table keeps only the rows the question
+    matches (focus_rows); without it, a table that fits the budget is kept whole together with
+    the notes around it.
     """
     lines = evidence_lines(text)
     if not lines:
@@ -171,6 +173,8 @@ def block_citation(text: str, question: str, max_chars: int, outline: bool = Tru
     top_level = min((level for _, level in lines if level), default=0)
     is_table = len(lines) >= 2 and sum(" | " in line for line, _ in lines) >= len(lines) * 0.5
     if is_table:
+        if not focus_rows and sum(len(line) + 1 for line, _ in lines) <= max_chars:
+            return "\n".join(line for line, _ in lines)
         rows = focus_table_rows(lines, question, terms)
         if sum(len(row) + 1 for row in rows) > max_chars:
             # Shorten rows before dropping any: leading cells (number, item, sub-item) identify a row,

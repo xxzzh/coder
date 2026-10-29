@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -71,6 +72,21 @@ def write_env(values: dict[str, str], path: Path = ENV_PATH) -> None:
         safe_value = str(value).replace("\\", "\\\\").replace("\n", "")
         lines.append(f"{key}={safe_value}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def set_env_value(key: str, value: str, path: Path = ENV_PATH) -> None:
+    """Change one setting in place (or add it), keeping the file's other lines, comments and line endings."""
+    text = path.read_bytes().decode("utf-8") if path.exists() else ""
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines()
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    for index, line in enumerate(lines):
+        if pattern.match(line):
+            lines[index] = f"{key}={value}"
+            break
+    else:
+        lines.append(f"{key}={value}")
+    path.write_bytes((newline.join(lines) + newline).encode("utf-8"))
 
 
 def infer_provider(base_url: str = "", api_key: str = "", hint: str = "") -> str:

@@ -70,10 +70,11 @@ CONCEPT_SYNONYMS: dict[str, tuple[str, ...]] = {
 
 # Phrases users say that production documents write differently, so searching with the user's
 # word alone never reaches the evidence (操作员 -> 测试人力, 节拍 -> UPH / 测试时间, 老化 -> Aging in
-# the English-titled test flows, 摄像头 -> Camera in English and Traditional-Chinese test requirements).
+# the English-titled test flows, 摄像头 -> Camera in English and Traditional-Chinese test requirements,
+# 重新测试 -> 重试 / retry in flow charts and settings).
 # Only these widen the search; widening a phrase the documents do use (目录, 同时执行) just adds
 # ranking noise.
-SEARCH_EXPANDED_PHRASES = ("操作员", "节拍", "老化", "摄像头")
+SEARCH_EXPANDED_PHRASES = ("操作员", "节拍", "老化", "摄像头", "重新测试", "重新测")
 
 STOP_WORDS = {
     "什么",
@@ -374,6 +375,12 @@ def abbreviation_query_term(question: str) -> str | None:
 
 def station_test_item_question(question: str) -> bool:
     return bool(re.search(r"测试项|测试项目|(?:站位|工位|站点)\s*测试|测试\s*(?:站位|工位|站点)", question))
+
+
+def station_item_attribute_question(question: str) -> bool:
+    """«HDMI测试项目前是什么状态»: asks about an item's status, result, cause, limits or amounts,
+    not for a station's item list, so the station table must not answer it with the list."""
+    return bool(re.search(r"状态|进度|结果|原因|为什么|为何|多久|多少|是否|有没有|能不能|谁|门限|阈值", question))
 
 
 def station_question_includes_schemes(question: str) -> bool:

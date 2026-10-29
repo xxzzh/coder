@@ -278,20 +278,20 @@ UI_CHECKS: list[dict[str, Any]] = [
         "area": "页面加载",
         "question": "标题",
         "selector": "h1",
-        "must_contain": ["Local Knowledge Base Agent"],
+        "must_contain": ["知识库问答助手"],
     },
     {
         "id": "UI02",
         "area": "页面控件",
-        "question": "本地知识库/online",
+        "question": "发送/新对话/联网补充/资料/设置",
         "selector": "body",
-        "must_contain": ["本地知识库", "online"],
+        "must_contain": ["发送", "开始新对话", "联网补充", "资料", "设置"],
     },
     {
         "id": "UI03",
         "area": "状态模块",
         "question": "索引时间/OCR",
-        "selector": "body",
+        "selector": "#settingsView",
         "must_contain": ["索引时间：", "OCR：可用（离线/online）"],
     },
 ]
@@ -315,12 +315,18 @@ def page_texts_http() -> dict[str, str]:
         f"索引时间：{(health.get('index') or {}).get('indexed_at') or '-'}",
         f"OCR：{'可用（离线/online）' if (health.get('optional_extractors') or {}).get('ocr_ready') else '不可用'}",
     ]
-    return {"h1": re.sub(r"<[^>]+>", "", h1.group(1)).strip() if h1 else "", "body": visible + "\n" + "\n".join(status_lines)}
+    return {
+        "h1": re.sub(r"<[^>]+>", "", h1.group(1)).strip() if h1 else "",
+        "body": visible,
+        "#settingsView": "\n".join(status_lines),
+    }
 
 
 def page_text_playwright(selector: str, label: str) -> str:
+    # The status lines are on the settings view, which the page fills in when it is opened.
+    opener = "showView('settingsView'); await new Promise((done) => setTimeout(done, 1500));" if selector == "#settingsView" else ""
     data = pw_eval(
-        "async () => JSON.stringify({text:(document.querySelector(%s)?.innerText || '')})" % json.dumps(selector),
+        "async () => {%s return JSON.stringify({text:(document.querySelector(%s)?.innerText || '')}); }" % (opener, json.dumps(selector)),
         label=label,
     )
     return data.get("text", "")

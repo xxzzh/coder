@@ -25,6 +25,9 @@ REQUIRED_FILES = [
     "scripts/test_retrieval_guardrails.py",
     "scripts/llm_budget.py",
     "scripts/test_llm_budget.py",
+    "scripts/web_agent.py",
+    "scripts/web_page.html",
+    "scripts/test_web_ui.py",
 ]
 
 
@@ -152,6 +155,11 @@ def main() -> int:
     budget = run_step([sys.executable, "scripts/test_llm_budget.py"])
     budget.pop("stdout", None)
     checks.append({"id": "llm-cost-control", "ok": budget["exitCode"] == 0, "details": budget})
+
+    # Follow-up questions, access rules, uploads and the Web UI server, on temporary folders.
+    web_ui = run_step([sys.executable, "scripts/test_web_ui.py"])
+    web_ui.pop("stdout", None)
+    checks.append({"id": "web-ui", "ok": web_ui["exitCode"] == 0, "details": web_ui})
 
     sources = run_step([sys.executable, "scripts/manage_knowledge_base.py", "sources"])
     sources_payload = parse_json_from_tail(sources)
