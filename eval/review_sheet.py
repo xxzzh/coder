@@ -87,8 +87,10 @@ def verdict_text(item: dict, answer: dict, verdicts: dict[str, dict]) -> tuple[s
     if item["category"] == "E":
         return ("正确拒答", False) if refused(answer) else ("给了答案（应拒答）", True)
     verdict = verdicts.get(item["id"])
+    if refused(answer):
+        return "拒答（没有作答）", True
     if not verdict:
-        return ("拒答" if refused(answer) else "作答（未判分）"), refused(answer)
+        return "作答（未判分）", False
     names = {"correct": "答对", "partial": "不完整", "wrong": "答错", "unjudged": "未判分"}
     label = names.get(verdict.get("verdict"), str(verdict.get("verdict")))
     reason = str(verdict.get("reason") or "")
