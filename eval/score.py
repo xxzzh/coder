@@ -11,7 +11,7 @@ Retrieval layer (general hybrid search, top-k chunks):
   MRR@k     1 / rank of the first hit chunk (0 when none)
   KwCov@k   share of gold keywords found anywhere in the top-k gold-doc chunks
 
-End-to-end layer (query(), including domain retrievers):
+End-to-end layer (query()):
   answered       the system returned an answer instead of "no evidence"
   AnsCov         share of gold keywords that appear in the answer text
   pass           answered and AnsCov >= answer_pass_ratio

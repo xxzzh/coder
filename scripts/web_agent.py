@@ -672,11 +672,15 @@ class AgentHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self.discard_unread_body()
             self.send_error_json(str(exc), HTTPStatus.INTERNAL_SERVER_ERROR)
+        finally:
+            # Requests that need no body (log out, start a job) may still carry one, such as "{}".
+            self.discard_unread_body()
 
     def discard_unread_body(self) -> None:
-        """A request refused before its body was read: read and drop a small body first. Windows
-        resets a connection closed with unread data, and the browser would then see a network error
-        instead of the reason; a large body is not read and the connection is closed."""
+        """A request answered without reading its body: read and drop a small body before the
+        connection closes. Windows resets a connection closed with unread data, and the browser
+        would then see a network error instead of the answer; a large body is not read and the
+        connection is closed."""
         if getattr(self, "body_read", True):
             return
         self.body_read = True

@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 import llm_budget
 
-AGENT_VERSION = "agent-v8"  # v8: v7 with made-up names in the prompt examples; older cached answers are not reused
+AGENT_VERSION = "agent-v9"  # v9: every meaning of an asked abbreviation, [n] read as a citation when no [#n]; older cached answers are not reused
 FIRST_ROUND_RESULTS = 10
 FOLLOW_UP_QUERIES = 3
 FOLLOW_UP_RESULTS = 5
@@ -54,6 +54,7 @@ SYSTEM_PROMPT = """你是本地知识库的检索问答助手。用户问题和�
    - 每条要点只讲一件事，用通顺的完整句子转述。把表格字段的堆砌（如“测试子项为…，工具为…，判定方式为…”）和用“-”连起来的片段改写成自然的说法；步骤按原顺序写，一条一个步骤或一个环节。
    - 合并重复或重叠的内容，同一件事只说一次，把支持它的编号放在一起。
    - 简洁指措辞精炼，不是删内容：列举类问题列出证据中的全部项，流程、步骤类问题完整列出每一步，关键条件、数值和判定标准都要保留。
+   - 只问一个缩写、术语或名称（如只问“PR”或“COB 是什么”）时，证据里给出的每一个含义都要列出，不要只挑一个。
    - 列举的条目（测试项、步骤名等）用证据里的原名，不要合并或改名；证据同时给出项目名和子项名时两个都写，如“WIFI吞吐量测试（T-put测试）”。
    - 参数名、标识符、文件路径、数值、单位和门限照证据原文写，连同前面的标签一起照抄（如“CH1 :[-30,-60] CH2 :[-30,-60]”），不要翻译或改写，也不要把几个值合并成“均为……”。
    - 不要用 Markdown 表格、# 标题或加粗。
@@ -141,6 +142,8 @@ def parse_reply(content: str) -> dict[str, Any]:
 # The model cites evidence as [#3]. Plain brackets are left alone: the documents are full of
 # bracketed data such as thresholds [10,20] or [-3,-7], which must never be read as citations.
 CITATION_PATTERN = re.compile(r"\[#\s*(\d+(?:\s*[,，、]\s*#?\s*\d+)*)\s*\]")
+# [3] written without the #: read as a citation only when an answer has no [#n] at all.
+PLAIN_CITATION = re.compile(r"\[(\d{1,2})\]")
 
 
 def citation_group_ids(group: str) -> list[int]:
@@ -264,6 +267,20 @@ def run_agent(
     if decision == "answer":
         ids = cited_ids(answer)
         known = {item["id"] for item in evidence}
+        plain = [int(value) for value in PLAIN_CITATION.findall(answer)]
+        if not ids and plain and set(plain) <= known:
+            # A short answer sometimes cites [1] instead of [#1]. With no [#n] at all and every
+            # bracketed number naming shown evidence, those brackets are its citations.
+            answer = PLAIN_CITATION.sub(lambda match: f"[#{match.group(1)}]", answer)
+            ids = cited_ids(answer)
+        listed = reply.get("evidence_ids")
+        if not ids and not plain and isinstance(listed, list) and listed:
+            # A one-line answer with no marker in its text, its evidence named only in evidence_ids:
+            # cite those at the end.
+            listed_ids = [value for value in listed if isinstance(value, int)]
+            if listed_ids and set(listed_ids) <= known:
+                answer = answer.rstrip() + "".join(f" [#{value}]" for value in dict.fromkeys(listed_ids))
+                ids = cited_ids(answer)
         if not answer or not ids:
             raise AgentError("answer cites no evidence")
         if not set(ids) <= known:

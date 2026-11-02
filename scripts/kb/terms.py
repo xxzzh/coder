@@ -33,10 +33,9 @@ QUERY_TRAILING_PHRASES = (
     "值",
 )
 
-QUERY_ALIAS_PHRASES = {
-    "FFT测试": ("人工功能测试", "MES：FFT", "IR CameraTest", "IR Camera Test", "IQCapture"),
-    "人工功能测试": ("FFT测试", "MES：FFT", "IR CameraTest", "IR Camera Test", "IQCapture"),
-}
+# Phrases searched together with their aliases (a question about one also searches the others).
+# Empty: aliases that only fit one set of documents do not belong in the shipped code.
+QUERY_ALIAS_PHRASES: dict[str, tuple[str, ...]] = {}
 
 # Everyday wording in a question -> the same idea as the documents write it. The local relevance
 # gate counts such a phrase as one subject unit that a chunk covers when it contains any of the
@@ -333,22 +332,6 @@ def enumeration_or_list_question(question: str) -> bool:
         re.search(
             r"哪些|那些|包含|包括|都有|几个|几种|几项|取值|枚举|列表|清单|有啥|有.*值|what\s+are|enum|values|list",
             question,
-            flags=re.IGNORECASE,
-        )
-    )
-
-
-def fft_manual_function_question(question: str) -> bool:
-    """Only a request for the item list itself, e.g. 「人工功能测试」 or 「FFT测试包含哪些测试项」.
-
-    A narrower question such as 「人工功能测试的 IR Camera 判定标准」 must go through
-    normal retrieval instead of receiving the whole list.
-    """
-    normalized = normalized_retrieval_question(question).strip()
-    return bool(
-        re.fullmatch(
-            r"(?:人工功能测试|FFT\s*测试|MES[:：]\s*FFT)\s*(?:都?(?:包含|包括|有))?\s*(?:哪些|那些)?\s*(?:测试项目?|项目?|内容)?",
-            normalized,
             flags=re.IGNORECASE,
         )
     )

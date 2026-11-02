@@ -328,9 +328,9 @@ def classify_query(question: str, config: dict[str, str] | None = None) -> dict[
     text = question.strip()
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9&./_-]{1,12}", text):
         return {"type": "abbreviation", "confidence": 0.9, "rewrites": [text]}
-    if re.search(r"站位|测试项|测试子项|门限|判定|治具|设备|N972|FFT", text, flags=re.IGNORECASE):
+    if re.search(r"站位|测试项|测试子项|门限|判定|治具|设备", text, flags=re.IGNORECASE):
         return {"type": "excel_table", "confidence": 0.85, "rewrites": [text]}
-    if re.search(r"代码|函数|枚举|LogMsgType|Enum|框架|流程|机制", text, flags=re.IGNORECASE):
+    if re.search(r"代码|函数|枚举|Enum|框架|流程|机制", text, flags=re.IGNORECASE):
         return {"type": "code_or_document", "confidence": 0.7, "rewrites": [text]}
     if enabled(config or runtime_config(), "LKA_LLM_QUERY_ROUTING_ENABLED"):
         # Keep this first implementation deterministic; model routing can replace this shape later.

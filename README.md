@@ -341,7 +341,6 @@ FAISS 是本地文件型向量索引，不需要 Docker 或外部服务。当前
 | `kb/relevance.py` | 相关性门槛：证据是否覆盖问题、知识库中没有的名称直接拒答 |
 | `kb/citations.py` | 引用选取（整节、表格聚焦行、句子）与引用校验 |
 | `kb/answer_text.py` | 不调用模型时的答案：润色、离线英译中、本地答案拼装 |
-| `kb/structured.py` | 直接读表格的结构化答案：缩写词典、站位测试项、Excel 字段、FFT 清单 |
 | `kb/web.py` | 联网搜索、公开网页抓取与正文提取、联网来源筛选去重 |
 
 `kb/followup.py` 把对话中的追问改写成能单独检索的完整问题（不在 `query_knowledge_base` 中重新导出，由 Web UI 直接调用）。

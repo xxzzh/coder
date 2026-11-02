@@ -21,7 +21,7 @@ LOCAL_CONTENT_COVERAGE_THRESHOLD = 0.5
 PARTICLE_CHARACTERS = frozenset("的了是在和与及或对把被从到给让为时里要前后都也就还会能该")
 
 # A name found in at least this share of the chunks (the framework's own name, a station that
-# every test sheet lists) does not pin a question to particular evidence: STPM matches a
+# every test sheet lists) does not pin a question to particular evidence: AB平台 matches a
 # quarter of the index. When every name in a question is that broad, the evidence must also
 # cover the question's Chinese part (what is asked about the name), at least half of it.
 BROAD_NAME_SHARE = 0.10
@@ -264,8 +264,8 @@ def asked_part(units: list[tuple[str, str, float]], db_path: Path) -> list[tuple
 def required_parts(question: str, units: list[tuple[str, str, float]], db_path: Path | None) -> list[list[tuple[str, str, float]]]:
     """Parts of the question each piece of evidence must cover at least half of, besides the whole.
 
-    - When every name in the question is broad (STPM, SFT), the asked part: STPM plus the
-      common word 测试 is no evidence about STPM's 单元测试覆盖率.
+    - When every name in the question is broad (AB平台, SFT), the asked part: AB平台 plus the
+      common word 测试 is no evidence about AB平台's 单元测试覆盖率.
     - In 「X支持Y吗」, Y: a chunk about X that never mentions Y does not answer whether X supports it.
     """
     if db_path is None:
@@ -306,7 +306,7 @@ def unknown_names(question: str, db_path: Path) -> list[str]:
     """Names in a Chinese question that occur nowhere in the knowledge base.
 
     In a Chinese question, Latin-script terms are names and identifiers (Jenkins, FATAL,
-    LogMsgType), and a word followed by a version (MES 3.0, Windows 7) names one release.
+    LogLevel), and a word followed by a version (MES 3.0, Windows 7) names one release.
     If the index never mentions such a name it holds no evidence about it, however well
     the rest of the question matches: MES 2.0 chunks do not answer a question about MES 3.0.
     Chinese words are not checked this way: users' wording (记事本, 连不上) is often absent
@@ -392,7 +392,7 @@ def document_labels(db_path: Path) -> dict[str, str]:
 
 
 def mentions_a_name(text: str, units: list[tuple[str, str, float]]) -> bool:
-    """A question that names something (SFT, N972, LogMsgType) is about it: a chunk that mentions
+    """A question that names something (SFT, X100, LogLevel) is about it: a chunk that mentions
     none of its names is about something else, however many other words it shares."""
     names = [term for kind, term, _ in units if kind == "ascii"]
     lowered = text.lower()
@@ -400,7 +400,7 @@ def mentions_a_name(text: str, units: list[tuple[str, str, float]]) -> bool:
 
 
 def rows_about_named_subject(rows: list[dict[str, Any]], question: str) -> list[dict[str, Any]]:
-    """Drop chunks that mention none of the question's names, when others do (the FFT touchpad
+    """Drop chunks that mention none of the question's names, when others do (the FAT touchpad
     test does not answer a question about the SFT station)."""
     units = query_content_units(question)
     named = [row for row in rows if mentions_a_name(str(row.get("text", "")), units)]
@@ -423,10 +423,24 @@ def covering_row_index(rows: list[dict[str, Any]], question: str, db_path: Path 
         return None
     required = required_parts(question, units, db_path)
     labels = document_labels(db_path) if db_path is not None else {}
+    first: int | None = None
     for index, row in enumerate(rows[: gate_candidate_count(rows, question)]):
-        if row_covers_question(row, units, required, labels.get(str(row.get("file_name", "")), "")):
+        if not row_covers_question(row, units, required, labels.get(str(row.get("file_name", "")), "")):
+            continue
+        if first is None:
+            if not opening_chunk(row):
+                return index
+            first = index
+        elif row.get("doc_id") == rows[first].get("doc_id"):
+            # A document's opening chunk (its title and introduction) covers a question through
+            # the title's words; a later chunk of the same document that covers it too holds the
+            # asked part («6.5 Fan», not the introduction of the document that has a Fan section).
             return index
-    return None
+    return first
+
+
+def opening_chunk(row: dict[str, Any]) -> bool:
+    return int(row.get("chunk_index") or 0) == 1
 
 
 def local_result_is_relevant(rows: list[dict[str, Any]], question: str, db_path: Path | None = None) -> bool:

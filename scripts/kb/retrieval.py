@@ -16,7 +16,7 @@ import vector_store
 
 from kb import config as kb_config
 from kb.config import DB_PATH
-from kb.terms import candidate_terms, enumeration_or_list_question, fft_manual_function_question, fts_query, iterative_retrieval_question, retrieval_question_with_aliases, section_context_question
+from kb.terms import candidate_terms, enumeration_or_list_question, fts_query, iterative_retrieval_question, retrieval_question_with_aliases, section_context_question
 from kb.text import first_markdown_heading_level, human_text, markdown_table_of_contents, sentence_score
 
 
@@ -427,7 +427,7 @@ def chunk_information_quality(text: str) -> float:
         return 0.0
     if markdown_table_of_contents(text):
         return 0.3
-    if re.search(r"\b(enum|LogMsgType|Enum[A-Za-z0-9_]+)\b", compact, flags=re.IGNORECASE) and (
+    if re.search(r"\b(enum|Enum[A-Za-z0-9_]+)\b", compact, flags=re.IGNORECASE) and (
         "枚举" in compact or " 值 " in f" {compact} " or "| 值 |" in text
     ):
         return 1.25
@@ -440,55 +440,6 @@ def chunk_information_quality(text: str) -> float:
     if header_hits and len(compact) < 180 and detail_hits <= 1:
         return 0.55
     return 1.0
-
-
-def expand_fft_manual_table_context(
-    conn: sqlite3.Connection,
-    ranked: list[dict[str, Any]],
-    question: str,
-) -> list[dict[str, Any]]:
-    if not fft_manual_function_question(question):
-        return ranked
-    expanded: list[dict[str, Any]] = []
-    expanded_once = False
-    for row in ranked:
-        item = row.copy()
-        if not expanded_once and str(item.get("file_type", "")).lower() == "xlsx":
-            anchor = None
-            if "人工功能测试" in str(item.get("text", "")) or "IR CameraTest" in str(item.get("text", "")):
-                anchor = item
-            else:
-                anchor_row = conn.execute(
-                    """
-                    SELECT chunk_id, doc_id, chunk_index, text
-                    FROM chunks
-                    WHERE doc_id = ? AND text LIKE '%人工功能测试%MES%FFT%' AND text LIKE '%IR CameraTest%'
-                    ORDER BY chunk_index
-                    LIMIT 1
-                    """,
-                    (item["doc_id"],),
-                ).fetchone()
-                if anchor_row:
-                    anchor = {**item, **dict(anchor_row)}
-            if anchor:
-                neighbors = conn.execute(
-                    """
-                    SELECT chunk_id, chunk_index, text
-                    FROM chunks
-                    WHERE doc_id = ? AND chunk_index >= ? AND chunk_index <= ?
-                    ORDER BY chunk_index
-                    """,
-                    (anchor["doc_id"], anchor["chunk_index"], anchor["chunk_index"] + 5),
-                ).fetchall()
-                context_chunks = [str(neighbor["text"]) for neighbor in neighbors]
-                if context_chunks:
-                    item.update(anchor)
-                    item["text"] = "\n\n".join(context_chunks)
-                    item["context_expanded"] = True
-                    item["context_chunk_ids"] = [str(neighbor["chunk_id"]) for neighbor in neighbors]
-                    expanded_once = True
-        expanded.append(item)
-    return expanded
 
 
 def expand_section_context(
@@ -694,7 +645,6 @@ def search(
         ]
         rows = score_with_vectors(rows, vector)
         ranked = rerank(rows, search_question, search_limit, config)
-        ranked = expand_fft_manual_table_context(conn, ranked, question)
         ranked = expand_section_context(conn, ranked, question)
         ranked = attach_continuations(conn, ranked)
         metadata = {

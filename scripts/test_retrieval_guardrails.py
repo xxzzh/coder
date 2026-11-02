@@ -25,8 +25,6 @@ from ingest_knowledge_base import read_xlsx
 from query_knowledge_base import (
     chunk_information_quality,
     citation_for_text,
-    extract_station_table_items,
-    extract_station_table_records,
     filter_web_sources,
     best_summary_source_ids,
     human_text,
@@ -74,19 +72,19 @@ def main() -> None:
     assert web_query("雷军是谁") == "雷军"
     assert web_query("雷军是什么") == "雷军"
     polished = polish_internal_answer_text(
-        "根据本地知识库，├── STPM.sln / STPM.exe.config | USB2.0/USB3.2 \\ ProgramData ![Image 1](x) [1]。"
+        "根据本地知识库，├── AB.sln / AB.exe.config | USB2.0/USB3.2 \\ ProgramData ![Image 1](x) [1]。"
     )
     assert "|" not in polished
     assert "├" not in polished and "Image" not in polished
-    assert "STPM.sln / STPM.exe.config" in polished and "USB2.0/USB3.2" in polished
+    assert "AB.sln / AB.exe.config" in polished and "USB2.0/USB3.2" in polished
     assert "[1]" in polished
     # Identifiers, paths and numeric ranges must survive answer polishing.
     polished = polish_internal_answer_text(
-        "缓存 `Output/LocalData/`，**EnableReadLocalStatus**，GetWorkOrderData_V20()，"
+        "缓存 `Output/Cache/`，**EnableReadLocalStatus**，GetWorkOrderData_V20()，"
         "C:\\ProgramData\\SAMPLELIST.txt，SAMPLE_ENUM_VALUE，[1.25,3.75]，接口*2，80%*标称值 [1]"
     )
     for fragment in (
-        "Output/LocalData/",
+        "Output/Cache/",
         "EnableReadLocalStatus",
         "GetWorkOrderData_V20()",
         "C:\\ProgramData\\SAMPLELIST.txt",
@@ -97,7 +95,7 @@ def main() -> None:
     ):
         assert fragment in polished, (fragment, polished)
     assert "**" not in polished and "`" not in polished
-    polished = polish_internal_answer_text("LogMsgType 枚举 | 值 | 颜色 | |----|------| | INFO | 蓝色 |")
+    polished = polish_internal_answer_text("SampleLogType 枚举 | 值 | 颜色 | |----|------| | INFO | 蓝色 |")
     assert "---" not in polished and "INFO，蓝色" in polished
     assert human_text("public enum EnumSample { SAMPLE_ENUM_VALUE, // 示例值 }").count("SAMPLE_ENUM_VALUE") == 1
     assert query_module.requested_station_name("FRT站位有哪些测试项") == "FRT"
@@ -109,12 +107,10 @@ def main() -> None:
     assert query_module.cache_key("FRT站位有哪些测试项", 5, False) == query_module.cache_key("FRT有哪些测试项", 5, False)
     assert query_module.normalized_retrieval_question("工单数据数据获取流程") == "工单数据获取流程"
     assert query_module.meaningful_query_terms("客户类型有那些") == ["客户类型"]
-    assert query_module.meaningful_query_terms("LogMsgType有那些值") == ["logmsgtype"]
-    assert query_module.cache_key("FFT测试", 5, False) == query_module.cache_key("人工功能测试", 5, False)
-    assert query_module.cache_key("FFT测试项", 5, False) == query_module.cache_key("FFT测试", 5, False)
+    assert query_module.meaningful_query_terms("SampleLogType有那些值") == ["samplelogtype"]
     # Different questions that merely share a topic word must not share one cached answer.
     assert query_module.cache_key("本地缓存的配置开关", 5, False) != query_module.cache_key("本地缓存的完整生命周期", 5, False)
-    assert query_module.cache_key("人工功能测试的IR Camera判定标准", 5, False) != query_module.cache_key("人工功能测试", 5, False)
+    assert query_module.cache_key("样例功能测试的IR Camera判定标准", 5, False) != query_module.cache_key("样例功能测试", 5, False)
     # Relevance gate: a paraphrase of a section title passes, a known subject with an unknown attribute does not.
     assert query_module.local_result_is_relevant(
         [{"rerank_score": 0.48, "keyword_score": 1.0, "fts_score": 0.1, "text": "十一、添加新设备完整步骤 共需修改 3 处"}],
@@ -132,7 +128,7 @@ def main() -> None:
     assert "embedding-disabled" in query_module.query_cache_variant({}, allow_api=False, use_web=False)
     assert model_capabilities.classify_query("PR")["type"] == "abbreviation"
     assert model_capabilities.classify_query("FRT站位有哪些测试项")["type"] == "excel_table"
-    assert model_capabilities.classify_query("LogMsgType有哪些值")["type"] == "code_or_document"
+    assert model_capabilities.classify_query("SampleLogType枚举有哪些值")["type"] == "code_or_document"
     with tempfile.TemporaryDirectory() as temp_vector_dir:
         vector_status = vector_store.vector_status(sqlite_chunk_count=0, vector_dir=Path(temp_vector_dir))
         assert vector_status["ready"] is False
@@ -143,20 +139,15 @@ def main() -> None:
     assert query_module.abbreviation_query_term("PR") == "PR"
     assert query_module.abbreviation_query_term("PR是什么") == "PR"
     assert query_module.meaningful_query_terms("GW") == ["gw"]
-    assert query_module.suggested_local_questions("SWDL2")[0] == "SWDL2有哪些测试项"
-    assert query_module.suggested_local_questions("swdl2")[0] == "SWDL2有哪些测试项"
+    assert query_module.suggested_local_questions("QX2")[0] == "QX2有哪些测试项"
+    assert query_module.suggested_local_questions("qx2")[0] == "QX2有哪些测试项"
     assert query_module.suggested_local_questions("hpd test")[0] == "HPD有哪些测试项"
     assert query_module.suggested_local_questions("电源键测试")[0] == "电源键测试是什么"
     assert query_module.suggested_local_questions("我的个人密码是")[0] == "个人密码是什么"
     assert query_module.suggested_local_questions("请问我的个人密码是什么")[0] == "个人密码是什么"
-    # These checks need an index that contains the abbreviation SR; other users' indexes skip them.
-    index_has_sr = query_module.DB_PATH.exists() and query_module.structured_abbreviation_result(query_module.DB_PATH, "SR") is not None
     if query_module.DB_PATH.exists():
         assert query_module.suggested_local_questions("ZZZ999有哪些测试项", query_module.DB_PATH) == []
-    if index_has_sr:
-        assert query_module.suggested_local_questions("SR是什么意思", query_module.DB_PATH)[0] == "SR是什么"
-        assert query_module.suggested_local_questions("SR有哪些测试项?", query_module.DB_PATH)[0] == "SR是什么"
-    guidance = query_module.no_index_user_guidance("SWDL2")
+    guidance = query_module.no_index_user_guidance("QX2")
     assert guidance["severity"] == "error"
     assert "还没有可用的资料" in guidance["message"] and "上传" in guidance["message"]
     assert guidance["suggested_questions"] == []
@@ -166,13 +157,6 @@ def main() -> None:
     assert "换个问法" in no_match_guidance["hint"] and "个人密码是什么" not in no_match_guidance["hint"]
     assert "「个人密码是什么」" in no_match_guidance["message"]
     assert no_match_guidance["suggested_questions"] == ["个人密码是什么"]
-    if index_has_sr:
-        sr_guidance = query_module.local_no_match_user_guidance("SR是什么意思", query_module.DB_PATH)
-        assert "SR是什么" in sr_guidance["message"]
-        assert "SR有哪些测试项" not in sr_guidance["message"]
-        sr_test_guidance = query_module.local_no_match_user_guidance("SR有哪些测试项?", query_module.DB_PATH)
-        assert "SR是什么" in sr_test_guidance["message"]
-        assert "SR有哪些测试项" not in sr_test_guidance["message"]
     if query_module.DB_PATH.exists():
         missing_guidance = query_module.local_no_match_user_guidance("ZZZ999有哪些测试项", query_module.DB_PATH)
         assert missing_guidance["suggested_questions"] == []
@@ -181,7 +165,7 @@ def main() -> None:
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             query_module.PROCESSED_DIR = Path(temp_dir) / "processed"
-            missing_index_result = query_module.query(Path(temp_dir) / "missing.db", "SWDL2", use_web=False, allow_api=False)
+            missing_index_result = query_module.query(Path(temp_dir) / "missing.db", "QX2", use_web=False, allow_api=False)
             assert missing_index_result["degrade_reason"] == "local_index_missing"
             assert missing_index_result["user_guidance"]["kind"] == "no_index_no_faq"
             assert "请先上传文档" in missing_index_result["user_guidance"]["message"]
@@ -198,71 +182,6 @@ def main() -> None:
         sample.write_text("omega", encoding="utf-8")
         os.utime(sample, ns=(fixed_ns, fixed_ns))
         assert ingest_module.source_fingerprint(raw_dir) != first_fingerprint
-    dictionary_text = (
-        "P | P | PR | | Pilot Run | | | | | | | 试运行 | | | | | | | Back\n"
-        "P | P | PR | | Public Relations | | | | | | | 公共关系 | | | | | | | Back\n"
-        "G | G | GW | | Gross Weight | | | | | | | 毛重 | | | | | | | Back\n"
-    )
-    assert query_module.dictionary_entry_rows(dictionary_text, "PR") == [
-        {
-            "abbr": "PR",
-            "english": "Pilot Run",
-            "chinese": "试运行",
-            "line": "P | P | PR | | Pilot Run | | | | | | | 试运行 | | | | | | | Back",
-        },
-        {
-            "abbr": "PR",
-            "english": "Public Relations",
-            "chinese": "公共关系",
-            "line": "P | P | PR | | Public Relations | | | | | | | 公共关系 | | | | | | | Back",
-        },
-    ]
-    fft_manual_text = (
-        "14 | 人工功能测试 MES：FFT | IR CameraTest | IR Camera Test | IQCapture |\n"
-        "15 | | Sensor Test | Lid Hall Sensor Test | SensorTest.dll |\n"
-        "16 | | LCD明暗度测试 | LCD明暗度测试 | LCDTest.dll |\n"
-        "17 | | Power Button | 开机键测试 | STPM.exe |\n"
-        "18 | | G-sensor Test | 零偏校准测试 | STPM.exe |\n"
-        "| | 手写笔功能测试 | 充电功能测试 | STPM.exe |\n"
-        "19 | | 异音测试 | 风扇异音测试 | STPM.exe |\n"
-        "20 | | | 开合转轴异响 | NA |\n"
-        "21 | | RSSI | 天线信号强度测试 | STPM.exe |\n"
-        "22 | | WIFI吞吐量测试 | T-put测试 | STPM.exe |\n"
-        "23 | | FFT 过站 | FFT扫描过站 | MES |\n"
-    )
-    assert query_module.extract_fft_manual_items(fft_manual_text) == [
-        "IR CameraTest / IR Camera Test",
-        "Sensor Test / Lid Hall Sensor Test",
-        "LCD明暗度测试",
-        "Power Button / 开机键测试",
-        "G-sensor Test / 零偏校准测试",
-        "手写笔功能测试 / 充电功能测试",
-        "异音测试 / 风扇异音测试",
-        "异音测试 / 开合转轴异响",
-        "RSSI / 天线信号强度测试",
-        "WIFI吞吐量测试 / T-put测试",
-        "FFT 过站 / FFT扫描过站",
-    ]
-    assert query_module.extract_fft_station_items(
-        "| | 测试项 | 测试子项 | 工具名称 |\n"
-        "1 | 自动化测试 | 寸动线自动化测试 | 清洁屏幕 |\n"
-        "2 | 自动化功能测试 MES:ATS | 摄像头测试 | 白板灯测试 棋盘格测试 |\n"
-        "3 | | LCD AOI 测试 | LCD 点.线 |\n"
-        "14 | 人工功能测试 MES：FFT | IR CameraTest | IR Camera Test |\n"
-        "| | 手写笔功能测试 | 充电功能测试 | STPM.exe |\n"
-        "19 | | 异音测试 | 风扇异音测试 | STPM.exe |\n"
-        "20 | | | 开合转轴异响 | NA |\n"
-        "23 | | FFT 过站 | FFT扫描过站 | MES |\n"
-    ) == [
-        "自动化测试 / 寸动线自动化测试 / 清洁屏幕",
-        "自动化功能测试 MES:ATS / 摄像头测试 / 白板灯测试 棋盘格测试",
-        "自动化功能测试 MES:ATS / LCD AOI 测试 / LCD 点.线",
-        "人工功能测试 MES：FFT / IR CameraTest / IR Camera Test",
-        "人工功能测试 MES：FFT / 手写笔功能测试 / 充电功能测试",
-        "人工功能测试 MES：FFT / 异音测试 / 风扇异音测试",
-        "人工功能测试 MES：FFT / 异音测试 / 开合转轴异响",
-        "人工功能测试 MES：FFT / FFT 过站 / FFT扫描过站",
-    ]
     assert [source["title"] for source in filter_web_sources(
         "acwing是什么",
         [{"title": "AcWing", "url": "https://www.acwing.com/", "snippet": "AcWing 算法交流平台。"}],
@@ -375,7 +294,7 @@ AcWing 是一个算法交流平台。
         """
         CREATE TABLE chunks(chunk_id TEXT PRIMARY KEY, doc_id TEXT, chunk_index INTEGER, text TEXT);
         INSERT INTO chunks VALUES ('guide-0122', 'guide', 122, '## 八、本地缓存与恢复机制\n### 用途\n支持断点续测。');
-        INSERT INTO chunks VALUES ('guide-0123', 'guide', 123, '### 缓存文件\nOutput/LocalData/');
+        INSERT INTO chunks VALUES ('guide-0123', 'guide', 123, '### 缓存文件\nOutput/Cache/');
         INSERT INTO chunks VALUES ('guide-0124', 'guide', 124, '### 状态值\n-1 等待测试，0 测试失败，1 测试通过。');
         INSERT INTO chunks VALUES ('guide-0125', 'guide', 125, '### 恢复逻辑\n若 EnableReadLocalStatus = true，状态 = 1 时直接标记 PASS，跳过执行。');
         INSERT INTO chunks VALUES ('guide-0126', 'guide', 126, '## 九、下一个章节\n不应拼接。');
@@ -402,8 +321,8 @@ AcWing 是一个算法交流平台。
     assert "状态 = 1" in query_module.citation_for_retrieval_row(expanded_rows[0], "恢复机制是什么")
     assert "下一个章节" not in expanded_rows[0]["text"]
     assert "INFO" in query_module.citation_for_retrieval_row(
-        {"text": "LogMsgType 枚举 | 值 | 颜色 | 用途 |\n| INFO | 蓝色 | 正常信息 |\n| WARNING | 黄色 | 警告 |"},
-        "LogMsgType有那些值",
+        {"text": "SampleLogType 枚举 | 值 | 颜色 | 用途 |\n| INFO | 蓝色 | 正常信息 |\n| WARNING | 黄色 | 警告 |"},
+        "SampleLogType有那些值",
     )
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -490,41 +409,6 @@ AcWing 是一个算法交流平台。
             ],
         }
     )] == [2]
-    fat_items = extract_station_table_items(
-        "工序名称：FAT\n"
-        "岗位资源： | MES Station Check | MES站别检测 | STPM.exe | NA |\n"
-        "6 | | ATO 系统时间同步 | 系统时间同步 | STPM.exe | NA |\n"
-        "7 | | FAN Test | FAN speed | STPM.exe | NA |\n"
-        "工作表 sheet6\n",
-        "FAT",
-    )
-    assert fat_items == ["MES Station Check / MES站别检测", "ATO 系统时间同步 / 系统时间同步", "FAN Test / FAN speed"]
-    fat_records = extract_station_table_records(
-        "工序名称：FAT\n"
-        "岗位资源： | MES Station Check | MES站别检测 | STPM.exe | NA | LC | NA | 1.读取主板序列号；\n"
-        "2.查询MES站点状态； | MES | 待导入 |\n"
-        "6 | | FAN Test | FAN speed | STPM.exe | NA | LC | NA | 1.读取风扇转速； | 程序 | 待导入 |\n"
-        "工作表 sheet6\n",
-        "FAT",
-    )
-    assert fat_records == [
-        {"item": "MES Station Check / MES站别检测", "scheme": "1.读取主板序列号； 2.查询MES站点状态；"},
-        {"item": "FAN Test / FAN speed", "scheme": "1.读取风扇转速；"},
-    ]
-    frt_records = extract_station_table_records(
-        "工作表 老化\n"
-        "1 | FRT | AC和网络在位Check | AC和网络在位Check | STPM.exe | NA | LC | NA | 检查AC与网络； | 程序 |\n"
-        "2 |  | Mainboard Test | AC in Check | STPM.exe | NA | LC | NA | 检查AC； | 程序 |\n"
-        "3 |  |  | RTC Test | STPM.exe | NA | LC | NA | 检查RTC； | 程序 |\n"
-        "4 |  | Write Number Check | Check_DMI（SMBIOS） | STPM.exe | NA | LC | NA | 检查DMI； | 程序 |\n",
-        "FRT",
-    )
-    assert [record["item"] for record in frt_records] == [
-        "AC和网络在位Check",
-        "Mainboard Test / AC in Check",
-        "Mainboard Test / RTC Test",
-        "Write Number Check / Check_DMI（SMBIOS）",
-    ]
     with tempfile.TemporaryDirectory() as temp_dir:
         xlsx_path = Path(temp_dir) / "coordinates.xlsx"
         with zipfile.ZipFile(xlsx_path, "w") as archive:
@@ -720,73 +604,6 @@ AcWing 是一个算法交流平台。
     original_search = query_module.search
     original_trigger_async_update = query_module.trigger_async_update
     original_web_search = query_module.web_search
-    with tempfile.TemporaryDirectory() as temp_dir:
-        db_path = Path(temp_dir) / "knowledge.db"
-        conn = sqlite3.connect(db_path)
-        conn.executescript(
-            """
-            CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT);
-            INSERT INTO metadata(key, value) VALUES ('indexed_at', 'test-index');
-            CREATE TABLE documents(
-                doc_id TEXT PRIMARY KEY,
-                file_name TEXT NOT NULL,
-                file_path TEXT NOT NULL,
-                file_type TEXT NOT NULL,
-                text TEXT NOT NULL
-            );
-            CREATE TABLE query_cache(
-                cache_key TEXT PRIMARY KEY,
-                question TEXT NOT NULL,
-                answer_json TEXT NOT NULL,
-                hit_count INTEGER NOT NULL,
-                index_version TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            """
-        )
-        conn.execute(
-            "INSERT INTO documents(doc_id, file_name, file_path, file_type, text) VALUES (?, ?, ?, ?, ?)",
-            (
-                "fat-doc",
-                "fat.xlsx",
-                "excel/fat.xlsx",
-                "xlsx",
-                "工序名称：FAT\n"
-                "岗位资源： | MES Station Check | MES站别检测 | STPM.exe | NA | LC | NA | 1.读取主板序列号； | MES | 待导入 |\n"
-                "6 | | FAN Test | FAN speed | STPM.exe | NA | LC | NA | 1.读取风扇转速； | 程序 | 待导入 |\n"
-                "工作表 sheet6\n",
-            ),
-        )
-        conn.commit()
-        conn.close()
-        try:
-            query_module.trigger_async_update = lambda *args, **kwargs: False
-            query_module.web_search = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("structured local answer must not search web"))
-            structured = query_module.query(
-                db_path,
-                "FAT 站位包含哪些测试项及其对应的测试方案是什么",
-                use_web=True,
-                allow_api=False,
-            )
-            assert structured["source_type"] == "knowledge_base"
-            assert structured["retrieval_mode"] == "local_structured_table"
-            assert structured["web_search_used"] is False
-            assert structured["answer"].count("\n- ") == 2
-            assert "1.读取主板序列号" in structured["answer"]
-            shorthand = query_module.query(
-                db_path,
-                "FAT有哪些测试项及其对应的测试方案是什么",
-                use_web=True,
-                allow_api=False,
-            )
-            assert shorthand["retrieval_mode"] == "local_structured_table"
-            assert shorthand["answer"] == structured["answer"]
-            assert shorthand["cache_hit"] is True
-        finally:
-            query_module.trigger_async_update = original_trigger_async_update
-            query_module.web_search = original_web_search
-
     with tempfile.TemporaryDirectory() as temp_dir:
         db_path = Path(temp_dir) / "knowledge.db"
         sqlite3.connect(db_path).close()
@@ -1217,8 +1034,21 @@ def check_agent_loop() -> None:
     # Still searching in the last round means the evidence is not there.
     complete, _ = scripted({"decision": "search", "queries": ["x"]}, {"decision": "search", "queries": ["y"]})
     assert agent.run_agent("开机流程", retrieve, complete).decision == "refuse"
+    # [1] without the # still cites evidence 1 when the answer has no [#n] at all.
+    complete, _ = scripted({"decision": "answer", "answer": "先自检再加载配置 [1]。"})
+    plain = agent.run_agent("开机流程", retrieve, complete)
+    assert plain.cited_ids == [1] and agent.renumber_citations(plain.answer, plain.cited_ids) == "先自检再加载配置 [1]。"
+    # No marker in the text, the evidence named in evidence_ids: cited at the end.
+    complete, _ = scripted({"decision": "answer", "answer": "先自检再加载配置。", "evidence_ids": [1]})
+    listed = agent.run_agent("开机流程", retrieve, complete)
+    assert listed.cited_ids == [1] and agent.renumber_citations(listed.answer, listed.cited_ids) == "先自检再加载配置。 [1]"
     # Replies that cannot be trusted raise, so the caller answers locally instead.
-    for bad in ("not json", json.dumps({"decision": "answer", "answer": "没有引用"}), json.dumps({"decision": "answer", "answer": "见 [#9]"})):
+    for bad in (
+        "not json",
+        json.dumps({"decision": "answer", "answer": "没有引用"}),
+        json.dumps({"decision": "answer", "answer": "见 [#9]"}),
+        json.dumps({"decision": "answer", "answer": "门限 [7]"}),  # no shown evidence numbered 7
+    ):
         try:
             agent.run_agent("开机流程", retrieve, lambda messages, bad=bad: {"content": bad})
         except agent.AgentError:

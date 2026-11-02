@@ -257,7 +257,7 @@ def primary_citation(db_path: Path, row: dict[str, Any], question: str) -> str:
 def citation_for_retrieval_row(row: dict[str, Any], question: str) -> str:
     text = str(row["text"])
     if row.get("context_expanded") or re.search(
-        r"\b(enum|LogMsgType|Enum[A-Za-z0-9_]+)\b|枚举|^.*\|\s*值\s*\|",
+        r"\b(enum|Enum[A-Za-z0-9_]+)\b|枚举|^.*\|\s*值\s*\|",
         text,
         flags=re.IGNORECASE | re.MULTILINE,
     ):

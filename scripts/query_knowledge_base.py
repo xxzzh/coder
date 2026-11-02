@@ -5,7 +5,7 @@
 This module is the main flow: answer cache, index status, the answer API and retrieval agent,
 guidance when nothing is found, query() and the command line. The building blocks live in kb/:
 text, terms (question analysis), config, retrieval, relevance (the answer gate), citations,
-answer_text (answers without a model), structured (table answers) and web (web search).
+answer_text (answers without a model) and web (web search).
 Their names are re-exported here, so existing callers keep working.
 """
 
@@ -32,10 +32,6 @@ from ingest_knowledge_base import ingest_in_progress, is_ignored_raw_file, raw_f
 import llm_budget
 import model_capabilities
 import project_runtime
-from retrievers import abbreviation as abbreviation_retriever
-from retrievers import excel_table as excel_table_retriever
-from retrievers import station_test as station_test_retriever
-from retrievers.base import DomainRetriever
 from kb.text import (  # noqa: F401  (re-exported for callers of this module)
     TRAD_PHRASES,
     TRAD_TO_SIMP,
@@ -64,7 +60,6 @@ from kb.terms import (  # noqa: F401  (re-exported for callers of this module)
     candidate_terms,
     collapse_repeated_query_terms,
     enumeration_or_list_question,
-    fft_manual_function_question,
     fts_query,
     iterative_retrieval_question,
     lexical_query_coverage,
@@ -118,7 +113,6 @@ from kb.retrieval import (  # noqa: F401  (re-exported for callers of this modul
     embedding_cache_key,
     embedding_lsh_buckets,
     embedding_terms,
-    expand_fft_manual_table_context,
     expand_section_context,
     external_vector_candidates,
     fallback_like_candidates,
@@ -176,33 +170,6 @@ from kb.answer_text import (  # noqa: F401  (re-exported for callers of this mod
     looks_like_code,
     polish_internal_answer,
     polish_internal_answer_text,
-)
-from kb.structured import (  # noqa: F401  (re-exported for callers of this module)
-    _explicit_station_table_records,
-    _heading_station_table_records,
-    _station_record,
-    dictionary_entry_rows,
-    extract_fft_manual_items,
-    extract_fft_station_items,
-    extract_station_table_items,
-    extract_station_table_records,
-    extract_station_table_records_with_excerpt,
-    legacy_xlsx_region,
-    n972_best_record,
-    n972_best_records,
-    n972_excel_field_intent,
-    n972_excel_records,
-    n972_record_from_cells,
-    n972_value_is_useful,
-    n972_worksheet_sections,
-    normalize_excel_key,
-    structured_abbreviation_result,
-    structured_cell_text,
-    structured_fft_manual_function_answer,
-    structured_fft_station_result,
-    structured_local_answer,
-    structured_n972_excel_result,
-    structured_station_result,
 )
 from kb.web import (  # noqa: F401  (re-exported for callers of this module)
     DuckDuckGoParser,
@@ -264,10 +231,10 @@ project_runtime.apply_project_runtime_env()
 HOT_QUERY_THRESHOLD = 2
 CACHE_TTL_SECONDS = 3600
 NEGATIVE_CACHE_TTL_SECONDS = 120
-CACHE_VARIANT_VERSION = "retrieval-v60:retry-search-expansion"
+CACHE_VARIANT_VERSION = "retrieval-v61:no-corpus-specific-rules"
 # Answers built without a model (layout, gate, cited evidence). Raising it refreshes cached local
 # answers only; cached API answers stay valid and are not paid for again.
-LOCAL_ANSWER_VERSION = "local-v3"
+LOCAL_ANSWER_VERSION = "local-v4"
 
 
 def source_fingerprint(raw_dir: Path = RAW_DIR) -> str:
@@ -464,8 +431,6 @@ def canonical_question_for_cache(question: str) -> str:
     abbreviation = abbreviation_query_term(normalized)
     if abbreviation:
         return f"abbreviation:{abbreviation.lower()}"
-    if fft_manual_function_question(normalized):
-        return "test-item:fft-manual-function"
     station_name = requested_station_name(normalized)
     if station_name and station_test_item_question(normalized) and not station_item_attribute_question(normalized):
         detail = "schemes" if station_question_includes_schemes(normalized) else "items"
@@ -508,36 +473,9 @@ def guidance_query_subject(question: str) -> str:
     return normalized or question.strip()
 
 
-def verified_local_suggestions(db_path: Path | None, question: str, subject: str) -> list[str]:
-    if db_path is None or not db_path.exists():
-        return []
-    suggestions: list[str] = []
-    abbreviation = abbreviation_query_term(subject)
-    if abbreviation and structured_abbreviation_result(db_path, abbreviation) is not None:
-        suggestions.append(f"{abbreviation}是什么")
-    station = requested_station_name(question)
-    if station:
-        station_question = f"{station}有哪些测试项"
-        if (
-            structured_fft_station_result(db_path, station_question) is not None
-            or structured_station_result(db_path, station_question) is not None
-        ):
-            suggestions.append(station_question)
-    return list(dict.fromkeys(suggestions))[:3]
-
-
 def local_candidate_has_answer(db_path: Path | None, question: str) -> bool:
     if db_path is None or not db_path.exists():
         return False
-    abbreviation = abbreviation_query_term(question)
-    if abbreviation and structured_abbreviation_result(db_path, abbreviation) is not None:
-        return True
-    station = requested_station_name(question)
-    if station and station_test_item_question(question):
-        return (
-            structured_fft_station_result(db_path, question) is not None
-            or structured_station_result(db_path, question) is not None
-        )
     try:
         rows, _metadata = search(db_path, question, 5)
     except sqlite3.DatabaseError:
@@ -548,9 +486,6 @@ def local_candidate_has_answer(db_path: Path | None, question: str) -> bool:
 def suggested_local_questions(question: str, db_path: Path | None = None) -> list[str]:
     normalized = normalize_search_question(normalized_retrieval_question(question)).strip()
     subject = guidance_query_subject(question)
-    verified = verified_local_suggestions(db_path, normalized, subject)
-    if verified:
-        return verified
     candidates: list[str] = []
     station = requested_station_name(normalized)
     if station:
@@ -805,29 +740,6 @@ def no_local_answer(
     }
 
 
-def domain_retrievers() -> list[DomainRetriever]:
-    return [
-        abbreviation_retriever.create(structured_abbreviation_result),
-        station_test_retriever.create(structured_fft_station_result),
-        station_test_retriever.create(structured_station_result),
-        excel_table_retriever.create(structured_n972_excel_result),
-    ]
-
-
-def run_domain_retrievers(
-    db_path: Path,
-    question: str,
-    metadata: dict[str, str],
-    refresh_scheduled: bool,
-) -> dict[str, Any] | None:
-    for retriever in domain_retrievers():
-        result = retriever.retrieve(db_path, question, metadata, refresh_scheduled)
-        if result is not None:
-            result["retriever_plugin"] = retriever.name
-            return result
-    return None
-
-
 # Evidence fed back to the agent per search hit (LKA_AGENT_EVIDENCE_MAX_CHARS) and in total
 # (LKA_AGENT_EVIDENCE_MAX_ITEMS): every character is billed as input on each round.
 AGENT_EVIDENCE_MAX_CHARS = 1800
@@ -1041,39 +953,6 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
             result = augment_with_web(question, result, limit)
         return finalize_answer(question, result, config, allow_api)
 
-    structured_result = run_domain_retrievers(db_path, question, metadata, refresh_scheduled)
-    if structured_result is not None:
-        result = finalize_answer(question, structured_result, config, allow_api)
-        apply_index_status(result, refresh_scheduled)
-        if cache_conn is not None:
-            cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)
-            cache_conn.close()
-        return result
-
-    verified_suggestions = verified_local_suggestions(db_path, question, guidance_query_subject(question))
-    # Only a request for a station's item list («SFT 有哪些测试项»): «X测试项目前是什么状态» asks
-    # about one item's status, not about a station called X.
-    if station_test_item_question(question) and enumeration_or_list_question(question) and requested_station_name(question) and verified_suggestions:
-        result = no_local_answer(
-            use_web,
-            question,
-            "本地知识库没有找到足够依据。",
-            metadata,
-            config,
-            allow_api,
-            limit,
-        )
-        if not use_web:
-            result["degraded"] = True
-            result["degrade_reason"] = "local_no_match"
-            result["user_guidance"] = local_no_match_user_guidance(question, db_path)
-        apply_index_status(result, refresh_scheduled)
-        result = finalize_answer(question, result, config, allow_api)
-        if cache_conn is not None and (not result.get("web_search_used") or result.get("sources")) and not result.get("web_search_reason"):
-            cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)
-            cache_conn.close()
-        return result
-
     agent_error = ""
     if allow_api and agent_enabled(config) and not unknown_names(question, db_path):
         try:
@@ -1231,10 +1110,6 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
         "index_status": "updating" if refresh_scheduled else "ready",
         "cache_hit": False,
     }
-    structured_answer = structured_local_answer(db_path, question, sources)
-    if structured_answer:
-        result["answer"] = structured_answer
-        result["answer_mode"] = "local_structured_table_summary"
     result = finalize_answer(question, result, config, allow_api)
     result["answer_quality"] = model_capabilities.evaluate_answer(question, str(result.get("answer", "")), result.get("sources") or [])
     if agent_error:

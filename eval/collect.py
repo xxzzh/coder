@@ -6,7 +6,7 @@ This script only executes and records. It never decides whether an answer is
 right; that is score.py's job. Two layers are captured per question:
 
 - retrieval: the ranked chunks from the general hybrid search (search())
-- end_to_end: the final answer from query(), including domain retrievers
+- end_to_end: the final answer from query()
 
 The query cache and the background re-index trigger are disabled so every run
 measures the current code, not an answer cached by an earlier version.
