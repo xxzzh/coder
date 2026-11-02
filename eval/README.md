@@ -112,7 +112,27 @@ python eval\run_eval.py ...    REM 先确认当前基线
 
 每道题都有 `source_ref` 指向原文位置。`origin: "wenti.txt"` 是 wenti.txt 里实测过的问题；`origin: "raw-doc"` 是对照原文起草的题。
 
-**所有题目目前都是 `review_status: "draft"`**：标准答案是对照原文写的，没有参考系统输出，但仍需要人工逐条核对。核对无误后改为 `"verified"`。新增题目时：
+**所有题目目前都是 `review_status: "draft"`**：标准答案是对照原文写的，没有参考系统输出，但仍需要人工逐条核对。核对无误后改为 `"verified"`。
+
+### 人工核对标准答案
+
+1. 生成核对表（Excel）。最可疑的题排在前面：开 API 的答案不完整或答错、负样本被作答的题是优先级 1，本机答案没答对的是优先级 2。每行有标准答案、关键词、出处，以及系统两种模式最新的答案和判分：
+
+   ```bat
+   .venv\Scripts\python.exe eval\review_sheet.py --api-run eval\results\<开 API 的全量结果> --local-run eval\results\<本机的全量结果> [--suggestions <建议.json>]
+   ```
+
+   两次结果最好都先用 `eval\judge.py` 判过分。核对表写到 `eval\results\`（不进仓库）。
+2. 打开核对表，按“说明”页逐题看：标准答案是否正好回答了问题（问题没问的内容不算必答）、与原文是否一致；负样本资料里是否确实没有。只填黄色列：“你的结论”选 正确 / 修改 / 删除，修改时写新的标准答案和关键词（关键词用“；”分隔，必须是原文里的词）。
+3. 写回评测集（先自动备份到 `eval\results\`；关键词在原文里找不到的行不会写入，会列出来让你改）：
+
+   ```bat
+   .venv\Scripts\python.exe eval\apply_review.py eval\results\<核对表>.xlsx
+   ```
+
+   可以分几次核对，每次填完都运行一次；加 `--dry-run` 只看会改什么。之后重新评测，判分就按核对过的标准计算。
+
+新增题目时：
 
 1. 不运行系统，直接读原文出题，故意混入与原文用词不同的问法；
 2. `gold_chunk_keywords` 从原文**逐字**摘录（单个表格单元格内的片段，不要跨单元格）；
