@@ -395,8 +395,8 @@
           <div class="row between"><h2 style="margin:0">系统状态</h2><button id="refreshHealthBtn">刷新</button></div>
           <div class="cards" style="margin-top:10px">
             <div class="metric"><div class="label">资料文件</div><div id="rawCount" class="value">-</div></div>
-            <div class="metric"><div class="label">已索引文档</div><div id="docCount" class="value">-</div></div>
-            <div class="metric"><div class="label">分块</div><div id="chunkCount" class="value">-</div></div>
+            <div class="metric"><div class="label">可用资料</div><div id="docCount" class="value">-</div></div>
+            <div class="metric"><div class="label">资料片段</div><div id="chunkCount" class="value">-</div></div>
             <div class="metric"><div class="label">待确认</div><div id="reviewCount" class="value">-</div></div>
           </div>
           <div id="healthDetail" class="small" style="margin-top:12px"></div>
@@ -423,22 +423,27 @@
           <div class="panel">
             <h2>维护</h2>
             <div class="grid-buttons">
-              <button data-job="update">增量更新</button>
+              <button data-job="update">处理新增和修改的资料</button>
               <button data-job="rebuild">全部重新处理</button>
-              <button data-job="vector-rebuild">重建向量索引</button>
-              <button data-action="/api/embedding-verify" data-name="验证向量模型">验证向量模型</button>
-              <button data-action="/api/vector-verify" data-name="验证向量索引">验证向量索引</button>
-              <button id="diagnosticsBtn">检索诊断</button>
-              <button data-action="/api/ocr-eval" data-name="OCR 评测">OCR 评测</button>
               <button id="openRawBtn">打开资料文件夹</button>
             </div>
-            <div class="muted small" style="margin-top:8px">检索诊断使用问答页输入框里的问题。</div>
+            <details style="margin-top:12px">
+              <summary class="muted small">高级（排查问题时用）</summary>
+              <div class="grid-buttons" style="margin-top:8px">
+                <button data-job="vector-rebuild">重建向量索引</button>
+                <button data-action="/api/embedding-verify" data-name="验证向量模型">验证向量模型</button>
+                <button data-action="/api/vector-verify" data-name="验证向量索引">验证向量索引</button>
+                <button id="diagnosticsBtn">检索诊断</button>
+                <button data-action="/api/ocr-eval" data-name="OCR 评测">OCR 评测</button>
+              </div>
+              <div class="muted small" style="margin-top:8px">检索诊断使用问答页输入框里的问题；结果写在下面的运行日志里。</div>
+            </details>
           </div>
         </div>
-        <div class="panel">
-          <h2>运行日志</h2>
-          <div id="log" class="log">Web UI 已启动。</div>
-        </div>
+        <details class="panel">
+          <summary><h2 style="display:inline">运行日志</h2> <span class="muted small">排查问题时用</span></summary>
+          <div id="log" class="log" style="margin-top:10px">Web UI 已启动。</div>
+        </details>
       </div></div>
     </section>
   </main>
@@ -506,11 +511,13 @@
         lastStatus = data;
         if (data.processing) setChip('warn', '正在处理资料');
         else if (!data.documents) setChip('warn', '还没有资料');
+        else if (data.warming) setChip('warn', '正在准备，第一个问题可能要等十几秒');
         else if (data.api_failure) setChip('bad', `${API_FAILURE_LABELS[data.api_failure.kind] || 'API 调用失败'}，已改用本机回答`);
         else if (data.needs_review && LKA.admin) setChip('warn', `${data.needs_review} 份资料待确认`);
         else setChip('ok', `可以提问 · ${data.documents} 份资料 · ${data.api ? 'API 模式' : '本机模式'}`);
         renderWelcome();
         if (data.processing && LKA.admin) watchJob();
+        if (data.warming) setTimeout(() => { if (!asking) loadStatus(); }, 3000);
       } catch (error) {
         setChip('bad', '服务不可用');
       }
@@ -664,7 +671,8 @@
         if (meta.source_type === 'web_search' || meta.web_search_provider) parts.push('含联网搜索结果');
         if (meta.index_status === 'updating') parts.push('资料正在更新，稍后再问可得到最新结果');
         metaLine.textContent = parts.join(' · ');
-        if (recordId) metaLine.appendChild(feedbackButtons(recordId));
+        // «Upload documents first» is not an answer to rate.
+        if (recordId && !String(meta.user_guidance?.kind || '').startsWith('no_index')) metaLine.appendChild(feedbackButtons(recordId));
         bot.appendChild(metaLine);
         history.push({question: understood || question, answer: answer.slice(0, 600)});
         if (history.length > MAX_HISTORY) history = history.slice(-MAX_HISTORY);
@@ -991,6 +999,7 @@
     const STATUS_TEXT = {
       ready: ['可用', 'ready'],
       processing: ['处理中', 'warn'],
+      waiting: ['待处理', 'warn'],
       outdated: ['待更新', 'warn'],
       needs_review: ['待确认', 'warn'],
       duplicate: ['重复', ''],
@@ -1212,8 +1221,13 @@
     // ---- Settings ----
     function translationStatus(data) {
       if (data.offline_translation?.en_to_zh_ready) return '可用（离线）';
-      if (data.online_translation?.en_to_zh_ready) return '可用（online）';
-      return '不可用';
+      if (data.online_translation?.en_to_zh_ready) return '可用（联网）';
+      return '未安装（只在不用大模型 API、资料又是英文时需要）';
+    }
+    function vectorIndexStatus(data) {
+      if (data.vector_index?.ready) return '正常';
+      if (!(data.index?.documents)) return '还没有资料';
+      return '需要重建：在下方“高级”里点“重建向量索引”';
     }
     async function loadHealth() {
       try {
@@ -1224,10 +1238,10 @@
         $('chunkCount').textContent = data.index?.chunks ?? 0;
         $('reviewCount').textContent = data.pending_reviews ?? 0;
         const lines = [
-          `索引时间：${formatTime(data.index?.indexed_at)}`,
-          `向量模型：${data.embedding?.enabled ? `${data.embedding?.model || '-'}（${data.embedding?.requested_dimensions || '-'} 维）` : '未启用'}`,
-          `向量索引：${data.vector_index?.ready ? '可用' : `降级（${data.vector_index?.reason || '-'}）`}`,
-          `OCR：${data.optional_extractors?.ocr_ready ? '可用（离线/online）' : '不可用'}`,
+          `上次处理资料：${formatTime(data.index?.indexed_at)}`,
+          `语义检索模型：${data.embedding?.enabled ? `已启用（${data.embedding?.model || '-'}）` : '未启用：运行 run-agent.bat embedding-setup 安装'}`,
+          `语义索引：${vectorIndexStatus(data)}`,
+          `扫描件文字识别（OCR）：${data.optional_extractors?.ocr_ready ? '可用' : '不可用：扫描件和图片里的文字读不出来，安装方法见 README「扫描件、图片表格和复杂版式」'}`,
           `英译中：${translationStatus(data)}`,
           `大模型 API：${data.api_configured ? (data.api_backend_usable ? data.api_provider : '当前配置不可用') : '未配置（本机模式）'}`,
           `资料文件夹：${data.raw_dir || '-'}`

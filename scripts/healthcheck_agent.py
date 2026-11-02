@@ -8,6 +8,7 @@ import json
 import shutil
 import sqlite3
 import sys
+from typing import Any
 from pathlib import Path
 
 from api_providers import infer_provider, token_plan_rejected
@@ -215,6 +216,23 @@ def retrieval_quality_report_stats() -> dict[str, object]:
     }
 
 
+def health_summary(checks: dict[str, Any], documents: int, requires_review: int, empty_library: bool, ok: bool) -> str:
+    """One line saying whether the install is usable and, if not, what to do."""
+    if not checks["sqlite_fts5"]:
+        return "这台电脑的 Python 缺少 SQLite 全文检索（FTS5）：请改用 python.org 的 Python 3.10 或更高版本。"
+    if checks["index"].get("error"):
+        return f"索引读取出错（{checks['index']['error']}）：在 Web UI 设置页点“全部重新处理”，或运行 run-agent.bat rebuild。"
+    if checks["raw_unsupported_files"]:
+        return f"资料文件夹里有不支持的文件：{'、'.join(checks['raw_unsupported_files'][:5])}。请移走，或换成 PDF、Word、Excel、Markdown、TXT。"
+    if requires_review:
+        return f"有 {requires_review} 份资料部分内容没能读取，在 Web UI“资料”页确认后才会用来回答。"
+    if empty_library:
+        return "安装正常，知识库还没有资料：运行 run-agent.bat web --open 打开 Web UI，在“资料”页上传文档。"
+    if not documents:
+        return f"资料文件夹里有 {checks['raw_supported_files']} 个文件还没有处理：在 Web UI“资料”页点“重新处理”，或运行 run-agent.bat update。"
+    return f"可以使用：{documents} 份资料已处理。" if ok else "索引不完整：在 Web UI 设置页点“全部重新处理”，或运行 run-agent.bat rebuild。"
+
+
 def main() -> int:
     project_runtime.apply_project_runtime_env()
     env = load_env(ROOT / ".env")
@@ -263,16 +281,20 @@ def main() -> int:
             env.get("LKA_API_PROVIDER", ""),
         ),
     }
+    documents = int(stats.get("documents", 0) or 0)
+    requires_review = int(checks["extraction_report"].get("requires_review", 0) or 0)
+    # A fresh install before any upload: nothing is wrong, there is just nothing to search yet.
+    empty_library = not raw_files and documents == 0
     ok = (
         checks["sqlite_fts5"]
         and checks["raw_dir_exists"]
-        and stats.get("exists") is True
         and not stats.get("error")
-        and int(stats.get("documents", 0) or 0) > 0
-        and int(stats.get("chunks", 0) or 0) > 0
-        and int(checks["extraction_report"].get("requires_review", 0) or 0) == 0
+        and requires_review == 0
         and not checks["raw_unsupported_files"]
+        and (empty_library or (stats.get("exists") is True and documents > 0 and int(stats.get("chunks", 0) or 0) > 0))
     )
+    checks["empty_library"] = empty_library
+    checks["summary"] = health_summary(checks, documents, requires_review, empty_library, ok)
     checks["ok"] = ok
     print(json.dumps(checks, ensure_ascii=False, indent=2))
     return 0 if ok else 1

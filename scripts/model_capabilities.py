@@ -27,6 +27,8 @@ DEFAULT_LOCAL_EMBEDDING_MODEL = "BAAI/bge-m3"
 DEFAULT_LOCAL_EMBEDDING_DIMENSIONS = 1024
 LOCAL_EMBEDDING_PROVIDERS = {"local", "local-bge-m3", "sentence-transformers", "huggingface"}
 LOCAL_EMBEDDING_MODEL: Any = None
+# The Web UI loads the model at start while a first question may load it too: only one of them does.
+LOCAL_EMBEDDING_MODEL_LOCK = threading.Lock()
 
 
 def read_env(path: Path = ENV_PATH) -> dict[str, str]:
@@ -293,17 +295,18 @@ def embed_texts_local(texts: list[str], cfg: dict[str, Any]) -> dict[str, Any]:
         from sentence_transformers import SentenceTransformer  # type: ignore
 
         model_name = str(cfg["model"])
-        if LOCAL_EMBEDDING_MODEL is None or getattr(LOCAL_EMBEDDING_MODEL, "_lka_model_name", "") != model_name:
-            cache_folder = project_runtime.CACHE_DIR / "huggingface"
-            # Once cached, never touch the Hub: offline machines would stall here, and transformers
-            # otherwise starts a background download of a safetensors conversion (~2.3 GB for bge-m3)
-            # that also keeps the process from exiting.
-            LOCAL_EMBEDDING_MODEL = SentenceTransformer(
-                model_name,
-                cache_folder=str(cache_folder),
-                local_files_only=local_model_is_cached(model_name, cache_folder),
-            )
-            setattr(LOCAL_EMBEDDING_MODEL, "_lka_model_name", model_name)
+        with LOCAL_EMBEDDING_MODEL_LOCK:
+            if LOCAL_EMBEDDING_MODEL is None or getattr(LOCAL_EMBEDDING_MODEL, "_lka_model_name", "") != model_name:
+                cache_folder = project_runtime.CACHE_DIR / "huggingface"
+                # Once cached, never touch the Hub: offline machines would stall here, and transformers
+                # otherwise starts a background download of a safetensors conversion (~2.3 GB for bge-m3)
+                # that also keeps the process from exiting.
+                LOCAL_EMBEDDING_MODEL = SentenceTransformer(
+                    model_name,
+                    cache_folder=str(cache_folder),
+                    local_files_only=local_model_is_cached(model_name, cache_folder),
+                )
+                setattr(LOCAL_EMBEDDING_MODEL, "_lka_model_name", model_name)
         vectors_raw = LOCAL_EMBEDDING_MODEL.encode(
             texts,
             batch_size=int(cfg["batch_size"]),

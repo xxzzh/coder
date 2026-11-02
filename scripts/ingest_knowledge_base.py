@@ -164,6 +164,22 @@ from kb_ingest.vectors import (  # noqa: F401  (re-exported for callers of this 
 )
 from kb_ingest import progress
 
+# A file read without error that gave no text at all.
+NO_TEXT_READ_ERROR = "no text extracted"
+
+
+def read_failure_report(path: Path, rel_path: str, error: str) -> dict[str, Any]:
+    """The extraction report of a file that could not be read: kept with the others, so the document
+    list can say why, and stamped with the file's size and time, so a newer copy is not marked failed."""
+    stat = path.stat()
+    return {
+        **extraction_report(path, path.suffix.lower().lstrip(".")),
+        "file_path": rel_path,
+        "read_error": error[:300],
+        "file_size": stat.st_size,
+        "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+    }
+
 
 def _ingest_unlocked(
     raw_dir: Path,
@@ -237,9 +253,11 @@ def _ingest_unlocked(
         except Exception as exc:
             skipped_count += 1
             print(f"skip {path}: {exc}")
+            extraction_reports.append(read_failure_report(path, rel_path, str(exc)))
             continue
         if not text:
             skipped_count += 1
+            extraction_reports.append(read_failure_report(path, rel_path, NO_TEXT_READ_ERROR))
             continue
 
         changed_doc_count += 1

@@ -3,7 +3,8 @@ and the users' "有用 / 没用" feedback, kept as JSON lines under logs/ on thi
 
 The statistics page shows what the knowledge base does for its users: how much is asked and
 answered, the estimated time saved, the most asked questions, and above all the questions it
-could not answer, which name the documents still missing. LKA_QUESTION_LOG=off stops recording.
+could not answer, which name the documents still missing (questions asked before any document was
+processed are left out). LKA_QUESTION_LOG=off stops recording.
 """
 
 from __future__ import annotations
@@ -79,6 +80,8 @@ class QuestionLog:
                 "answer_start": str(result.get("answer") or "")[:200],
                 "remote": remote,
                 "api_failure": api_failure,
+                # Asked before any document was processed: not a gap in the documents.
+                "no_documents": result.get("degrade_reason") == "local_index_missing",
             },
         )
         return record_id
@@ -106,7 +109,9 @@ class QuestionLog:
         now = time.time()
         since = now - days * 86400 if days else 0.0
         with self._lock:
-            questions = [item for item in self._read(self.path) if float(item.get("time") or 0) >= since]
+            questions = [
+                item for item in self._read(self.path) if float(item.get("time") or 0) >= since and not item.get("no_documents")
+            ]
             feedback_events = self._read(self.feedback_path)
         # The latest feedback on an answer counts (a user may change their mind).
         feedback: dict[str, bool] = {}

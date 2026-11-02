@@ -101,6 +101,9 @@ def check_vector_fallback(health_payload: dict[str, Any] | None) -> dict[str, An
     index = health_payload.get("index") or {}
     embedding_ready = bool(embedding.get("ready"))
     vector_ready = bool(vector_index.get("ready"))
+    if health_payload.get("empty_library"):
+        # A fresh install before any upload: there are no chunks to build vectors from yet.
+        return {"ok": True, "mode": "empty_library", "embedding": embedding}
     if embedding_ready:
         return {
             "ok": vector_ready and bool(vector_index.get("aligned_with_sqlite", False)),

@@ -9,6 +9,7 @@ set "RAW=%ROOT%knowledge_base\raw"
 set "RUNNER=%ROOT%run-agent.bat"
 set "OCR_EVAL=%ROOT%scripts\evaluate_ocr_test_materials.py"
 set "OCR_GEN=%ROOT%scripts\generate_ocr_test_materials.py"
+set "MENU_TEXT=%ROOT%scripts\start_menu.py"
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 set "LKA_PROJECT_ROOT=%ROOT%"
@@ -35,46 +36,59 @@ if not exist "%RAW%" mkdir "%RAW%"
 
 :menu
 cls
+set "CHOICE="
+rem The menu text is Chinese, printed by Python; without a working Python, the English menu below.
+"%PY%" "%MENU_TEXT%" menu 2>nul || goto menu_ascii
+set /p "CHOICE="
+goto choose
+
+:menu_ascii
 echo ================================================
 echo  Local Knowledge Base Agent
+echo  (Python 3.10+ was not found: install it with "Add python.exe to PATH")
 echo ================================================
 echo.
-echo  1. First-time setup / configure API
-echo  2. Start Web UI
-echo  3. Open raw materials folder
-echo  4. Strict rebuild index
-echo  5. Incremental update index
-echo  6. Health check
-echo  7. Ask a question
-echo  8. List indexed sources
-echo  9. Run OCR test materials evaluation
-echo 10. Generate OCR test materials
-echo 11. Install offline English-to-Chinese translation model
-echo 12. Configure answer refinement API
-echo 13. Install project-local dependencies
-echo 14. Configure high-quality embedding API
-echo  0. Exit
+echo  First install, in this order
+echo   1. Install dependencies
+echo   2. Create the configuration
+echo   3. Install the local embedding model (about 2.2 GB)
+echo   4. Configure the answer API (optional)
+echo  Daily use
+echo   5. Start the Web UI (upload documents, ask questions)
+echo   6. Check the installation and documents
+echo  Without uploading in the Web UI
+echo   7. Open the documents folder
+echo   8. Process new and changed documents
+echo   9. Process all documents again
+echo  Other
+echo  10. Ask a question here
+echo  11. List processed documents
+echo  12. Install the offline English-to-Chinese model
+echo  13. Evaluate OCR test materials
+echo  14. Generate OCR test materials
+echo   0. Exit
 echo.
 set /p "CHOICE=Choose an option: "
 
-if "%CHOICE%"=="1" goto setup
-if "%CHOICE%"=="2" goto web
-if "%CHOICE%"=="3" goto open_raw
-if "%CHOICE%"=="4" goto rebuild_strict
-if "%CHOICE%"=="5" goto update
+:choose
+if "%CHOICE%"=="1" goto install_deps
+if "%CHOICE%"=="2" goto setup
+if "%CHOICE%"=="3" goto embedding_setup
+if "%CHOICE%"=="4" goto api_setup
+if "%CHOICE%"=="5" goto web
 if "%CHOICE%"=="6" goto verify
-if "%CHOICE%"=="7" goto ask
-if "%CHOICE%"=="8" goto sources
-if "%CHOICE%"=="9" goto ocr_eval
-if "%CHOICE%"=="10" goto ocr_generate
-if "%CHOICE%"=="11" goto translation_setup
-if "%CHOICE%"=="12" goto api_setup
-if "%CHOICE%"=="13" goto install_deps
-if "%CHOICE%"=="14" goto embedding_setup
+if "%CHOICE%"=="7" goto open_raw
+if "%CHOICE%"=="8" goto update
+if "%CHOICE%"=="9" goto rebuild_strict
+if "%CHOICE%"=="10" goto ask
+if "%CHOICE%"=="11" goto sources
+if "%CHOICE%"=="12" goto translation_setup
+if "%CHOICE%"=="13" goto ocr_eval
+if "%CHOICE%"=="14" goto ocr_generate
 if "%CHOICE%"=="0" goto end
 
 echo.
-echo Invalid option.
+call :say invalid
 pause
 goto menu
 
@@ -86,8 +100,7 @@ goto menu
 
 :web
 echo.
-echo Starting Web UI at http://127.0.0.1:8765/
-echo Close this window or press Ctrl+C to stop the Web UI.
+call :say web
 echo.
 call "%RUNNER%" web --open
 echo.
@@ -97,7 +110,7 @@ goto menu
 :open_raw
 start "" "%RAW%"
 echo.
-echo Put .md, .doc, .docx, .pdf, and .xlsx files in this folder, then run option 5 for an incremental update or option 4 for a strict rebuild.
+call :say open_raw
 echo.
 pause
 goto menu
@@ -105,8 +118,7 @@ goto menu
 :rebuild_strict
 call "%RUNNER%" rebuild-strict
 echo.
-echo If the result has requires_review greater than 0, inspect:
-echo   knowledge_base\processed\extraction_report.jsonl
+call :say rebuild_strict
 echo.
 pause
 goto menu
@@ -120,16 +132,18 @@ goto menu
 :verify
 call "%RUNNER%" verify
 echo.
-echo The agent is ready when the output contains: "ok": true
+call :say verify
 echo.
 pause
 goto menu
 
 :ask
 echo.
-set /p "QUESTION=Enter your question: "
+call :say ask_prompt
+set "QUESTION="
+set /p "QUESTION="
 if "%QUESTION%"=="" (
-  echo Question cannot be empty.
+  call :say ask_empty
   pause
   goto menu
 )
@@ -146,7 +160,7 @@ goto menu
 
 :ocr_eval
 if not exist "%OCR_EVAL%" (
-  echo Missing OCR evaluation script: %OCR_EVAL%
+  call :say ocr_eval_missing
   pause
   goto menu
 )
@@ -157,7 +171,7 @@ goto menu
 
 :ocr_generate
 if not exist "%OCR_GEN%" (
-  echo Missing OCR material generator: %OCR_GEN%
+  call :say ocr_gen_missing
   pause
   goto menu
 )
@@ -189,6 +203,11 @@ call "%RUNNER%" embedding-setup
 echo.
 pause
 goto menu
+
+:say
+rem One of the Chinese messages in scripts\start_menu.py.
+"%PY%" "%MENU_TEXT%" %1 2>nul
+exit /b 0
 
 :end
 endlocal

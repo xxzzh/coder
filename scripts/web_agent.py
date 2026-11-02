@@ -82,6 +82,7 @@ from kb.config import api_enabled, runtime_config  # noqa: E402
 import model_capabilities  # noqa: E402
 import project_runtime  # noqa: E402
 from query_knowledge_base import query as kb_query  # noqa: E402
+from query_knowledge_base import search as kb_search  # noqa: E402
 import vector_store  # noqa: E402
 from web_access import (  # noqa: E402
     LOOPBACK_HOST_NAMES,
@@ -244,9 +245,27 @@ def status_payload() -> dict[str, Any]:
         "documents": indexed_document_count(DB_PATH),
         "needs_review": len(pending_review_reports(RAW_DIR, PROCESSED_DIR)),
         "processing": JOBS.running() or ingest_in_progress(DB_PATH),
+        "warming": WARMUP["state"] == "loading",
         "api": api_enabled(runtime_config()),
         "api_failure": recent_api_failure(),
     }
+
+
+# Loading the vector model and index takes 10-20 s. Done in the background when the UI starts, so the
+# first question does not wait for it; the status bar says so meanwhile.
+WARMUP: dict[str, str] = {"state": "idle"}
+
+
+def warm_up() -> None:
+    if not indexed_document_count(DB_PATH):
+        return  # nothing to search yet: the first processing loads the model with its own progress
+    WARMUP["state"] = "loading"
+    try:
+        kb_search(DB_PATH, "预热", 1, runtime_config())
+    except Exception:  # noqa: BLE001  (the first question then loads them itself)
+        pass
+    finally:
+        WARMUP["state"] = "ready"
 
 
 def api_config_payload() -> dict[str, Any]:
@@ -914,6 +933,7 @@ def main() -> None:
         for address in network_addresses():
             print(f"同一网络的电脑可以打开：http://{address}:{args.port}/（需要访问密码；只能提问，资料和设置只能在本机管理）")
     print("Press Ctrl+C to stop.")
+    threading.Thread(target=warm_up, daemon=True).start()
     if args.open:
         webbrowser.open(url)
     try:

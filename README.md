@@ -35,64 +35,60 @@ knowledge_base/raw/
 
 ### 第一次安装
 
-获取代码（当前功能在 `codex/agent-delivery-hardening` 分支）：
+1. 下载安装包：在 GitHub 仓库的 Releases 页面下载最新的 `local-knowledge.zip`，解压后进入 `local-knowledge` 目录，下面的命令都在这个目录里运行。不习惯命令行可以双击 `start.bat`，按菜单“首次安装”的 1～4 依次操作，再用 5 启动 Web UI。
 
-```bat
-git clone -b codex/agent-delivery-hardening https://github.com/xxzzh/coder.git
-cd coder
-```
-
-不用 git 的话，可以在 GitHub 仓库的 Releases 页面下载打包好的 `local-knowledge.zip`，解压后进入 `local-knowledge` 目录，从下面第 1 步开始。
-
-1. 安装依赖：在项目内创建 `.venv`，下载缓存放在 `tools\cache`。
+2. 安装依赖：在项目内创建 `.venv`，下载缓存放在 `tools\cache`。
 
    ```bat
    .\run-agent.bat install-deps
    ```
 
-2. 生成配置文件 `.env`。会询问是否配置大模型 API，可以先选否，第 5 步再配。
+3. 生成配置文件 `.env`。会询问是否配置大模型 API，可以先选否，之后在 Web UI 的“设置”页配置。
 
    ```bat
    .\run-agent.bat setup
    ```
 
-3. 启用本地向量检索。首次运行会把 `BAAI/bge-m3`（约 2.2 GB）下载到 `tools\cache\huggingface`，提示输入时直接回车用默认值。
+4. 安装本地向量模型。首次运行会把 `BAAI/bge-m3`（约 2.2 GB）下载到 `tools\cache\huggingface`，提示输入时直接回车用默认值。
 
    ```bat
    .\run-agent.bat embedding-setup
    ```
 
-4. 把资料放进 `knowledge_base\raw`（支持格式和子目录见上文），然后严格建库并检查。`verify` 输出 `"ok": true` 即可使用；如果 `requires_review` 大于 0，见下文「扫描件、图片表格和复杂版式」。
-
-   ```bat
-   .\run-agent.bat rebuild-strict
-   .\run-agent.bat verify
-   ```
-
-5. （推荐）配置大模型 API，开启智能检索 Agent，详见「API 配置」。
+5. （推荐）配置大模型 API，开启智能检索 Agent，详见「API 配置」。也可以跳过，启动后在 Web UI 的“设置”页配置。
 
    ```bat
    .\run-agent.bat api-setup
    ```
 
-6. 启动 Web UI，在“资料”页上传文档，处理完成后在“问答”页提问。默认地址 `http://127.0.0.1:8765/`，只监听本机。
+6. 检查安装。最后的 `summary` 一行显示“安装正常，知识库还没有资料”（`"ok": true`）即可。
+
+   ```bat
+   .\run-agent.bat verify
+   ```
+
+7. 启动 Web UI，在“资料”页上传文档，处理完成后在“问答”页提问。默认地址 `http://127.0.0.1:8765/`，只监听本机。
 
    ```bat
    .\run-agent.bat web --open
    ```
 
-不习惯命令行可以双击 `start.bat`，菜单编号对应：`13` 安装依赖、`1` 初始化、`14` 配置向量模型、`3` 打开资料目录、`4` 严格建库、`6` 健康检查、`12` 配置 API、`2` 启动 Web UI、`7` 命令行提问。
+不用网页上传时，也可以把资料直接放进 `knowledge_base\raw`（支持格式和子目录见上文），再运行 `.\run-agent.bat update` 处理（`rebuild-strict` 会清空索引后全部重新处理）。处理完 `verify` 的 summary 显示“可以使用”；如果 `requires_review` 大于 0，见下文「扫描件、图片表格和复杂版式」。
+
+从源码获取（开发者）：先 `git clone -b codex/agent-delivery-hardening https://github.com/xxzzh/coder.git`，进入 `coder` 目录后同样从第 2 步开始。
+
+`start.bat` 菜单：`1`～`4` 首次安装（安装依赖、初始化配置、本地向量模型、大模型 API），`5` 启动 Web UI，`6` 检查安装和资料，`7`～`9` 用资料文件夹方式处理资料，`10` 起是命令行提问和其他工具。
 
 ### 日常使用
 
-Web UI 分三页：
+Web UI 分四页：
 
 | 页面 | 内容 |
 |---|---|
 | 问答 | 对话式提问：Enter 发送、Shift+Enter 换行；答案逐段显示，编号可点开对应原文；可以接着追问（“它最多重试几次？”“那 SFT 呢？”），页面会显示按什么完整问题理解；资料里没有时说明缺什么，并给出可点的推荐问题；“开始新对话”清空上下文 |
 | 资料 | 拖入或选择文件上传（PDF、Word、Excel、Markdown、TXT，单个默认不超过 200 MB，`LKA_UPLOAD_MAX_MB` 可改），上传后自动处理并显示进度（读取第几个文件、扫描页识别、生成向量）；资料列表显示每个文件的状态（可用、处理中、待确认、未能读取等），可以删除；有部分内容没能读取的文件列在“需要确认的资料”里，确认后才用来回答 |
 | 统计 | 提问次数、答出率、估计节省时间（按每个答案省 5 分钟估算，`LKA_MINUTES_SAVED_PER_ANSWER` 可改）、答案好评率、回答用时，每日提问图；“答不出的问题”列出资料里找不到答案的提问，也就是还缺哪些文档；另有常问问题、最常用到的资料和被标为“没用”的答案 |
-| 设置 | 回答方式（大模型 API 模式 / 本机模式）、系统状态、大模型 API 配置、维护操作（增量更新、全部重新处理、重建向量索引、验证、检索诊断、OCR 评测）和运行日志 |
+| 设置 | 回答方式（大模型 API 模式 / 本机模式）、系统状态、大模型 API 配置、维护（处理新增和修改的资料、全部重新处理、打开资料文件夹）；排查问题用的高级操作（重建向量索引、验证、检索诊断、OCR 评测）和运行日志收在折叠区里 |
 
 **回答方式**：设置页最上面的开关在“大模型 API 模式”和“本机模式”之间切换（即 `.env` 里的 `LKA_USE_API`），已保存的 Key 和模型保留，切回来不用重新配置；顶部状态栏显示当前模式。API 模式更准确，但问题和检索到的资料片段会发给所选的大模型服务；本机模式资料和问题都不离开这台电脑、不产生费用，准确率低一些。
 
@@ -511,7 +507,7 @@ Web UI 端到端验证：先启动 Web UI，再运行下面的命令。17 道提
 | 向量模型 | `tools/cache/huggingface/` | `.\run-agent.bat embedding-setup` 首次自动下载 |
 | OCR 引擎（有扫描件或图片时） | 系统安装的 Tesseract | 见「扫描件、图片表格和复杂版式」；识别数据已在 `tools/tessdata` |
 | 原始资料 | `knowledge_base/raw/` | 在 Web UI“资料”页上传，或自己放入 |
-| 索引和向量 | `knowledge_base/index/`、`knowledge_base/vector/` | `.\run-agent.bat rebuild-strict` |
+| 索引和向量 | `knowledge_base/index/`、`knowledge_base/vector/` | 在 Web UI 上传后自动生成；资料放进文件夹时运行 `.\run-agent.bat update` |
 | 评测集 | `eval/eval_set.jsonl` | 按 `eval/README.md` 自己出题，可选 |
 
 建好后运行 `.\audit-local.bat` 可以做一次完整的本地审计。资料更新后再运行 `.\run-agent.bat update`，或者直接提问，系统会检测 raw 文件变化并在后台更新。
@@ -521,10 +517,11 @@ Web UI 端到端验证：先启动 Web UI，再运行下面的命令。17 道提
 ## 常见问题
 
 - **命令行提问每次要等 15–20 秒**：每条命令都要重新加载本地向量模型。Web UI 常驻运行，只有第一次提问慢，之后每题一般 1–4 秒（含 API 调用），日常使用推荐 Web UI。
-- **回答“本地知识库中没有出现「某名称」”**：问题里的英文名称或“名称+版本”在资料中一次都没出现，系统直接拒答。确认名称写法，或把相关资料放进 `knowledge_base\raw` 后更新索引。
+- **回答“本地知识库中没有出现「某名称」”**：问题里的英文名称或“名称+版本”在资料中一次都没出现，系统直接拒答。确认名称写法，或在“资料”页上传相关资料。
 - **回答“本地知识库没有找到足够依据：……”**：智能检索 Agent 读过检索到的资料，认为其中没有这项信息，冒号后面写了缺什么。
 - **API 失败或超时**：系统会自动退回本地答案，返回结果里的 `agent_error` 字段记录原因。请检查 Key、余额和网络；这类退回的答案不会写入缓存，恢复后重新提问即可。
 - **`embedding-setup` 下载很慢或失败**：模型来自 Hugging Face。网络受限时可以先设置镜像再运行，cmd 用 `set HF_ENDPOINT=https://hf-mirror.com`，PowerShell 用 `$env:HF_ENDPOINT="https://hf-mirror.com"`；下载完成后不再需要联网。
+- **`verify` 的 `ok` 是 `false`**：看最后的 `summary` 一行，它说明了原因和该怎么做。
 - **`verify` 显示 `requires_review` 大于 0**：有文件可能没有完整抽取（扫描件、图片表格等），见上文「扫描件、图片表格和复杂版式」。
 
 ## 限制

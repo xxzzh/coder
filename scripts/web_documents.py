@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
@@ -162,14 +163,40 @@ def review_reason(warning: str) -> str:
     return warning
 
 
+# Why a file could not be read (the reader's error, see read_failure_report in ingest_knowledge_base),
+# in words that say what to do about it.
+READ_FAILURE_REASONS = (
+    (r"no text extracted", "没能从文件里读出文字：可能是空文件，或者整份都是扫描图片。"),
+    (r"decrypt|encrypt|password", "文件有密码保护：请去掉密码后重新上传。"),
+    (r"/Root object|EOF marker|really a PDF|PdfReadError|PdfStreamError", "不是有效的 PDF 文件：可能已损坏，或只是改了扩展名。请重新导出 PDF 后再上传。"),
+    (r"not a zip file|BadZipFile|zipfile", "文件已损坏，或不是真正的 Word / Excel 文件：请用 Office 或 WPS 打开后另存一份，再上传。"),
+    (r"\.doc 提取|Microsoft Word", "旧版 Word（.doc）需要这台电脑装有 Microsoft Word 才能读取；也可以另存为 .docx 后再上传。"),
+)
+
+
+def read_failure_reason(error: str) -> str:
+    for pattern, reason in READ_FAILURE_REASONS:
+        if re.search(pattern, error, flags=re.IGNORECASE):
+            return reason
+    return f"读取时出错：{error[:120]}。可以重新保存或导出这份文件后再上传。"
+
+
 def _iso_seconds(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="seconds")
 
 
+def indexed_sources(db_path: Path) -> dict[str, dict[str, Any]]:
+    """The processed documents by path; none yet before the first processing has created the index."""
+    try:
+        return {str(item.get("file_path")): item for item in kb_sources(db_path).get("sources", [])}
+    except sqlite3.DatabaseError:
+        return {}
+
+
 def documents_payload(raw_dir: Path, db_path: Path, processed_dir: Path, processing: bool) -> dict[str, Any]:
-    """Every file in the knowledge base folder with its state:
-    ready, processing, outdated (changed since it was processed), needs_review, duplicate, failed, unsupported."""
-    indexed = {str(item.get("file_path")): item for item in kb_sources(db_path).get("sources", [])}
+    """Every file in the knowledge base folder with its state: ready, processing, waiting (not processed
+    yet), outdated (changed since it was processed), needs_review, duplicate, failed, unsupported."""
+    indexed = indexed_sources(db_path)
     pending = {str(item.get("file_path")): item for item in pending_review_reports(raw_dir, processed_dir)}
     reports = {str(item.get("file_path")): item for item in extraction_reports(processed_dir)}
     items: list[dict[str, Any]] = []
@@ -197,8 +224,18 @@ def documents_payload(raw_dir: Path, db_path: Path, processed_dir: Path, process
             elif row:
                 status = "outdated"
             else:
-                status = "failed"
-                reasons = [review_reason(warning) for warning in (reports.get(rel_path) or {}).get("warnings", [])]
+                report = reports.get(rel_path) or {}
+                read_this_copy = report.get("file_size") == stat.st_size and report.get("modified_at") == _iso_seconds(stat.st_mtime)
+                if report.get("read_error") and read_this_copy:
+                    status = "failed"
+                    reasons = [read_failure_reason(str(report["read_error"]))]
+                elif report.get("warnings") and not report.get("read_error"):
+                    status = "failed"
+                    reasons = [review_reason(warning) for warning in report["warnings"]]
+                else:
+                    # Put into the folder by hand, or replaced since the last try: not processed yet.
+                    status = "waiting"
+                    reasons = ["还没有处理：点上方的“重新处理”，处理完成后就能用来回答。"]
             items.append(
                 {
                     "file_path": rel_path,

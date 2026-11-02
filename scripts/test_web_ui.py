@@ -180,7 +180,28 @@ def test_upload_names_and_storage() -> None:
         listing = web_documents.documents_payload(raw, Path(temp) / "none.db", Path(temp) / "processed", processing=True)
         assert [(item["file_path"], item["status"]) for item in listing["documents"]] == [("pdf/x.pdf", "processing")]
         listing = web_documents.documents_payload(raw, Path(temp) / "none.db", Path(temp) / "processed", processing=False)
-        assert listing["documents"][0]["status"] == "failed"
+        assert listing["documents"][0]["status"] == "waiting" and "重新处理" in listing["documents"][0]["reasons"][0], listing
+
+        # The first processing has created the index file but not its tables yet: processing, not an error.
+        import sqlite3
+
+        import ingest_knowledge_base
+
+        empty_db = Path(temp) / "empty.db"
+        sqlite3.connect(empty_db).close()
+        assert web_documents.documents_payload(raw, empty_db, Path(temp) / "processed", processing=True)["documents"][0]["status"] == "processing"
+        # A file the last processing could not read says why, in words that say what to do.
+        processed = Path(temp) / "processed"
+        processed.mkdir()
+        pdf = raw / "pdf" / "x.pdf"
+        report = ingest_knowledge_base.read_failure_report(pdf, "pdf/x.pdf", "No /Root object! - Is this really a PDF?")
+        (processed / "extraction_report.jsonl").write_text(json.dumps(report, ensure_ascii=False) + "\n", encoding="utf-8")
+        item = web_documents.documents_payload(raw, empty_db, processed, processing=False)["documents"][0]
+        assert item["status"] == "failed" and "不是有效的 PDF" in item["reasons"][0], item
+        # A newer copy of that file is not marked failed before it has been processed.
+        later = time.time() + 60
+        os.utime(pdf, (later, later))
+        assert web_documents.documents_payload(raw, empty_db, processed, processing=False)["documents"][0]["status"] == "waiting"
 
 
 def test_review_reasons() -> None:
@@ -189,6 +210,10 @@ def test_review_reasons() -> None:
     xlsx = web_documents.review_reason("XLSX content not extracted: 2 embedded object(s) not extracted (attached file on sheet A), embedded image(s) returned no OCR text.")
     assert xlsx == "Excel 中有部分内容没能读取：2 个嵌入对象（attached file on sheet A）；图片中的文字。", xlsx
     assert web_documents.review_reason("something new") == "something new"
+    assert "密码" in web_documents.read_failure_reason("File has not been decrypted")
+    assert "Word / Excel" in web_documents.read_failure_reason("File is not a zip file")
+    assert web_documents.read_failure_reason("no text extracted").startswith("没能从文件里读出文字")
+    assert web_documents.read_failure_reason("strange error").startswith("读取时出错：strange error")
 
 
 def test_question_log_and_stats() -> None:
@@ -202,6 +227,8 @@ def test_question_log_and_stats() -> None:
         log.record("整机保修多久", None, answered, 1.0, remote=True)
         log.record("它电池呢", "电池保修多久", refused, 3.0, remote=False)
         log.record("电池保修多久？", None, refused, 2.5, remote=False)
+        # Asked before any document was uploaded: not a gap in the documents, left out of the statistics.
+        log.record("公司年假有几天？", None, {"source_type": "none", "degrade_reason": "local_index_missing", "sources": []}, 0.1, remote=False)
         log.feedback(first, False)
         log.feedback(first, True)  # the latest feedback counts
         try:
@@ -427,15 +454,29 @@ def test_http_server() -> None:
             assert status == 200 and starts == ["update", "update"]
             assert not (web_agent.RAW_DIR / "markdown" / "安装.md").exists()
 
+            # A question asked before any document was processed is not a gap in the documents: the
+            # statistics leave it out.
+            def ask(question: str) -> str:
+                status, page, _ = client.request(
+                    "POST", "/api/query-stream", json.dumps({"question": question, "allow_api": False}).encode("utf-8"),
+                    {"Content-Type": "application/json"},
+                )
+                events = page["html"]
+                assert status == 200 and "event: done" in events, events[:300]
+                done_line = events.split("event: done", 1)[1].strip().splitlines()[0]
+                return json.loads(done_line.removeprefix("data: "))["record_id"]
+
+            ask("保修多久")
+            status, data, _ = client.request("GET", "/api/stats?days=7")
+            assert status == 200 and data["totals"]["questions"] == 0, data["totals"]
+
             # A question on the chat page is recorded; feedback and the statistics follow it.
-            status, page, _ = client.request(
-                "POST", "/api/query-stream", json.dumps({"question": "保修多久", "allow_api": False}).encode("utf-8"),
-                {"Content-Type": "application/json"},
-            )
-            events = page["html"]
-            assert status == 200 and "event: done" in events, events[:300]
-            done_line = events.split("event: done", 1)[1].strip().splitlines()[0]
-            record_id = json.loads(done_line.removeprefix("data: "))["record_id"]
+            original_query = web_agent.kb_query
+            web_agent.kb_query = lambda *args, **kwargs: {"answer": "本地知识库没有找到足够依据。", "source_type": "none", "sources": []}
+            try:
+                record_id = ask("保修多久")
+            finally:
+                web_agent.kb_query = original_query
             status, _, _ = client.post_json("/api/feedback", {"id": record_id, "helpful": False})
             assert status == 200
             status, data, _ = client.request("GET", "/api/stats?days=7")
@@ -527,6 +568,27 @@ def test_http_server() -> None:
             query_knowledge_base.PROCESSED_DIR = saved_query_processed
 
 
+def test_install_messages() -> None:
+    """verify says in one line whether the install is usable and what to do; start.bat's messages exist."""
+    import re
+
+    import healthcheck_agent
+    import start_menu
+
+    checks = {"sqlite_fts5": True, "index": {}, "raw_unsupported_files": [], "raw_supported_files": 0}
+    assert healthcheck_agent.health_summary(checks, 0, 0, True, True).startswith("安装正常，知识库还没有资料")
+    assert "还没有处理" in healthcheck_agent.health_summary({**checks, "raw_supported_files": 3}, 0, 0, False, False)
+    assert healthcheck_agent.health_summary(checks, 5, 0, False, True) == "可以使用：5 份资料已处理。"
+    assert "确认" in healthcheck_agent.health_summary(checks, 5, 2, False, False)
+
+    start_bat = (SCRIPTS_DIR.parent / "start.bat").read_bytes()
+    # cmd misreads multi-byte lines of a UTF-8 batch file: the Chinese text lives in start_menu.py.
+    assert all(byte < 128 for byte in start_bat), "start.bat must stay ASCII"
+    keys = set(re.findall(r"call :say (\w+)", start_bat.decode("ascii")))
+    assert keys and keys <= set(start_menu.MESSAGES), keys - set(start_menu.MESSAGES)
+    assert "1. 安装依赖" in start_menu.MENU and start_menu.MENU.endswith("请输入编号：")
+
+
 def main() -> None:
     test_followup_rules()
     test_followup_api_failure_falls_back_to_rules()
@@ -538,6 +600,7 @@ def main() -> None:
     test_set_env_value()
     test_index_job()
     test_http_server()
+    test_install_messages()
     print("web ui: ok")
 
 
