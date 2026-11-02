@@ -399,11 +399,13 @@ def mentions_a_name(text: str, units: list[tuple[str, str, float]]) -> bool:
     return not names or any(ascii_term_pattern(name).search(lowered) for name in names)
 
 
-def rows_about_named_subject(rows: list[dict[str, Any]], question: str) -> list[dict[str, Any]]:
+def rows_about_named_subject(rows: list[dict[str, Any]], question: str, labels: dict[str, str] | None = None) -> list[dict[str, Any]]:
     """Drop chunks that mention none of the question's names, when others do (the FAT touchpad
-    test does not answer a question about the SFT station)."""
+    test does not answer a question about the SFT station). A chunk mentions what its document's
+    name says (labels: file name -> document label): a section of «AP-300 说明书» is about AP-300."""
     units = query_content_units(question)
-    named = [row for row in rows if mentions_a_name(str(row.get("text", "")), units)]
+    labels = labels or {}
+    named = [row for row in rows if mentions_a_name(f"{row.get('text', '')}\n{labels.get(str(row.get('file_name', '')), '')}", units)]
     return named if named and len(named) < len(rows) else rows
 
 

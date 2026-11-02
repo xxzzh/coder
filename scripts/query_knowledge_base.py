@@ -32,6 +32,7 @@ from ingest_knowledge_base import ingest_in_progress, is_ignored_raw_file, raw_f
 import llm_budget
 import model_capabilities
 import project_runtime
+from kb import local_focus
 from kb.text import (  # noqa: F401  (re-exported for callers of this module)
     TRAD_PHRASES,
     TRAD_TO_SIMP,
@@ -134,6 +135,7 @@ from kb.relevance import (  # noqa: F401  (re-exported for callers of this modul
     ascii_term_pattern,
     content_coverage,
     covering_row_index,
+    document_labels,
     knowledge_text,
     local_result_is_relevant,
     query_content_units,
@@ -234,7 +236,7 @@ NEGATIVE_CACHE_TTL_SECONDS = 120
 CACHE_VARIANT_VERSION = "retrieval-v61:no-corpus-specific-rules"
 # Answers built without a model (layout, gate, cited evidence). Raising it refreshes cached local
 # answers only; cached API answers stay valid and are not paid for again.
-LOCAL_ANSWER_VERSION = "local-v4"
+LOCAL_ANSWER_VERSION = "local-v5"
 
 
 def source_fingerprint(raw_dir: Path = RAW_DIR) -> str:
@@ -1010,12 +1012,21 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
         return finalize_answer(question, result, config, allow_api)
 
     covering = covering_row_index(rows, question, db_path)
+    covering_row = rows[covering] if covering is not None else None
     if covering is not None and covering > 0 and rows[covering].get("doc_id") != rows[0].get("doc_id"):
         # The answer starts from the document that covers the question, not from another document
         # ranked above it (a fixture list above the limits the question asks for). Within one
         # document the ranking stays: its top chunk often answers in words the gate does not count.
         rows = [rows[covering], *rows[:covering], *rows[covering + 1 :]]
-    if covering is None:
+    # An answer built without a model shows the section of the evidence the question is about; a
+    # question in other words than the documents' gets the closest section, labelled as such.
+    focus = None
+    local_answer = not use_web and not (allow_api and api_enabled(config))
+    # Only the chunk the wording check passed is narrowed (not a higher-ranked chunk of its document).
+    if rows and local_answer and (rows[0] is covering_row or (covering is None and not unknown_names(question, db_path))):
+        first_text = full_section_text(db_path, rows[0])
+        focus = local_focus.focus_answer(question, rows, first_text, config, covering is not None, query_content_units(question))
+    if covering is None and focus is None:
         missing = unknown_names(question, db_path)
         result = no_local_answer(
             use_web,
@@ -1043,18 +1054,32 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
             cache_put(cache_conn, question, limit, use_web, metadata.get("indexed_at", ""), result, cache_variant)
             cache_conn.close()
         return result
-    if iterative_retrieval_question(question):
-        min_source_score = max(LOCAL_SCORE_THRESHOLD * 0.8, rows[0]["rerank_score"] * 0.35)
-        rows = [row for row in rows if row["rerank_score"] >= min_source_score][: max(limit, 8)]
+    focused_citation = ""
+    if focus is not None and focus.related:
+        # Only the closest section: nothing else matched the question's words either.
+        focused_citation = focus.citation(first_text if focus.row == 0 else str(rows[focus.row]["text"]), question)
+        rows = [rows[focus.row]]
     else:
-        min_source_score = max(LOCAL_SCORE_THRESHOLD, rows[0]["rerank_score"] * 0.75)
-        rows = [row for row in rows if row["rerank_score"] >= min_source_score]
-    rows = rows_about_named_subject(rows, question)
+        focused_row = rows[0]
+        if iterative_retrieval_question(question):
+            min_source_score = max(LOCAL_SCORE_THRESHOLD * 0.8, rows[0]["rerank_score"] * 0.35)
+            rows = [row for row in rows if row["rerank_score"] >= min_source_score][: max(limit, 8)]
+        else:
+            min_source_score = max(LOCAL_SCORE_THRESHOLD, rows[0]["rerank_score"] * 0.75)
+            rows = [row for row in rows if row["rerank_score"] >= min_source_score]
+        rows = rows_about_named_subject(rows, question, document_labels(db_path))
+        if local_answer:
+            rows = local_focus.supplements(rows, query_content_units(question))
+        if focus is not None and rows and rows[0] is focused_row:
+            focused_citation = focus.citation(first_text, question)
 
     sources: list[dict[str, Any]] = []
     citations: list[dict[str, Any]] = []
     for index, row in enumerate(rows, start=1):
-        citation = primary_citation(db_path, row, question) if index == 1 else citation_for_retrieval_row(row, question)
+        if index == 1 and focused_citation:
+            citation = focused_citation
+        else:
+            citation = primary_citation(db_path, row, question) if index == 1 else citation_for_retrieval_row(row, question)
         source = {
             "source_id": index,
             "file": row["file_name"],
@@ -1110,6 +1135,8 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
         "index_status": "updating" if refresh_scheduled else "ready",
         "cache_hit": False,
     }
+    if focus is not None:
+        result["local_match"] = "related" if focus.related else "focused"
     result = finalize_answer(question, result, config, allow_api)
     result["answer_quality"] = model_capabilities.evaluate_answer(question, str(result.get("answer", "")), result.get("sources") or [])
     if agent_error:

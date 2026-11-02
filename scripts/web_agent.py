@@ -806,7 +806,7 @@ class AgentHandler(BaseHTTPRequestHandler):
         def run_query() -> None:
             try:
                 # A follow-up («它最多重试几次») is searched as the complete question it stands for.
-                understood = followup.standalone_question(question, history, runtime_config(), allow_api)
+                understood = followup.standalone_question(question, history, runtime_config(), allow_api, DB_PATH)
                 result_box["understood"] = understood
                 result_box["result"] = kb_query(DB_PATH, understood["question"], limit=limit, use_web=use_web, allow_api=allow_api)
             except Exception as exc:  # noqa: BLE001

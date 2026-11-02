@@ -5,18 +5,22 @@ the retrieval agent all see a complete question.
 A question that already says what it is about is used exactly as typed, so single questions behave
 as before. With the answer API on, the model fills in what a follow-up leaves out; without it, or
 when that call fails, a few rules do: a pronoun takes the previous question's subject, «那 X 呢»
-asks the previous question about X, «X呢» asks about the previous subject's X.
+asks the previous question about X, «X呢» asks about the previous subject's X. When the documents
+write X where the previous question has another word (排气温度 and 排气压力, 火车乘坐… and
+飞机乘坐…), «X呢» swaps that word instead.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from api_providers import chat_completion_detailed
 import llm_budget
 
+from kb import relevance
 from kb.config import DEFAULT_API_TIMEOUT_SECONDS, api_enabled
 
 
@@ -84,23 +88,107 @@ def subject_of(question: str) -> str:
     match = QUESTION_WORD.search(text)
     if match and match.start() >= 2:
         return text[: match.start()].strip()
+    # «怎么订会议室» is about what follows its question word.
+    lead = PREDICATE_START.match(text)
+    rest = text[lead.end() :].strip() if lead else ""
+    if len(rest) >= 2 and not QUESTION_WORD.match(rest):
+        tail = QUESTION_WORD.search(rest)
+        return (rest[: tail.start()] if tail and tail.start() >= 2 else rest).strip()
     return ""
 
 
-def rewrite_by_rules(question: str, previous: str) -> str:
+# Occurrences of a word read from the documents when looking for its siblings.
+CONTEXT_SCAN_LIMIT = 200
+
+
+def word_contexts(word: str, text: str) -> set[str]:
+    """The two characters before («<排气») and after («乘坐>») each place text uses word."""
+    contexts: set[str] = set()
+    for count, match in enumerate(re.finditer(re.escape(word.lower()), text)):
+        if count >= CONTEXT_SCAN_LIMIT:
+            break
+        left = text[max(0, match.start() - 2) : match.start()]
+        right = text[match.end() : match.end() + 2]
+        if re.fullmatch(r"[一-鿿a-z0-9]{2}", left):
+            contexts.add("<" + left)
+        if re.fullmatch(r"[一-鿿a-z0-9]{2}", right):
+            contexts.add(right + ">")
+    return contexts
+
+
+def listed_together(word: str, other: str, knowledge: str) -> bool:
+    """Whether one line of the documents uses both words in the same frame: «火车乘坐高铁二等座；
+    飞机乘坐经济舱»."""
+    for count, match in enumerate(re.finditer(re.escape(other.lower()), knowledge)):
+        if count >= CONTEXT_SCAN_LIMIT:
+            break
+        line_start = knowledge.rfind(chr(10), 0, match.start()) + 1
+        line_end = knowledge.find(chr(10), match.end())
+        line = knowledge[line_start : line_end if line_end >= 0 else len(knowledge)]
+        if word.lower() in line and word_contexts(word, line) & word_contexts(other, line):
+            return True
+    return False
+
+
+def sibling_word(other: str, previous: str, knowledge: str) -> str:
+    """The word of the previous question that other takes the place of, as the documents show it:
+    they write other in the same frame as it does in the previous question (排气温度 in
+    «空压机排气温度标准», 排气压力 in the documents: 温度 for 压力), or list both in one line in
+    the same frame (火车乘坐… ；飞机乘坐…). Empty when there is no such word."""
+    wanted = word_contexts(other, knowledge)
+    if not wanted:
+        return ""
+    content = QUESTION_WORD.sub(" ", previous)
+    lowered = previous.lower()
+    candidates = dict.fromkeys(
+        span[start : start + size]
+        for span in re.findall(r"[一-鿿]{2,}", content.replace("的", " "))
+        for size in range(2, min(4, len(other) + 1) + 1)
+        for start in range(len(span) - size + 1)
+    )
+    for word in sorted(candidates, key=len, reverse=True):
+        if set(word) & set(other):
+            continue
+        shared = word_contexts(word, knowledge) & wanted
+        if not shared:
+            continue
+        place = lowered.find(word.lower())
+        frame = {"<" + lowered[place - 2 : place], lowered[place + len(word) : place + len(word) + 2] + ">"}
+        if shared & frame or listed_together(word, other, knowledge):
+            return word
+    return ""
+
+
+def rewrite_by_rules(question: str, previous: str, knowledge: str = "") -> str:
+    """knowledge: the documents' text, lower-cased, used to tell which word «X呢» swaps."""
     subject = subject_of(previous)
     if not subject:
         return question
     text = question.strip()
+    led = LEADING.match(POLITE_PREFIX.sub("", text)) is not None
     core = LEADING.sub("", POLITE_PREFIX.sub("", text)).rstrip(END_PUNCTUATION)
     if not core:
         return question
     elided = re.fullmatch(r"(.+?)呢", core)
     if elided and not PRONOUNS.search(elided.group(1)):
         other = elided.group(1).strip()
-        # A name or model number is another subject: «那 SFT 呢» asks the previous question about SFT.
-        if re.search(r"[A-Za-z0-9]", other) and subject in previous:
-            return previous.replace(subject, other, 1)
+        if re.search(r"[A-Za-z0-9]", other):
+            # Another model number of the same series swaps just that number: «E3呢» after «出现E1怎么办».
+            prefix = re.match(r"[A-Za-z]+", other)
+            for token in re.findall(r"[A-Za-z]+[A-Za-z0-9_.-]*\d[A-Za-z0-9_.-]*", previous):
+                if prefix and token != other and token.lower().startswith(prefix.group().lower()) and re.search(r"\d", other):
+                    return previous.replace(token, other, 1)
+            # A name or model number is another subject: «那 SFT 呢» asks the previous question about SFT.
+            if subject in previous:
+                return previous.replace(subject, other, 1)
+        elif "的" not in previous:
+            plain = POLITE_PREFIX.sub("", previous.strip())
+            sibling = sibling_word(other, plain, knowledge) if knowledge else ""
+            if sibling:
+                return plain.replace(sibling, other, 1)
+            # «那报销呢» after «年假怎么算» asks the same about 报销.
+            if led and subject in plain:
+                return plain.replace(subject, other, 1)
         return f"{subject}的{other}是什么"
     pronoun = PRONOUNS.search(core)
     if pronoun:
@@ -164,6 +252,7 @@ def standalone_question(
     history: Any,
     config: dict[str, str],
     allow_api: bool = True,
+    db_path: Path | None = None,
 ) -> dict[str, Any]:
     """{"question": what to search for, "rewritten": bool, "method": "none"|"api"|"rules"}."""
     question = question.strip()
@@ -177,5 +266,6 @@ def standalone_question(
             pass
         else:
             return {"question": rewritten, "rewritten": rewritten != question, "method": "api"}
-    rewritten = rewrite_by_rules(question, turns[-1]["question"])
+    knowledge = (relevance.knowledge_text(db_path) or "") if db_path is not None else ""
+    rewritten = rewrite_by_rules(question, turns[-1]["question"], knowledge)
     return {"question": rewritten, "rewritten": rewritten != question, "method": "rules"}

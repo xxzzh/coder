@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -16,26 +17,165 @@ from kb_ingest.ocr import ocr_image_bytes
 from kb_ingest.reviews import extraction_report
 
 
-def read_docx(path: Path) -> str:
-    with zipfile.ZipFile(path) as zf:
-        root = ET.fromstring(zf.read("word/document.xml"))
+W_NAMESPACE = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
-    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-    paragraphs: list[str] = []
-    for paragraph in root.findall(".//w:p", ns):
-        parts: list[str] = []
-        for node in paragraph.iter():
-            tag = node.tag.rsplit("}", 1)[-1]
-            if tag == "t" and node.text:
-                parts.append(node.text)
-            elif tag == "tab":
-                parts.append("\t")
-            elif tag in {"br", "cr"}:
-                parts.append("\n")
-        line = "".join(parts).strip()
-        if line:
-            paragraphs.append(line)
-    return "\n".join(paragraphs)
+
+def w_tag(node: ET.Element) -> str:
+    return node.tag.rsplit("}", 1)[-1]
+
+
+def w_value(node: ET.Element | None, path: str) -> str | None:
+    found = node.find(path.replace("w:", W_NAMESPACE)) if node is not None else None
+    return found.get(W_NAMESPACE + "val") if found is not None else None
+
+
+def style_heading_levels(styles: ET.Element | None) -> dict[str, int]:
+    """Paragraph style id -> Markdown heading level: the Title style is 1, Heading N (标题 N in a
+    Chinese Word, same internal name) and styles with outline level N-1 are N + 1."""
+    if styles is None:
+        return {}
+    defined: dict[str, tuple[str, str | None, str | None]] = {}
+    for style in styles.iter(W_NAMESPACE + "style"):
+        if style.get(W_NAMESPACE + "type") == "paragraph" and style.get(W_NAMESPACE + "styleId"):
+            name = (w_value(style, "w:name") or "").strip().lower()
+            defined[style.get(W_NAMESPACE + "styleId")] = (name, w_value(style, "w:pPr/w:outlineLvl"), w_value(style, "w:basedOn"))
+
+    def level(style_id: str, depth: int = 0) -> int:
+        if style_id not in defined or depth > 10:
+            return 0
+        name, outline, based_on = defined[style_id]
+        if name == "title":
+            return 1
+        heading = re.fullmatch(r"heading (\d)", name)
+        if heading:
+            return min(6, int(heading.group(1)) + 1)
+        if outline is not None and outline.isdigit() and int(outline) < 9:
+            return min(6, int(outline) + 2)
+        return level(based_on, depth + 1) if based_on else 0
+
+    return {style_id: found for style_id in defined if (found := level(style_id))}
+
+
+def style_lists(styles: ET.Element | None) -> dict[str, tuple[str, str]]:
+    """Paragraph style id -> (numId, level) of the list numbering the style itself carries (List
+    Number, List Bullet)."""
+    found: dict[str, tuple[str, str]] = {}
+    for style in styles.iter(W_NAMESPACE + "style") if styles is not None else []:
+        num_id = w_value(style, "w:pPr/w:numPr/w:numId")
+        if style.get(W_NAMESPACE + "styleId") and num_id:
+            found[style.get(W_NAMESPACE + "styleId")] = (num_id, w_value(style, "w:pPr/w:numPr/w:ilvl") or "0")
+    return found
+
+
+def list_formats(numbering: ET.Element | None) -> dict[tuple[str, str], str]:
+    """(numId, level) -> number format of Word's list numbering (decimal, bullet, ...)."""
+    if numbering is None:
+        return {}
+    abstract: dict[str, dict[str, str]] = {}
+    for item in numbering.iter(W_NAMESPACE + "abstractNum"):
+        abstract[item.get(W_NAMESPACE + "abstractNumId", "")] = {
+            lvl.get(W_NAMESPACE + "ilvl", "0"): w_value(lvl, "w:numFmt") or "decimal" for lvl in item.iter(W_NAMESPACE + "lvl")
+        }
+    formats: dict[tuple[str, str], str] = {}
+    for num in numbering.iter(W_NAMESPACE + "num"):
+        for level, number_format in abstract.get(w_value(num, "w:abstractNumId") or "", {}).items():
+            formats[(num.get(W_NAMESPACE + "numId", ""), level)] = number_format
+    return formats
+
+
+def paragraph_text(paragraph: ET.Element) -> str:
+    parts: list[str] = []
+    for node in paragraph.iter():
+        tag = w_tag(node)
+        if tag == "t" and node.text:
+            parts.append(node.text)
+        elif tag == "tab":
+            parts.append("\t")
+        elif tag in {"br", "cr"}:
+            parts.append("\n")
+    return "".join(parts).strip()
+
+
+def table_lines(table: ET.Element) -> list[str]:
+    """A Word table as Markdown rows, its first row the header. A one-column table is a text box
+    drawn as a table: its paragraphs are plain lines. Cells inside a merged cell stay empty."""
+    rows: list[list[str]] = []
+    for row in table.findall(W_NAMESPACE + "tr"):
+        cells: list[str] = []
+        for cell in row.findall(W_NAMESPACE + "tc"):
+            text = " ".join(line for line in (paragraph_text(p) for p in cell.iter(W_NAMESPACE + "p")) if line)
+            cells.append(re.sub(r"\s+", " ", text).replace("|", "/").strip())
+            span = w_value(cell, "w:tcPr/w:gridSpan")
+            cells.extend([""] * (int(span) - 1 if span and span.isdigit() else 0))
+        if any(cells):
+            rows.append(cells)
+    if not rows:
+        return []
+    if max(len(cells) for cells in rows) == 1:
+        return [cells[0] for cells in rows if cells[0]]
+    width = max(len(cells) for cells in rows)
+    rows = [cells + [""] * (width - len(cells)) for cells in rows]
+    return ["| " + " | ".join(rows[0]) + " |", "| " + " | ".join(["---"] * width) + " |", *("| " + " | ".join(cells) + " |" for cells in rows[1:])]
+
+
+def read_docx(path: Path) -> str:
+    """The document's text in reading order: heading styles become Markdown headings (sections
+    are then split and cited like a Markdown file's), list paragraphs keep their numbers or
+    bullets, tables become Markdown rows instead of one line per cell."""
+    with zipfile.ZipFile(path) as zf:
+        names = set(zf.namelist())
+        root = ET.fromstring(zf.read("word/document.xml"))
+        styles = ET.fromstring(zf.read("word/styles.xml")) if "word/styles.xml" in names else None
+        numbering = ET.fromstring(zf.read("word/numbering.xml")) if "word/numbering.xml" in names else None
+    headings = style_heading_levels(styles)
+    style_numbering = style_lists(styles)
+    formats = list_formats(numbering)
+    counters: dict[tuple[str, str], int] = {}
+    blocks: list[list[str]] = [[]]
+
+    def add_paragraph(paragraph: ET.Element) -> None:
+        text = paragraph_text(paragraph)
+        if not text:
+            return
+        properties = paragraph.find(W_NAMESPACE + "pPr")
+        outline = w_value(properties, "w:outlineLvl")
+        style = w_value(properties, "w:pStyle") or ""
+        level = headings.get(style, 0)
+        if outline is not None and outline.isdigit() and int(outline) < 9:
+            level = min(6, int(outline) + 2)
+        if level and len(text) <= 120:
+            blocks.extend([["#" * level + " " + re.sub(r"\s+", " ", text)], []])
+            counters.clear()
+            return
+        num_id, list_level = style_numbering.get(style, (None, "0"))
+        num_id = w_value(properties, "w:numPr/w:numId") or num_id
+        list_level = w_value(properties, "w:numPr/w:ilvl") or list_level
+        if num_id and num_id != "0":
+            number_format = formats.get((num_id, list_level), "decimal")
+            if number_format == "bullet":
+                text = f"- {text}"
+            elif number_format != "none":
+                for key in [key for key in counters if key[0] == num_id and key[1] > list_level]:
+                    del counters[key]
+                counters[(num_id, list_level)] = counters.get((num_id, list_level), 0) + 1
+                text = f"{counters[(num_id, list_level)]}. {text}"
+        blocks[-1].append(text)
+
+    def walk(parent: ET.Element) -> None:
+        for child in parent:
+            tag = w_tag(child)
+            if tag == "p":
+                add_paragraph(child)
+            elif tag == "tbl":
+                lines = table_lines(child)
+                if lines:
+                    blocks.extend([lines, []])
+            elif tag in {"sdt", "sdtContent", "customXml", "smartTag"}:
+                walk(child)
+
+    body = root.find(W_NAMESPACE + "body")
+    walk(body if body is not None else root)
+    return "\n\n".join("\n".join(lines) for lines in blocks if lines)
 
 
 def find_winword() -> str | None:

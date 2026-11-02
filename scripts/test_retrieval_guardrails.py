@@ -652,6 +652,8 @@ AcWing 是一个算法交流平台。
     check_gate_synonyms()
     check_gate_asked_part()
     check_local_evidence_blocks()
+    check_local_focus()
+    check_document_structure()
     print("retrieval guardrails: ok")
 
 
@@ -816,6 +818,154 @@ def check_local_answer_layout() -> None:
     answer = answer_text.local_structured_answer([(record, 1), ("接通电源后读取电压。", 2)], "knowledge_base")
     assert answer.startswith("在本地知识库的「样例清单」中找到这条记录："), answer
     assert "#" not in answer and "补充：\n- 接通电源后读取电压。 [2]" in answer, answer
+
+def check_local_focus() -> None:
+    """A local answer shows the section a question is about; a question in other words gets the
+    closest section, labelled for checking, only when one section clearly stands out."""
+    import math
+
+    from kb import answer_text, local_focus
+
+    handbook = "员工手册\n## 一、年假\n入职满 1 年：每年 5 天年假。\n## 二、费用报销\n1. 在 OA 填写报销单。\n2. 直属主管审批。\n## 三、加班\n周末加班按 2 倍计算。"
+    sections = local_focus.split_sections(handbook, 0)
+    assert [section.title for section in sections] == ["", "一、年假", "二、费用报销", "三、加班"], sections
+    assert local_focus.names_only(sections[0]) and not local_focus.names_only(sections[2])
+    # A document's title above its sections is its name; one heading over its sub-sections (a
+    # procedure and its steps) keeps them together.
+    titled = "# 员工手册\n## 一、年假\n每年 5 天。\n## 二、加班\n按 2 倍计算。"
+    assert [section.title for section in local_focus.split_sections(titled, 0, opening=True)] == ["员工手册", "一、年假", "二、加班"]
+    assert len(local_focus.split_sections(titled, 0)) == 1
+    procedure = "## 四、上线流程\n### 准备\n检查电源。\n### 执行\n1. 开机\n2. 测试"
+    assert len(local_focus.split_sections(procedure, 0)) == 1
+    # A numbered line followed by text is a title; numbered steps are not.
+    faq = "1. 如何连接 VPN\n安装客户端。\n2. 忘记密码\n访问重置页面。"
+    assert [section.title for section in local_focus.split_sections(faq, 0)] == ["1. 如何连接 VPN", "2. 忘记密码"]
+    assert len(local_focus.split_sections("滤网更换\n1. 关机\n2. 取出旧滤网\n3. 装入新滤网", 0)) == 1
+
+    vocabulary = ["年假", "报销", "审批", "加班", "到账"]
+
+    def fake_vectors(texts: list[str], config: dict[str, str]) -> list[list[float]]:
+        vectors = []
+        for text in texts:
+            raw = [float(word in text) for word in vocabulary] + [0.3]
+            norm = math.sqrt(sum(value * value for value in raw))
+            vectors.append([value / norm for value in raw])
+        return vectors
+
+    original_vectors = local_focus.line_vectors
+    local_focus.line_vectors = fake_vectors
+    try:
+        rows = [{"text": handbook, "file_name": "员工手册.md", "vector_score": 0.7}]
+        units = query_module.query_content_units("报销多久到账")
+        related = local_focus.focus_answer("报销多久到账", rows, handbook, {}, False, units)
+        assert related is not None and related.related and related.section is not None and related.section.title == "二、费用报销", related
+        cited = related.citation(handbook, "报销多久到账")
+        assert "直属主管审批" in cited and "加班" not in cited, cited
+        answer = answer_text.local_structured_answer([(cited, 1)], "knowledge_base", related=True)
+        assert answer.startswith("找到最相关的内容「费用报销」，请核对是否回答了你的问题："), answer
+        focused = local_focus.focus_answer("年假有几天", rows, handbook, {}, True, query_module.query_content_units("年假有几天"))
+        assert focused is not None and not focused.related and focused.section.title == "一、年假", focused
+        # Nothing retrieved is close to the question as a whole: no closest section is looked for.
+        assert local_focus.focus_answer("报销多久到账", [{**rows[0], "vector_score": 0.3}], handbook, {}, False, units) is None
+        # A chunk that is one section is cited as before.
+        single = "## 一、年假\n入职满 1 年：每年 5 天年假。"
+        assert local_focus.focus_answer("年假有几天", [{"text": single, "file_name": "a.md"}], single, {}, True, []) is None
+        # Two sections about equally close: no closest section is offered.
+        travel = {"text": "差旅办法\n一、出差审批\n出差三天以内由主管审批。\n二、交通标准\n火车二等座。", "file_name": "差旅.pdf", "vector_score": 0.7}
+        units = query_module.query_content_units("加班要谁审批")
+        assert local_focus.focus_answer("加班要谁审批", [travel, rows[0]], travel["text"], {}, False, units) is None
+        chosen = local_focus.split_sections(travel["text"], 0)[1]
+        others = local_focus.split_sections(handbook, 1)
+        assert local_focus.names_another_topic(chosen, [chosen, *others], ["差旅.pdf", "员工手册.md"], units)
+    finally:
+        local_focus.line_vectors = original_vectors
+    # Without an embedding model the answer keeps the whole evidence.
+    local_focus.line_vectors = lambda texts, config: None
+    try:
+        assert local_focus.focus_answer("年假有几天", [{"text": handbook, "file_name": "a.md"}], handbook, {}, True, []) is None
+    finally:
+        local_focus.line_vectors = original_vectors
+    # Other documents' pieces that hardly mention the question are not shown next to the answer.
+    units = query_module.query_content_units("叉车刹车怎么检查")
+    pieces = [{"file_name": "点检表.xlsx", "text": "叉车 刹车 每班"}, {"file_name": "价格表.xlsx", "text": "AP-500 4599 元"}, {"file_name": "点检表.xlsx", "text": "冷却塔 水位"}]
+    assert [piece["text"] for piece in local_focus.supplements(pieces, units)] == ["叉车 刹车 每班", "冷却塔 水位"]
+    # A section of a document named after the asked model is about that model.
+    rows = [{"text": "滤网每 6 个月更换一次", "file_name": "AP-300说明书.docx"}, {"text": "AP-500 零售价 4599", "file_name": "价格表.xlsx"}]
+    named = query_module.rows_about_named_subject(rows, "AP-300滤网多久换", {"AP-300说明书.docx": "AP-300 说明书"})
+    assert [row["file_name"] for row in named] == ["AP-300说明书.docx"], named
+
+    assert answer_text.clean_title("2026年价格表") == "2026年价格表"
+    assert answer_text.clean_title("3. 安装") == "安装" and answer_text.clean_title("2.1 配置") == "配置"
+    assert human_text("[page 1]\n售后服务政策\n[page 2 table 1]\n代码 | 含义") == "售后服务政策 代码 | 含义"
+
+
+def check_document_structure() -> None:
+    """Word headings, list numbers and tables are read as Markdown; PDF lines broken by the page
+    width are joined back into their sentences; follow-ups swap the word the documents use alike."""
+    from kb import followup
+    from kb_ingest import word as word_module
+
+    w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+
+    def paragraph(text: str, style: str = "", numbered: bool = False) -> str:
+        properties = (f'<w:pStyle w:val="{style}"/>' if style else "") + ('<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>' if numbered else "")
+        return f"<w:p><w:pPr>{properties}</w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"
+
+    def cell(text: str) -> str:
+        return f"<w:tc><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:tc>"
+
+    body = (
+        paragraph("产品手册", "Title")
+        + paragraph("一、滤网更换", "Heading1")
+        + paragraph("关机", numbered=True)
+        + paragraph("取出旧滤网", numbered=True)
+        + f"<w:tbl><w:tr>{cell('代码')}{cell('含义')}</w:tr><w:tr>{cell('E1')}{cell('风机故障')}</w:tr></w:tbl>"
+    )
+    styles = (
+        f'<w:styles {w}><w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style></w:styles>'
+    )
+    numbering = (
+        f'<w:numbering {w}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum>'
+        '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>'
+    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = Path(temp_dir) / "manual.docx"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("word/document.xml", f"<w:document {w}><w:body>{body}</w:body></w:document>")
+            archive.writestr("word/styles.xml", styles)
+            archive.writestr("word/numbering.xml", numbering)
+        text = word_module.read_docx(path)
+    assert text == "# 产品手册\n\n## 一、滤网更换\n\n1. 关机\n2. 取出旧滤网\n\n| 代码 | 含义 |\n| --- | --- |\n| E1 | 风机故障 |", text
+
+    page = "\n".join(
+        [
+            "售后服务政策",
+            "二、保修",
+            "保修期内的非人为故障免费维修。保修期从购买发票日期起计算，AP-300 为 2 年，AP-500",
+            "为 3 年。滤网属于耗材。",
+            "市区范围内提供免费上门服务，请拨打客服热线 400-800-1234（工作日 9:00–18:00）。",
+            "三、上门服务",
+            "代码 含义 处理方法 说明说明说明说明说明说明说明说明说明说明说明说明说明说明说明说明",
+            "E1 风机故障",
+        ]
+    )
+    joined = pdf_module.join_wrapped_lines(page).splitlines()
+    assert "保修期内的非人为故障免费维修。保修期从购买发票日期起计算，AP-300 为 2 年，AP-500为 3 年。滤网属于耗材。" in joined, joined
+    assert "三、上门服务" in joined and "E1 风机故障" in joined and len(joined) == 7, joined
+
+    knowledge = "点检项目：排气温度 | 标准：不高于 95℃\n点检项目：排气压力 | 标准：0.6–0.8 mpa\n火车乘坐高铁二等座；飞机乘坐经济舱。\n三、取消预订\n会议室预订说明"
+    cases = {
+        ("压力呢？", "空压机排气温度标准是多少？"): "空压机排气压力标准是多少？",
+        ("那火车呢？", "出差坐飞机能坐什么舱？"): "出差坐火车能坐什么舱？",
+        ("取消呢？", "怎么订会议室？"): "订会议室的取消是什么",
+        ("E3呢？", "出现E1怎么办？"): "出现E3怎么办？",
+        ("那报销呢？", "年假怎么算？"): "报销怎么算？",
+    }
+    for (question, previous), expected in cases.items():
+        rewritten = followup.rewrite_by_rules(question, previous, knowledge)
+        assert rewritten == expected, (question, previous, rewritten)
+
 
 def check_offline_translation_setup() -> None:
     """Stanza pipelines started for translation reuse local resources instead of re-downloading them."""

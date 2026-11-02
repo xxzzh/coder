@@ -17,7 +17,7 @@ import vector_store
 from kb import config as kb_config
 from kb.config import DB_PATH
 from kb.terms import candidate_terms, enumeration_or_list_question, fts_query, iterative_retrieval_question, retrieval_question_with_aliases, section_context_question
-from kb.text import first_markdown_heading_level, human_text, markdown_table_of_contents, sentence_score
+from kb.text import MARKDOWN_SECTION_FILE_TYPES, first_markdown_heading_level, human_text, markdown_table_of_contents, sentence_score
 
 
 EMBEDDING_DIMS = 384
@@ -455,7 +455,7 @@ def expand_section_context(
         item = row.copy()
         heading_level = first_markdown_heading_level(str(item.get("text", "")))
         if (
-            str(item.get("file_type", "")).lower() not in {"md", "markdown"}
+            str(item.get("file_type", "")).lower() not in MARKDOWN_SECTION_FILE_TYPES
             or heading_level is None
             or markdown_table_of_contents(str(item.get("text", "")))
         ):

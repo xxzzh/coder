@@ -52,7 +52,9 @@ def isolate_system(allow_api: bool) -> dict[str, str]:
 def git_state() -> dict[str, Any]:
     def run(*args: str) -> str:
         try:
-            return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, timeout=10).stdout.strip()
+            # git prints file names in UTF-8 (a Chinese file name is not valid in the console code page).
+            completed = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+            return (completed.stdout or "").strip()
         except (OSError, subprocess.SubprocessError):
             return ""
 

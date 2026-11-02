@@ -11,7 +11,7 @@ from typing import Any
 from urllib.parse import quote
 
 from kb.terms import ENGLISH_QUERY_STOP_WORDS, STOP_WORDS, candidate_terms, enumeration_or_list_question, process_question, question_concepts
-from kb.text import first_markdown_heading_level, human_text, markdown_table_of_contents, sentence_score, split_sentences, strip_markdown_emphasis, trim_terminal_punctuation, unique_terms
+from kb.text import MARKDOWN_SECTION_FILE_TYPES, PAGE_MARKER_LINE, first_markdown_heading_level, human_text, markdown_table_of_contents, sentence_score, split_sentences, strip_markdown_emphasis, trim_terminal_punctuation, unique_terms
 
 
 # Evidence budgets for local answers built without an LLM.
@@ -96,7 +96,7 @@ def evidence_lines(text: str) -> list[tuple[str, int]]:
     """
     lines: list[tuple[str, int]] = []
     previous_cells: list[str] = []
-    for raw_line in unescape(text).splitlines():
+    for raw_line in PAGE_MARKER_LINE.sub("", unescape(text)).splitlines():
         line = raw_line.strip()
         if not line or re.fullmatch(r"```[\w+-]*|[-*_=]{3,}|\|?[\s:|-]*-{3,}[\s:|-]*\|?", line):
             continue
@@ -221,7 +221,7 @@ def full_section_text(db_path: Path, row: dict[str, Any]) -> str:
     text = str(row.get("text", ""))
     level = first_markdown_heading_level(text)
     if (
-        str(row.get("file_type", "")).lower() not in {"md", "markdown"}
+        str(row.get("file_type", "")).lower() not in MARKDOWN_SECTION_FILE_TYPES
         or level is None
         or row.get("doc_id") is None
         or row.get("chunk_index") is None

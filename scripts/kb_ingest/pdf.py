@@ -31,6 +31,56 @@ OCR_ALL_PAGES_UP_TO = 30
 LINE_KNOWN_SHARE = 0.6
 
 
+# A text line this close to the page's widest line ran into the right margin: when it ends in the
+# middle of a sentence, the next line continues it («…AP-500» + «为 3 年。»).
+WRAPPED_LINE_SHARE = 0.85
+
+# Lines narrower than this (in half-width characters) are not wrapped prose but labels or titles.
+WRAPPED_LINE_MIN_WIDTH = 40
+
+# A line that starts a new item, whatever the line above it: 一、 1. (1) ① 第三条 - •
+NEW_ITEM_START = re.compile(r"^(?:[-•·*▪●]|\d+(?:\.\d+)*[.、)）]|[（(][\d一二三四五六七八九十]+[)）]|[一二三四五六七八九十]+[、.．]|第[一二三四五六七八九十百\d]+[章节条款部分]|[①-⑳])")
+
+
+WIDE_CHARACTER = re.compile(r"[⺀-鿿＀-￯]")
+
+# Chinese cells of a table row: two Chinese characters with a space between them.
+SPACED_CHINESE = re.compile(r"[一-鿿] [一-鿿]")
+
+
+def display_width(text: str) -> int:
+    return sum(2 if WIDE_CHARACTER.match(char) else 1 for char in text)
+
+
+def join_wrapped_lines(text: str) -> str:
+    """One page's text with the lines the page width broke joined back into their sentences. A
+    line is joined to the one above only when that one is about as wide as the widest line and
+    stops mid-sentence. Table rows (Chinese cells separated by spaces) and new items stay apart."""
+    lines = [line.strip() for line in text.splitlines()]
+    widest = max((display_width(line) for line in lines), default=0)
+    if widest < WRAPPED_LINE_MIN_WIDTH:
+        return text
+    out: list[str] = []
+    previous = ""
+    for line in lines:
+        wrapped = (
+            out
+            and line
+            and display_width(previous) >= widest * WRAPPED_LINE_SHARE
+            and not re.search(r"[。！？!?：:；;]$", previous)
+            and not SPACED_CHINESE.search(previous)
+            and not SPACED_CHINESE.search(line)
+            and not NEW_ITEM_START.match(line)
+        )
+        if wrapped:
+            joiner = "" if WIDE_CHARACTER.match(line) or WIDE_CHARACTER.match(out[-1][-1]) or out[-1].endswith("-") else " "
+            out[-1] = out[-1] + joiner + line
+        else:
+            out.append(line)
+        previous = line
+    return "\n".join(out)
+
+
 def _read_pdf_with_library(path: Path) -> str | None:
     for module_name in ("pypdf", "PyPDF2"):
         try:
@@ -54,7 +104,7 @@ def _read_pdf_with_pdfplumber(path: Path) -> str | None:
     pieces: list[str] = []
     with pdfplumber.open(str(path)) as pdf:
         for page_index, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
+            text = join_wrapped_lines(page.extract_text() or "")
             if text.strip():
                 pieces.append(f"[page {page_index}]\n{text.strip()}")
             try:

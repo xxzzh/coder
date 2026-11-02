@@ -109,10 +109,15 @@ def strip_markdown_emphasis(text: str) -> str:
     return re.sub(r"(?<![\w])_(?=[^\s_])([^_\n]+?)(?<=[^\s_])_(?![\w])", r"\1", text)
 
 
+# The PDF reader's page markers ([page 3], [page 3 table 1], [ocr page 3]): position, not content.
+PAGE_MARKER_LINE = re.compile(r"(?m)^[ \t]*\[(?:ocr )?page \d+(?: table \d+)?\][ \t]*$")
+
+
 def human_text(text: str, max_len: int | None = None, simplify: bool = False) -> str:
     if simplify:
         text = to_simplified(text)
     text = unescape(text)
+    text = PAGE_MARKER_LINE.sub("", text)
     text = re.sub(r"\[[^\]]+\]\([^)]+\)", lambda match: match.group(0).split("](")[0].lstrip("["), text)
     text = re.sub(r"^[ \t]*#{1,6}[ \t]*", "", text, flags=re.MULTILINE)
     text = re.sub(r"^[ \t]*[-*+]\s+", "", text, flags=re.MULTILINE)
@@ -173,6 +178,10 @@ def split_sentences(text: str) -> list[str]:
 
 def markdown_table_of_contents(text: str) -> bool:
     return bool(re.search(r"(?m)^\s{0,3}#{1,6}\s+目录\s*$", text)) or len(re.findall(r"\]\(#[^)]+\)", text)) >= 4
+
+
+# File types whose text marks sections with Markdown headings: Word documents are read that way too.
+MARKDOWN_SECTION_FILE_TYPES = frozenset({"md", "markdown", "docx", "doc"})
 
 
 def first_markdown_heading_level(text: str) -> int | None:

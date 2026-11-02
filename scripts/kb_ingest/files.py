@@ -32,8 +32,14 @@ EXTRACTION_VERSION = "extract-v2"
 
 # Added for one file type when only its reading changes, so the next update reads just those files
 # again. xlsx-rows-v2: a row or item list longer than a chunk is split into lines that each name its
-# row's item or group.
-EXTRACTION_VERSION_BY_SUFFIX = {".xlsx": "xlsx-rows-v2"}
+# row's item or group. docx-structure-v1: Word headings, list numbers and tables kept as Markdown.
+# pdf-wrap-v1: lines the page width broke are joined back into their sentences.
+EXTRACTION_VERSION_BY_SUFFIX = {
+    ".xlsx": "xlsx-rows-v2",
+    ".docx": "docx-structure-v1",
+    ".doc": "docx-structure-v1",
+    ".pdf": "pdf-wrap-v1",
+}
 
 
 def portable_error_message(exc: Exception) -> str:

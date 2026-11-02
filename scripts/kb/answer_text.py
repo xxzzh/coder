@@ -380,16 +380,30 @@ def clean_title(title: str) -> str:
     # "工作表 参数表 / 站点 / 项目。 参数表" names a sheet by its path: keep the sheet.
     title = title.rsplit("。", 1)[-1].strip() or title
     title = re.sub(r"^(?:##\s*)?工作表\s+", "", title).strip() or title
-    return re.sub(r"^(?:第?[一二三四五六七八九十百]+[、.．]|\d+(?:\.\d+)*[、.．]?|#{1,6})\s*", "", title).strip() or title
+    # A section number, not the year of «2026年价格表».
+    return re.sub(r"^(?:第?[一二三四五六七八九十百]+[、.．]|\d+(?:\.\d+)+[、.．]?|\d+(?:[、.．]|\s+)|#{1,6})\s*", "", title).strip() or title
 
 
-def local_structured_answer(pieces: list[tuple[str, Any]], source_type: str | None) -> str:
+# Opening of an answer whose evidence is the closest content to the question in meaning, not a
+# match of its words.
+RELATED_OPENING = "找到最相关的内容{title}，请核对是否回答了你的问题："
+
+
+def local_structured_answer(pieces: list[tuple[str, Any]], source_type: str | None, related: bool = False) -> str:
     """The local answer: an opening line that names what was found, the best evidence laid out
-    by its structure, then the other evidence in groups of its own."""
+    by its structure, then the other evidence in groups of its own. related: the evidence is the
+    closest content found, not a match of the question's words; the opening says so."""
     where = {"web_search": "联网搜索资料", "hybrid_web_knowledge": "本地知识库和联网资料"}.get(str(source_type), "本地知识库")
     kind, title, lines = evidence_layout(pieces[0][0])
 
-    if kind == "prose":
+    if related:
+        named = kind != "prose" and bool(title)
+        body = [f"- {lines[0]}"] if kind == "prose" else lines
+        opening = RELATED_OPENING.format(title=f"「{clean_title(title)}」" if named else "")
+        if not has_text_line(body):
+            opening = opening.rstrip("：") + f" [{pieces[0][1]}]："
+        body = cite_block(body, pieces[0][1])
+    elif kind == "prose":
         opening, body = f"{lines[0]} [{pieces[0][1]}]", []
     else:
         if kind == "record":
@@ -435,7 +449,7 @@ def chinese_grounded_fallback(result: dict[str, Any]) -> dict[str, Any]:
             translated = strip_native_reference_markers(translated)
             pieces.append((trim_terminal_punctuation(translated), citation["source_id"]))
     if pieces:
-        result["answer"] = local_structured_answer(pieces, source_type)
+        result["answer"] = local_structured_answer(pieces, source_type, related=result.get("local_match") == "related")
         result["answer_mode"] = "local_translation_grounded_summary"
     elif source_type == "web_search":
         result["answer"] = (
