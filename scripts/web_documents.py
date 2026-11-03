@@ -322,6 +322,8 @@ class IndexJob:
         if state.get("started_at"):
             end = state.get("finished_at") or time.time()
             state["elapsed_seconds"] = round(end - state["started_at"], 1)
+        if state.get("phase") == "reading" and isinstance(state.get("reading"), dict) and state["reading"].get("since"):
+            state["reading"] = {**state["reading"], "file_seconds": round(time.time() - state["reading"]["since"])}
         return state
 
     def start(self, kind: str) -> dict[str, Any]:
@@ -342,7 +344,20 @@ class IndexJob:
         return {"state": "running", "kind": kind, "label": JOB_LABELS[kind], "phase": "starting", "started_at": time.time()}
 
     def _progress(self, phase: str, fields: dict[str, Any]) -> None:
+        """Record a step's progress; pages read by OCR and chunks embedded also get the time left,
+        estimated from the pace so far, so a long file does not look stuck."""
+        now = time.time()
+        done, total = fields.get("done"), fields.get("total")
         with self._lock:
+            mark = getattr(self, "_mark", None)
+            if mark is None or mark[:2] != (phase, total) or (isinstance(done, int) and done < mark[3]):
+                mark = (phase, total, now, done if isinstance(done, int) else 0)
+            self._mark = mark
+            fields = dict(fields)
+            if phase in {"ocr", "embedding"} and isinstance(done, int) and isinstance(total, int) and done > mark[3]:
+                fields["eta_seconds"] = round((now - mark[2]) / (done - mark[3]) * (total - done))
+            if phase == "reading":
+                fields["since"] = now  # when this file's reading began: a scanned book takes minutes
             self._state["phase"] = phase
             self._state[phase] = fields
 

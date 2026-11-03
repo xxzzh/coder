@@ -156,7 +156,10 @@ def main() -> None:
     assert no_match_guidance["severity"] == "info"
     assert "换个问法" in no_match_guidance["hint"] and "个人密码是什么" not in no_match_guidance["hint"]
     assert "「个人密码是什么」" in no_match_guidance["message"]
-    assert no_match_guidance["suggested_questions"] == ["个人密码是什么"]
+    assert no_match_guidance["suggested_questions"] == ["个人密码是什么"] and not no_match_guidance["suggest_api_mode"]
+    # Answering on this computer only: the refusal says the API mode understands other wording.
+    local_guidance = query_module.local_no_match_user_guidance("我的个人密码是", local_mode=True)
+    assert local_guidance["suggest_api_mode"] and "API 模式" in local_guidance["hint"], local_guidance
     if query_module.DB_PATH.exists():
         missing_guidance = query_module.local_no_match_user_guidance("ZZZ999有哪些测试项", query_module.DB_PATH)
         assert missing_guidance["suggested_questions"] == []
@@ -1142,6 +1145,28 @@ def check_ocr_pipeline() -> None:
     assert not secrets_module.is_credential_label("Username")
     pages = pdf_module.text_by_page("[page 1]\nfirst\n\n[page 1 table 1]\na | b\n\n[page 2]\nsecond")
     assert {number: text.split() for number, text in pages.items()} == {1: ["first", "a", "|", "b"], 2: ["second"]}, pages
+    # Pages read side by side come back in page order, each Tesseract told to use one thread.
+    import time as time_module
+
+    saved = (ocr_module.find_tesseract, ocr_module.pdf_page_renderer, ocr_module.render_pdf_pages_for_ocr, ocr_module.ocr_image, ocr_module.OCR_WORKERS)
+    seen_single: list[bool] = []
+
+    def slow_ocr(path: Path, single_thread: bool = False) -> str:
+        seen_single.append(single_thread)
+        time_module.sleep(0.05 * (5 - int(path.stem[-1])))  # later pages finish first
+        return "" if path.stem.endswith("3") else f"text {path.stem}"
+
+    try:
+        ocr_module.find_tesseract = lambda: "tesseract"
+        ocr_module.pdf_page_renderer = lambda: "pypdfium2"
+        ocr_module.render_pdf_pages_for_ocr = lambda path, temp, pages=None: [Path(f"page-000{n}.png") for n in (1, 2, 3, 4)]
+        ocr_module.ocr_image = slow_ocr
+        ocr_module.OCR_WORKERS = 3
+        text, warnings = ocr_module.ocr_pdf(Path("scan.pdf"))
+    finally:
+        (ocr_module.find_tesseract, ocr_module.pdf_page_renderer, ocr_module.render_pdf_pages_for_ocr, ocr_module.ocr_image, ocr_module.OCR_WORKERS) = saved
+    assert text == "[ocr page 1]\ntext page-0001\n\n[ocr page 2]\ntext page-0002\n\n[ocr page 4]\ntext page-0004", text
+    assert warnings == ["OCR returned no text for page 3."] and all(seen_single), (warnings, seen_single)
 
 def check_agent_loop() -> None:
     """The agent answers from cited evidence, searches again when asked, and never ends a last round searching."""

@@ -529,11 +529,19 @@ def no_index_user_guidance(question: str, faq_missing: bool = True) -> dict[str,
     }
 
 
-def local_no_match_user_guidance(question: str, db_path: Path | None = None) -> dict[str, Any]:
+# Answering on this computer finds what the documents say in their own words; a question put another
+# way (电焊 for 焊接) may find nothing, which the answer API would understand.
+LOCAL_MODE_HINT = "本机模式只能按资料里的说法查找：可以换成资料里的词再问；开启大模型 API 模式后，口语或换了说法的问题也能理解。"
+
+
+def local_no_match_user_guidance(question: str, db_path: Path | None = None, local_mode: bool = False) -> dict[str, Any]:
     """What to try after a refusal. `hint` is the advice alone (the Web UI shows the suggested
-    questions as buttons next to it); `message` also names them, for the command line."""
+    questions as buttons next to it); `message` also names them, for the command line. local_mode:
+    answered without the API, which is then suggested (suggest_api_mode)."""
     suggestions = suggested_local_questions(question, db_path)
     hint = "资料里可能没有这部分内容。可以换个问法，或确认相关资料已经上传。"
+    if local_mode:
+        hint = "资料里可能没有这部分内容，或者资料用的是别的说法。" + LOCAL_MODE_HINT
     message = hint
     if suggestions:
         message += " 资料中有相关内容，可以试试问：" + "；".join(f"「{item}」" for item in suggestions) + "。"
@@ -543,6 +551,7 @@ def local_no_match_user_guidance(question: str, db_path: Path | None = None) -> 
         "message": message,
         "hint": hint,
         "suggested_questions": suggestions,
+        "suggest_api_mode": local_mode,
     }
 
 
@@ -1040,7 +1049,7 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
         if not use_web:
             result["degraded"] = True
             result["degrade_reason"] = "local_no_match"
-            result["user_guidance"] = local_no_match_user_guidance(question, db_path)
+            result["user_guidance"] = local_no_match_user_guidance(question, db_path, local_answer)
         apply_index_status(result, refresh_scheduled)
         result = finalize_answer(question, result, config, allow_api)
         if agent_error:

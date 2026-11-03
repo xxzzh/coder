@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 import re
 import shutil
 import subprocess
@@ -17,6 +19,10 @@ PROJECT_TESSDATA_DIR = PROJECT_ROOT / "tools" / "tessdata"
 OCR_LANGUAGES = "eng+chi_sim"
 
 OCR_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+# Pages read by OCR at the same time, each by its own single-threaded Tesseract: about three times
+# faster on a 20-thread CPU with the same text, while a third of the CPU stays free for questions.
+OCR_WORKERS = max(1, min(6, (os.cpu_count() or 2) // 3))
 
 
 def find_tesseract() -> str | None:
@@ -132,7 +138,9 @@ def tsv_mean_confidence(tsv_path: Path) -> float:
     return total / weight if weight else -1.0
 
 
-def ocr_image(path: Path) -> str:
+def ocr_image(path: Path, single_thread: bool = False) -> str:
+    """The text of one image; single_thread when several pages are read side by side (Tesseract's
+    own threads would then only compete with each other)."""
     tesseract = find_tesseract()
     if not tesseract:
         return ""
@@ -150,7 +158,8 @@ def ocr_image(path: Path) -> str:
             ]
             if tessdata_dir:
                 command.extend(["--tessdata-dir", str(tessdata_dir)])
-            proc = subprocess.run(command, check=False, capture_output=True)
+            env = {**os.environ, "OMP_THREAD_LIMIT": "1"} if single_thread else None
+            proc = subprocess.run(command, check=False, capture_output=True, env=env)
             text_path = output_base.with_name(output_base.name + ".txt")
             if proc.returncode != 0 or not text_path.exists():
                 continue
@@ -201,10 +210,17 @@ def ocr_pdf(path: Path, pages: list[int] | None = None) -> tuple[str, list[str]]
         except Exception as exc:
             warnings.append(f"OCR render failed: {portable_error_message(exc)}")
             return "", warnings
-        for done, image_path in enumerate(images):
-            progress.report("ocr", done=done, total=len(images))
+        workers = min(OCR_WORKERS, len(images))
+        texts: dict[Path, str] = {}
+        progress.report("ocr", done=0, total=len(images))
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            pending = {pool.submit(ocr_image, image_path, workers > 1): image_path for image_path in images}
+            for done, future in enumerate(as_completed(pending), start=1):
+                texts[pending[future]] = future.result()
+                progress.report("ocr", done=done, total=len(images))
+        for image_path in images:
             page_index = int(re.sub(r"\D", "", image_path.stem) or 0)
-            page_text = ocr_image(image_path)
+            page_text = texts.get(image_path, "")
             if page_text:
                 pieces.append(f"[ocr page {page_index}]\n{page_text}")
             else:

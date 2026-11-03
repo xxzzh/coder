@@ -346,6 +346,24 @@ def wait_for(job: web_documents.IndexJob, timeout: float = 10.0) -> dict:
     return job.snapshot()
 
 
+def test_job_time_left() -> None:
+    """Pages read by OCR and chunks embedded get the time left from the pace so far."""
+    job = web_documents.IndexJob(Path("raw"), Path("k.db"), Path("p"))
+    original_time = web_documents.time.time
+    clock = iter([100.0, 130.0, 200.0, 290.0])
+    web_documents.time.time = lambda: next(clock)
+    try:
+        job._progress("ocr", {"done": 0, "total": 40})
+        job._progress("ocr", {"done": 10, "total": 40})  # 3 s a page, 30 pages left
+        assert job._state["ocr"]["eta_seconds"] == 90, job._state
+        job._progress("reading", {"done": 1, "total": 3, "file": "b.pdf"})  # files differ too much to time
+        assert "eta_seconds" not in job._state["reading"]
+        # ... but how long the current file has been read is shown: a scanned book takes minutes.
+        assert job.snapshot()["reading"]["file_seconds"] == 90
+    finally:
+        web_documents.time.time = original_time
+
+
 def test_index_job() -> None:
     gate = threading.Event()
     seen: list[str] = []
@@ -374,7 +392,8 @@ def test_index_job() -> None:
                 time.sleep(0.01)
             state = job.snapshot()
             seen.append(state["phase"])
-            assert state["state"] == "running" and state["reading"] == {"done": 0, "total": 2, "file": "a.pdf"}
+            assert state["state"] == "running" and {key: state["reading"][key] for key in ("done", "total", "file")} == {"done": 0, "total": 2, "file": "a.pdf"}
+            assert state["reading"]["file_seconds"] >= 0, state
             # More uploads while it runs: one more update afterwards; another kind is refused.
             assert job.start("update")["queued"]
             assert job.start("rebuild")["ok"] is False
@@ -639,6 +658,7 @@ def main() -> None:
     test_api_failures()
     test_set_env_value()
     test_save_api_config()
+    test_job_time_left()
     test_index_job()
     test_http_server()
     test_install_messages()

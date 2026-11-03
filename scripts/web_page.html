@@ -722,6 +722,14 @@
         go.querySelector('button').onclick = () => showView('docsView');
         node.appendChild(go);
       }
+      // Answered on this computer only: the API mode understands questions put in other words.
+      if (guidance.suggest_api_mode && LKA.admin) {
+        const go = document.createElement('div');
+        go.style.marginTop = '8px';
+        go.innerHTML = '<button class="link">去设置页开启大模型 API 模式</button>';
+        go.querySelector('button').onclick = () => showView('settingsView');
+        node.appendChild(go);
+      }
       bot.appendChild(node);
     }
     function renderSources(bot, items) {
@@ -1158,11 +1166,15 @@
       const info = job[phase] || {};
       const reading = job.reading || {};
       if (phase === 'waiting') return ['等待另一个更新完成…', null];
-      if (phase === 'reading') return [`正在读取：${reading.file || ''}（第 ${(reading.done || 0) + 1}/${reading.total || '?'} 个文件）`, reading.total ? (reading.done || 0) / reading.total : null];
-      if (phase === 'ocr') return [`正在识别扫描内容：${reading.file || ''}（第 ${(info.done || 0) + 1}/${info.total || '?'} 页）`, info.total ? (info.done || 0) / info.total : null];
+      // A file read for a while is a scanned or very long one: say so, or it looks stuck.
+      const slow = (reading.file_seconds || 0) >= 30 ? `，这个文件已读 ${reading.file_seconds < 120 ? `${reading.file_seconds} 秒` : `${Math.round(reading.file_seconds / 60)} 分钟`}；扫描件和很长的 PDF 要几分钟` : '';
+      if (phase === 'reading') return [`正在读取：${reading.file || ''}（第 ${(reading.done || 0) + 1}/${reading.total || '?'} 个文件${slow}）`, reading.total ? (reading.done || 0) / reading.total : null];
+      // Time left from the pace so far, for steps that can take many minutes on a large file.
+      const left = info.eta_seconds == null ? '' : info.eta_seconds < 60 ? '，预计不到 1 分钟' : `，预计还要约 ${Math.ceil(info.eta_seconds / 60)} 分钟`;
+      if (phase === 'ocr') return [`正在识别扫描内容：${reading.file || ''}（已识别 ${info.done || 0}/${info.total || '?'} 页${left}）`, info.total ? (info.done || 0) / info.total : null];
       if (phase === 'indexing') return ['正在建立索引…', null];
       if (phase === 'embedding' && !info.done) return [`正在生成向量：0/${info.total || '?'}（第一批要先加载向量模型，可能需要一两分钟）`, null];
-      if (phase === 'embedding') return [`正在生成向量：${info.done}/${info.total || '?'}`, info.total ? info.done / info.total : null];
+      if (phase === 'embedding') return [`正在生成向量：${info.done}/${info.total || '?'}${left ? `（${left.slice(1)}）` : ''}`, info.total ? info.done / info.total : null];
       return ['准备处理…', null];
     }
     function renderJob(job) {
@@ -1243,7 +1255,7 @@
           `语义索引：${vectorIndexStatus(data)}`,
           `扫描件文字识别（OCR）：${data.optional_extractors?.ocr_ready ? '可用' : '不可用：扫描件和图片里的文字读不出来，安装方法见 README「扫描件、图片表格和复杂版式」'}`,
           `英译中：${translationStatus(data)}`,
-          `大模型 API：${data.api_configured ? (data.api_backend_usable ? data.api_provider : '当前配置不可用') : '未配置（本机模式）'}`,
+          `大模型 API：${data.api_configured ? (data.api_backend_usable ? data.api_provider : '当前配置不可用') : (data.api_key_saved ? `已保存（${data.api_model}），当前用本机模式` : '未配置（本机模式）')}`,
           `资料文件夹：${data.raw_dir || '-'}`
         ];
         if ((data.raw_unsupported_files ?? []).length) lines.push(`不支持的文件（没有处理）：${data.raw_unsupported_files.join('；')}`);
@@ -1283,7 +1295,10 @@
         $('apiProvider').innerHTML = apiProviders.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
         $('apiProvider').value = data.provider || 'openai-compatible';
         $('apiBaseUrl').value = data.base_url || providerBaseUrl();
-        $('apiConfigMeta').textContent = data.usable ? `当前模型：${data.model || '-'}` : (data.configured ? '已有配置不可用，请重新配置有效的 API Key' : '未配置，当前为本机模式');
+        $('apiConfigMeta').textContent = data.usable ? `当前模型：${data.model || '-'}`
+          : data.configured ? '已有配置不可用，请重新配置有效的 API Key'
+          : data.has_key ? `已保存 API Key（模型：${data.model}），当前用本机模式；点上方“大模型 API 模式”即可启用，不用重新填写`
+          : '未配置，当前为本机模式';
         if (data.model) $('apiModel').innerHTML = `<option value="${escapeHtml(data.model)}">${escapeHtml(data.model)}</option>`;
       } catch (error) {
         $('apiConfigMeta').textContent = `加载失败：${error.message}`;

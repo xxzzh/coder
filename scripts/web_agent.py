@@ -171,6 +171,9 @@ def health_payload() -> dict[str, Any]:
         "api_configured": api_configured,
         "api_backend_usable": api_usable,
         "api_provider": env.get("LKA_API_PROVIDER", "none"),
+        # A key and model saved while answering on this computer: kept for switching back.
+        "api_key_saved": bool(env.get("LKA_API_KEY")) and bool(env.get("LKA_API_MODEL")),
+        "api_model": env.get("LKA_API_MODEL", ""),
         "scale_warning": chunks >= 50000,
         "pending_reviews": len(pending_review_reports(RAW_DIR, PROCESSED_DIR)),
         "job": JOBS.snapshot(),
