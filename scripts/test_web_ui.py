@@ -300,6 +300,43 @@ def test_set_env_value() -> None:
         assert crlf.read_bytes() == b"A=1\r\nLKA_USE_API=false\r\n"  # the file's own line endings stay
 
 
+def test_save_api_config() -> None:
+    """Saving checks the key with a real call first; only then are the API settings written into
+    .env, leaving its comments and other settings as they were."""
+    import web_agent
+
+    original_validate = web_agent.validate_chat_model
+    web_agent.validate_chat_model = lambda provider, base_url, key, model: (
+        {"ok": True} if key == "good-key" else {"ok": False, "error": "HTTP 401: Unauthorized"}
+    )
+    try:
+        with tempfile.TemporaryDirectory() as temp:
+            env = Path(temp) / ".env"
+            before = "# 本机设置\nLKA_USE_API=false\nLKA_API_PROVIDER=deepseek\nLKA_API_PRO_MODEL=deepseek-v4-pro\nLKA_API_TIMEOUT_SECONDS=30\nLKA_WEB_PASSWORD=a\\b\n"
+            env.write_text(before, encoding="utf-8")
+            payload = {"provider": "openai", "base_url": "https://api.openai.com/v1", "api_key": "bad-key", "model": "gpt-5-mini"}
+            try:
+                web_agent.save_api_config(payload, env)
+            except ValueError as exc:
+                assert "API Key 无效" in str(exc) and "没有保存" in str(exc), exc
+            else:
+                raise AssertionError("a rejected key must not be saved")
+            assert env.read_text(encoding="utf-8") == before
+            saved = web_agent.save_api_config({**payload, "api_key": " good-\nkey "}, env)
+            assert saved["model"] == "gpt-5-mini", saved
+            values = web_agent.read_api_env(env)
+            assert values["LKA_USE_API"] == "true" and values["LKA_API_KEY"] == "good-key" and values["LKA_API_PROVIDER"] == "openai"
+            assert values["LKA_API_BASE_URL"] == "https://api.openai.com/v1" and values["LKA_API_MODEL"] == "gpt-5-mini"
+            assert values["LKA_API_PRO_MODEL"] == "" and values["LKA_API_TIMEOUT_SECONDS"] == "30"  # old service's model cleared
+            text = env.read_text(encoding="utf-8")
+            assert text.startswith("# 本机设置\n") and "LKA_WEB_PASSWORD=a\\b\n" in text, text
+            # Saving again with the key field left empty keeps the saved key for the same address.
+            web_agent.save_api_config({**payload, "api_key": ""}, env)
+            assert web_agent.read_api_env(env)["LKA_API_KEY"] == "good-key"
+    finally:
+        web_agent.validate_chat_model = original_validate
+
+
 def wait_for(job: web_documents.IndexJob, timeout: float = 10.0) -> dict:
     deadline = time.time() + timeout
     while job.running():
@@ -601,6 +638,7 @@ def main() -> None:
     test_question_log_and_stats()
     test_api_failures()
     test_set_env_value()
+    test_save_api_config()
     test_index_job()
     test_http_server()
     test_install_messages()

@@ -18,6 +18,14 @@ from model_capabilities import embed_texts
 
 class MockHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        if self.headers.get("Authorization") == "Bearer bad-key":
+            body = b'{"error": {"message": "Authentication Fails, Your api key: ****-key is invalid"}}'
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/v1/models":
             self.send_json({"data": [{"id": "mock-chat"}, {"id": "text-embedding-3-small"}]})
         else:
@@ -72,7 +80,11 @@ def main() -> None:
     try:
         discovery = discover_models("openai-compatible", base_url, "test-key")
         assert discovery["ok"] is True
-        assert discovery["models"] == ["mock-chat"]
+        assert discovery["models"] == ["mock-chat"] and discovery["default"] == "mock-chat"
+        # A rejected key reads no list at all: the provider's default names would look like success.
+        rejected = discover_models("deepseek", base_url, "bad-key")
+        assert rejected["ok"] is False and rejected["models"] == [] and "API Key 无效" in rejected["error"], rejected
+        assert "bad-key" not in rejected["error"]
         answer = chat_completion(
             "openai-compatible",
             base_url,

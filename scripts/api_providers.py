@@ -190,9 +190,20 @@ def discover_models(provider: str, base_url: str, api_key: str, timeout: int = 1
         ]
         models = sorted({model for model in models if chat_capable_model(provider, model)})
         if models:
-            return {"ok": True, "provider": provider, "base_url": base_url, "models": models, "discovered": True}
+            return {
+                "ok": True,
+                "provider": provider,
+                "base_url": base_url,
+                "models": models,
+                "default": recommended_model(provider, models),
+                "discovered": True,
+            }
     except Exception as exc:  # noqa: BLE001
-        error = str(exc)
+        error = str(exc).replace(api_key, "***") if api_key else str(exc)
+        # A rejected key is not a missing model list: the provider's default names would look
+        # like the key worked.
+        if re.search(r"HTTP 40[13]\b|Unauthorized|Authentication|invalid.{0,12}key", error, flags=re.IGNORECASE):
+            return {"ok": False, "provider": provider, "base_url": base_url, "models": [], "error": f"API Key 无效或没有权限，请检查后重新填写（{error[:160]}）"}
     else:
         error = "接口没有返回可用的文本模型。"
 
@@ -202,9 +213,15 @@ def discover_models(provider: str, base_url: str, api_key: str, timeout: int = 1
         "provider": provider,
         "base_url": base_url,
         "models": models,
+        "default": recommended_model(provider, models),
         "discovered": False,
         "warning": f"在线模型发现失败，已使用提供商默认模型列表：{error}" if models else error,
     }
+
+
+def recommended_model(provider: str, models: list[str]) -> str:
+    """The model to preselect: the provider's usual choice when the list has it, else the first."""
+    return next((model for model in fallback_models(provider) if model in models), models[0] if models else "")
 
 
 def chat_completion(

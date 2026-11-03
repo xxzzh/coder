@@ -1296,7 +1296,8 @@
           provider: $('apiProvider').value, base_url: $('apiBaseUrl').value, api_key: $('apiKey').value
         })});
         $('apiModel').innerHTML = (data.models || []).map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join('');
-        $('apiConfigMeta').textContent = data.warning || `已读取 ${(data.models || []).length} 个模型`;
+        if (data.default) $('apiModel').value = data.default;
+        $('apiConfigMeta').textContent = data.warning || `已读取 ${(data.models || []).length} 个模型，选好后点“保存并验证”`;
       } catch (error) {
         $('apiConfigMeta').textContent = `读取失败：${error.message}`;
       }
@@ -1308,11 +1309,11 @@
           provider: $('apiProvider').value, base_url: $('apiBaseUrl').value, api_key: $('apiKey').value, model: $('apiModel').value
         })});
         $('apiKey').value = '';
-        $('apiConfigMeta').textContent = `已启用：${data.provider} · ${data.model}`;
         log('API 配置已保存', {provider: data.provider, model: data.model});
         loadHealth();
-        loadApiConfig();
         loadStatus();
+        await loadApiConfig();
+        $('apiConfigMeta').textContent = `验证通过，已保存并启用：${data.model}（已写入 .env，下一个问题起生效）`;
       } catch (error) {
         $('apiConfigMeta').textContent = `保存失败：${error.message}`;
       }

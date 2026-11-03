@@ -36,7 +36,6 @@ from api_providers import (  # noqa: E402
     read_env as read_api_env,
     set_env_value,
     validate_chat_model,
-    write_env as write_api_env,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -324,41 +323,52 @@ def reviews_payload() -> dict[str, Any]:
     }
 
 
-def api_key_from_payload(payload: dict[str, Any], base_url: str) -> str:
+def api_key_from_payload(payload: dict[str, Any], base_url: str, env_path: Path | None = None) -> str:
     """The key typed in, or else the saved one, but only for the saved address: a changed address
     gets no key it was not given, so the saved key never goes to a server it was not meant for."""
-    api_key = str(payload.get("api_key", "")).strip()
+    api_key = re.sub(r"\s+", "", str(payload.get("api_key", "")))
     if api_key:
         return api_key
-    env = read_api_env()
+    env = read_api_env(env_path or ROOT / ".env")
     if base_url.rstrip("/") == env.get("LKA_API_BASE_URL", "").rstrip("/"):
         return env.get("LKA_API_KEY", "")
     return ""
 
 
-def save_api_config(payload: dict[str, Any]) -> dict[str, Any]:
+def api_error_message(error: str) -> str:
+    """A failed API call in words a user can act on, with the service's own reply after it."""
+    failure = api_failure({"api_error": error}) or {"message": "大模型 API 调用失败"}
+    return f"{failure['message']}（{redact_secrets(error)[:160]}）"
+
+
+def save_api_config(payload: dict[str, Any], env_path: Path | None = None) -> dict[str, Any]:
+    """Check the key and model with one real call, then write them into .env and turn the API
+    mode on. Only these settings change: the file's other lines and comments stay as they are."""
+    env_path = env_path or ROOT / ".env"
     provider = str(payload.get("provider", "openai-compatible")).strip()
-    base_url = str(payload.get("base_url", "")).strip() or default_base_url(provider)
-    api_key = api_key_from_payload(payload, base_url)
+    base_url = (str(payload.get("base_url", "")).strip() or default_base_url(provider)).rstrip("/")
+    api_key = api_key_from_payload(payload, base_url, env_path)
     model = str(payload.get("model", "")).strip()
     if not api_key or not model:
-        raise ValueError("API key 和模型不能为空。")
+        raise ValueError("API Key 和模型不能为空：请填写 API Key，点“读取可用模型”后选择一个模型。")
     validation = validate_chat_model(provider, base_url, api_key, model)
     if not validation.get("ok"):
-        raise ValueError(f"模型调用验证失败：{validation.get('error')}")
-    env = read_api_env()
-    env.update(
-        {
-            "LKA_USE_API": "true",
-            "LKA_API_PROVIDER": provider,
-            "LKA_API_BASE_URL": base_url.rstrip("/"),
-            "LKA_API_KEY": api_key,
-            "LKA_API_MODEL": model,
-            "LKA_API_TIMEOUT_SECONDS": env.get("LKA_API_TIMEOUT_SECONDS", "20"),
-        }
-    )
-    write_api_env(env)
-    return {"ok": True, "provider": provider, "base_url": base_url.rstrip("/"), "model": model}
+        raise ValueError(f"验证没有通过，配置没有保存：{api_error_message(str(validation.get('error', '')))}")
+    env = read_api_env(env_path)
+    updates = {
+        "LKA_USE_API": "true",
+        "LKA_API_PROVIDER": provider,
+        "LKA_API_BASE_URL": base_url,
+        "LKA_API_KEY": api_key,
+        "LKA_API_MODEL": model,
+    }
+    if not env.get("LKA_API_TIMEOUT_SECONDS"):
+        updates["LKA_API_TIMEOUT_SECONDS"] = "20"
+    if env.get("LKA_API_PRO_MODEL") and env.get("LKA_API_PROVIDER") != provider:
+        updates["LKA_API_PRO_MODEL"] = ""  # the previous service's model: the new one's default applies
+    for key, value in updates.items():
+        set_env_value(key, value, env_path)
+    return {"ok": True, "provider": provider, "base_url": base_url, "model": model}
 
 
 def set_api_mode(payload: dict[str, Any]) -> dict[str, Any]:
