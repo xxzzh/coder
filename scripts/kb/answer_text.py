@@ -196,6 +196,15 @@ def numbered_steps(value: str) -> list[str]:
     return ([head] if head else []) + [step for step in steps if step]
 
 
+# A numbered step ("1. 关机", "2、取出旧滤网", not "2.5V") keeps its own number in a list: the Web UI
+# shows such lines as ordered steps, without a bullet in front of the number.
+STEP_LINE_PATTERN = re.compile(r"^\d{1,2}[.、](?!\d)\s*\S")
+
+
+def list_line(text: str) -> str:
+    return text if STEP_LINE_PATTERN.match(text) else f"- {text}"
+
+
 def record_lines(fields: list[tuple[str, str]]) -> list[str]:
     """One bullet per field; a field holding numbered steps becomes a group of its own after the
     plain fields, so the fields that follow it are not read as its steps."""
@@ -204,7 +213,7 @@ def record_lines(fields: list[tuple[str, str]]) -> list[str]:
     for name, value in fields:
         steps = numbered_steps(value)
         if steps and name:
-            grouped += ["", name, *[f"- {step}" for step in steps]]
+            grouped += ["", name, *[list_line(step) for step in steps]]
         else:
             plain.append(f"- {name}：{value}" if name else f"- {value}")
     return plain + grouped
@@ -346,7 +355,7 @@ def evidence_layout(text: str) -> tuple[str, str, list[str]]:
         elif index + 1 < len(lines) and (is_heading_line(line) or is_subheading_line(line, lines[index + 1])):
             out += ["", line.rstrip("：:")]
         else:
-            out.append(f"- {line}")
+            out.append(list_line(line))
         index += 1
     return "section", title, out
 
@@ -398,7 +407,7 @@ def local_structured_answer(pieces: list[tuple[str, Any]], source_type: str | No
 
     if related:
         named = kind != "prose" and bool(title)
-        body = [f"- {lines[0]}"] if kind == "prose" else lines
+        body = [list_line(lines[0])] if kind == "prose" else lines
         opening = RELATED_OPENING.format(title=f"「{clean_title(title)}」" if named else "")
         if not has_text_line(body):
             opening = opening.rstrip("：") + f" [{pieces[0][1]}]："

@@ -22,6 +22,7 @@ import llm_budget
 
 from kb import relevance
 from kb.config import DEFAULT_API_TIMEOUT_SECONDS, api_enabled
+from kb.local_focus import title_rank
 
 
 # Recent turns sent along with a follow-up, and how much of each is kept.
@@ -122,10 +123,29 @@ def listed_together(word: str, other: str, knowledge: str) -> bool:
     for count, match in enumerate(re.finditer(re.escape(other.lower()), knowledge)):
         if count >= CONTEXT_SCAN_LIMIT:
             break
-        line_start = knowledge.rfind(chr(10), 0, match.start()) + 1
-        line_end = knowledge.find(chr(10), match.end())
-        line = knowledge[line_start : line_end if line_end >= 0 else len(knowledge)]
+        line = line_at(knowledge, match.start())
         if word.lower() in line and word_contexts(word, line) & word_contexts(other, line):
+            return True
+    return False
+
+
+def line_at(text: str, position: int) -> str:
+    start = text.rfind("\n", 0, position) + 1
+    end = text.find("\n", position)
+    return text[start : end if end >= 0 else len(text)]
+
+
+def titles_a_section(word: str, knowledge: str) -> bool:
+    """Whether the documents have a section titled with word (二、费用报销, ## 加班): then «那X呢»
+    asks about that topic, not about X of the previous question's subject."""
+    for count, match in enumerate(re.finditer(re.escape(word.lower()), knowledge)):
+        if count >= CONTEXT_SCAN_LIMIT:
+            break
+        line = line_at(knowledge, match.start()).strip()
+        marks = len(line) - len(line.lstrip("#"))
+        title = line.lstrip("#").strip()
+        # The title names the topic itself (费用报销, 加班), not something of it (价格表).
+        if title_rank(title, min(marks, 6), "-") and title.rstrip("：:").endswith(word.lower()):
             return True
     return False
 
@@ -181,13 +201,17 @@ def rewrite_by_rules(question: str, previous: str, knowledge: str = "") -> str:
             # A name or model number is another subject: «那 SFT 呢» asks the previous question about SFT.
             if subject in previous:
                 return previous.replace(subject, other, 1)
-        elif "的" not in previous:
+        else:
             plain = POLITE_PREFIX.sub("", previous.strip())
-            sibling = sibling_word(other, plain, knowledge) if knowledge else ""
+            sibling = sibling_word(other, plain, knowledge) if knowledge and "的" not in previous else ""
             if sibling:
                 return plain.replace(sibling, other, 1)
+            # «那加班呢» after «报销多久能到账»: a topic the documents have a section for is asked
+            # about on its own; the previous question's wording (多久能到账) may not fit it.
+            if led and knowledge and titles_a_section(other, knowledge):
+                return other
             # «那报销呢» after «年假怎么算» asks the same about 报销.
-            if led and subject in plain:
+            if led and "的" not in previous and subject in plain:
                 return plain.replace(subject, other, 1)
         return f"{subject}的{other}是什么"
     pronoun = PRONOUNS.search(core)

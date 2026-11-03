@@ -178,6 +178,9 @@ QUESTION_FUNCTION_PHRASES = tuple(
             "哪个函数", "什么函数", "哪个方法", "哪个字段",
             # Asking for the values of a field (某字段的取值) or a part of the named document.
             "取值", "哪一部分", "哪部分", "这本书",
+            # Where and how long only ask (安全帽坏了去哪换, 多久能到账). 谁 stays: in 要谁批 it marks
+            # what is asked (who approves), and without it any chunk naming the subject would pass.
+            "哪", "多久", "多长",
             "的", "了", "吗", "呢", "吧", "啊", "呀", "么", "和", "与", "及", "是", "都", "也",
         },
         key=len,

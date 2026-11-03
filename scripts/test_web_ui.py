@@ -134,6 +134,9 @@ def test_upload_names_and_storage() -> None:
     assert web_documents.safe_upload_name("a/b/c.md") == "c.md"
     assert web_documents.safe_upload_name('a<b>:"c".xlsx') == "a_b___c_.xlsx"
     assert web_documents.safe_upload_name("CON.txt") == "_CON.txt"
+    # The list shows a file's folder only when it is not the one uploads of its type go to.
+    assert web_documents.shown_folder("markdown/安全规定.txt") == "" and web_documents.shown_folder("说明.md") == ""
+    assert web_documents.shown_folder("项目A/说明.md") == "项目A" and web_documents.shown_folder("pdf/旧版/手册.pdf") == "pdf/旧版"
     assert len(web_documents.safe_upload_name("长" * 300 + ".pdf")) == web_documents.FILE_NAME_MAX_CHARS
     for bad in ("tool.exe", "noext", "", ".hidden.md", "~$lock.docx", ".pdf"):
         try:

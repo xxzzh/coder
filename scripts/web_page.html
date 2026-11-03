@@ -1020,7 +1020,7 @@
             const [label, kind] = STATUS_TEXT[item.status] || [item.status, ''];
             const reasons = (item.reasons || []).length ? `<div class="muted small">${item.reasons.map(escapeHtml).join('<br>')}</div>` : '';
             return `<tr>
-              <td>${escapeHtml(item.file_name)}<div class="muted small">${escapeHtml(item.file_path)}</div>${reasons}</td>
+              <td>${escapeHtml(item.file_name)}${item.folder ? `<div class="muted small">${escapeHtml(item.folder)}/</div>` : ''}${reasons}</td>
               <td><span class="tag ${kind}">${label}</span></td>
               <td class="num">${formatSize(item.size)}</td>
               <td class="num">${formatTime(item.modified_at)}</td>

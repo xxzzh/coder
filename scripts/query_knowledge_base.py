@@ -236,7 +236,7 @@ NEGATIVE_CACHE_TTL_SECONDS = 120
 CACHE_VARIANT_VERSION = "retrieval-v61:no-corpus-specific-rules"
 # Answers built without a model (layout, gate, cited evidence). Raising it refreshes cached local
 # answers only; cached API answers stay valid and are not paid for again.
-LOCAL_ANSWER_VERSION = "local-v5"
+LOCAL_ANSWER_VERSION = "local-v6"
 
 
 def source_fingerprint(raw_dir: Path = RAW_DIR) -> str:

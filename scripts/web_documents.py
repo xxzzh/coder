@@ -43,6 +43,15 @@ FILE_NAME_MAX_CHARS = 150
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 
+def shown_folder(rel_path: str) -> str:
+    """The folder a file is listed under: empty at the top of the folder and in the folder uploads
+    of its type go to (markdown/ for a .txt means nothing to a user), else its folder path."""
+    folder, _, name = rel_path.replace("\\", "/").rpartition("/")
+    if folder == UPLOAD_SUBDIRS.get(Path(name).suffix.lower()):
+        return ""
+    return folder
+
+
 def upload_max_bytes() -> int:
     try:
         megabytes = int(os.environ.get("LKA_UPLOAD_MAX_MB", "") or DEFAULT_UPLOAD_MAX_MB)
@@ -240,6 +249,7 @@ def documents_payload(raw_dir: Path, db_path: Path, processed_dir: Path, process
                 {
                     "file_path": rel_path,
                     "file_name": path.name,
+                    "folder": shown_folder(rel_path),
                     "file_type": path.suffix.lower().lstrip("."),
                     "size": stat.st_size,
                     "modified_at": _iso_seconds(stat.st_mtime),

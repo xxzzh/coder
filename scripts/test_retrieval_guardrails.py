@@ -806,7 +806,8 @@ def check_local_answer_layout() -> None:
     record = "样例清单 | #：7 | 类别：电源 | 内容：电压范围 | 状态：— | 负责人：甲组 | 负责人：乙组 | 方案：1.接通电源 2.读取电压 3.比较范围"
     kind, title, lines = answer_text.evidence_layout(record)
     assert (kind, title) == ("record", "样例清单"), (kind, title)
-    assert lines == ["- 类别：电源", "- 内容：电压范围", "- 负责人：甲组，乙组", "", "方案", "- 1.接通电源", "- 2.读取电压", "- 3.比较范围"], lines
+    # Numbered steps keep their numbers without a bullet: the Web UI lists them in order.
+    assert lines == ["- 类别：电源", "- 内容：电压范围", "- 负责人：甲组，乙组", "", "方案", "1.接通电源", "2.读取电压", "3.比较范围"], lines
     assert answer_text.numbered_steps("电压 2.5V，版本 1.0") == []  # numbers are not steps
     code = "步骤 1：新建示例类\nusing Demo.Core;\npublic class Sample : SampleBase\nget { return value; }\n<Target>Release</Target>"
     kind, title, lines = answer_text.evidence_layout("新增示例\n" + code)
@@ -954,13 +955,19 @@ def check_document_structure() -> None:
     assert "保修期内的非人为故障免费维修。保修期从购买发票日期起计算，AP-300 为 2 年，AP-500为 3 年。滤网属于耗材。" in joined, joined
     assert "三、上门服务" in joined and "E1 风机故障" in joined and len(joined) == 7, joined
 
-    knowledge = "点检项目：排气温度 | 标准：不高于 95℃\n点检项目：排气压力 | 标准：0.6–0.8 mpa\n火车乘坐高铁二等座；飞机乘坐经济舱。\n三、取消预订\n会议室预订说明"
+    knowledge = (
+        "点检项目：排气温度 | 标准：不高于 95℃\n点检项目：排气压力 | 标准：0.6–0.8 mpa\n火车乘坐高铁二等座；飞机乘坐经济舱。\n"
+        "三、取消预订\n会议室预订说明\n## 三、加班\n周末加班按 2 倍计算。\n## 工作表 2026年价格表"
+    )
     cases = {
         ("压力呢？", "空压机排气温度标准是多少？"): "空压机排气压力标准是多少？",
         ("那火车呢？", "出差坐飞机能坐什么舱？"): "出差坐火车能坐什么舱？",
         ("取消呢？", "怎么订会议室？"): "订会议室的取消是什么",
         ("E3呢？", "出现E1怎么办？"): "出现E3怎么办？",
         ("那报销呢？", "年假怎么算？"): "报销怎么算？",
+        # A topic with a section of its own is asked about alone; part of a title (价格表) is not one.
+        ("那加班呢？", "报销多久能到账？"): "加班",
+        ("那价格呢", "AP-300的滤网多久换一次"): "AP-300的价格是什么",
     }
     for (question, previous), expected in cases.items():
         rewritten = followup.rewrite_by_rules(question, previous, knowledge)
