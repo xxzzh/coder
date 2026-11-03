@@ -447,13 +447,44 @@ def run_ocr_eval() -> dict[str, Any]:
 
 
 JOBS = IndexJob(RAW_DIR, DB_PATH, PROCESSED_DIR, redact=redact_secrets)
-# Set in main(): the access password, and whether the UI listens on this computer only.
+# Set in main(): the access password, whether the UI listens on this computer only, and its port.
 ACCESS = Access("")
 LOCAL_ONLY = True
+PORT = 8765
+
+# The access password for colleagues on the network: at least this long, so it is not guessed in
+# the few tries a browser gets before a lockout.
+ACCESS_PASSWORD_MIN_CHARS = 6
 
 
 def web_setting(name: str, default: str = "") -> str:
     return os.environ.get(name) or load_env(ROOT / ".env").get(name, "") or default
+
+
+def access_payload() -> dict[str, Any]:
+    """Whether colleagues on the network can use this UI now, and at which addresses."""
+    return {
+        "lan_open": not LOCAL_ONLY,
+        "password_set": bool(web_setting("LKA_WEB_PASSWORD")),
+        "addresses": [f"http://{address}:{PORT}/" for address in network_addresses()] if not LOCAL_ONLY else [],
+    }
+
+
+def save_access_password(payload: dict[str, Any], cookie: str | None = None, env_path: Path | None = None) -> dict[str, Any]:
+    """Write the network access password into .env. While the UI is shared on the network it takes
+    effect at once (everyone else signs in again); otherwise at the next shared start."""
+    password = str(payload.get("password", ""))
+    if len(password.strip()) < ACCESS_PASSWORD_MIN_CHARS:
+        raise ValueError(f"访问密码至少 {ACCESS_PASSWORD_MIN_CHARS} 位。")
+    if re.search(r"[\r\n]", password) or password != password.strip():
+        raise ValueError("访问密码不能有换行，开头和结尾不能是空格。")
+    set_env_value("LKA_WEB_PASSWORD", password, env_path or ROOT / ".env")
+    if not LOCAL_ONLY:
+        ACCESS.change_password(password, cookie)
+        message = "已保存，立即生效：其他人需要用新密码重新登录。"
+    else:
+        message = "已保存。用开始菜单的“15. 局域网共享启动”启动后，同事输入这个密码即可提问。"
+    return {"ok": True, "message": message, **access_payload(), "password_set": True}
 
 
 def app_title() -> str:
@@ -607,6 +638,9 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self.send_json(reviews_payload())
             elif path == "/api/api-config":
                 self.send_json(api_config_payload())
+            elif path == "/api/access":
+                self.check_manager()
+                self.send_json(access_payload())
             elif path == "/api/jobs":
                 self.send_json(JOBS.snapshot())
             elif path == "/api/stats":
@@ -691,6 +725,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self.send_json(result)
             elif path == "/api/api-save":
                 self.send_json(save_api_config(self.read_json()))
+            elif path == "/api/access-password":
+                self.send_json(save_access_password(self.read_json(), self.headers.get("Cookie")))
             elif path == "/api/api-mode":
                 self.send_json(set_api_mode(self.read_json()))
             else:
@@ -920,7 +956,7 @@ def network_addresses() -> list[str]:
 
 
 def main() -> None:
-    global ACCESS, LOCAL_ONLY
+    global ACCESS, LOCAL_ONLY, PORT
     rotate_web_ui_logs()
     parser = argparse.ArgumentParser(description="Run the Web UI of the Local Knowledge Base Agent.")
     parser.add_argument(
@@ -933,9 +969,10 @@ def main() -> None:
     args = parser.parse_args()
 
     LOCAL_ONLY = is_loopback_bind(args.host)
+    PORT = args.port
     password = web_setting("LKA_WEB_PASSWORD")
     if not LOCAL_ONLY and not password:
-        print(f"对外开放（--host {args.host}）时必须设置访问密码：在 .env 中加一行 LKA_WEB_PASSWORD=你的密码，然后重新启动。")
+        print(f"对外开放（--host {args.host}）时必须设置访问密码：先用普通方式启动，在网页“设置”页的“局域网共享”里设好访问密码（或在 .env 中加一行 LKA_WEB_PASSWORD=你的密码），然后重新启动。")
         sys.exit(2)
     ACCESS = Access(password)
 

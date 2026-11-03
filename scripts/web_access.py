@@ -113,6 +113,15 @@ class Access:
         with self._lock:
             return len([m for m in self._failures.get(client, []) if now - m < LOGIN_LOCKOUT_SECONDS]) >= LOGIN_FAILURES_ALLOWED
 
+    def change_password(self, password: str, keep_cookie: str | None = None) -> None:
+        """A new access password, in force at once: every other browser has to sign in again with
+        it; the one that changed it (keep_cookie) stays signed in."""
+        token = self._token(keep_cookie)
+        with self._lock:
+            self.password = password
+            kept = self._sessions.get(token or "")
+            self._sessions = {token: kept} if token and kept else {}
+
     def sign_out(self, cookie_header: str | None) -> None:
         token = self._token(cookie_header)
         with self._lock:

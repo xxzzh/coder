@@ -97,11 +97,7 @@ def db_stats() -> dict[str, object]:
 def optional_extractors() -> dict[str, object]:
     modules: dict[str, bool] = {}
     for module_name in ("pypdf", "PyPDF2", "pdfplumber", "pypdfium2", "PIL", "pytesseract", "openpyxl", "faiss", "numpy"):
-        try:
-            __import__(module_name)
-            modules[module_name] = True
-        except ImportError:
-            modules[module_name] = False
+        modules[module_name] = project_runtime.import_optional(module_name) is not None
     tesseract = shutil.which("tesseract")
     if not tesseract:
         for candidate in (

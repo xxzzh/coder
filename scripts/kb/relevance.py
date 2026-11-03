@@ -335,6 +335,47 @@ def unknown_names(question: str, db_path: Path) -> list[str]:
     return unknown
 
 
+COMPACT_TEXT_CACHE: dict[str, tuple[str, str]] = {}
+
+
+def compact_knowledge_text(db_path: Path) -> str | None:
+    """The knowledge base's text without spaces or line breaks (Chinese words split across lines
+    still match), cached like knowledge_text."""
+    text = knowledge_text(db_path)
+    if text is None:
+        return None
+    key = str(Path(db_path).resolve())
+    stamp = KNOWLEDGE_TEXT_CACHE.get(key, ("", ""))[0]
+    cached = COMPACT_TEXT_CACHE.get(key)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    compact = re.sub(r"\s+", "", text)
+    COMPACT_TEXT_CACHE[key] = (stamp, compact)
+    return compact
+
+
+def absent_words(question: str, db_path: Path) -> list[str]:
+    """Chinese words of the question that the knowledge base never uses (洗衣费 in «出差的洗衣费能
+    报销吗»). A question is not refused for them, since users' wording is often not the documents'
+    (unknown_names), but an answer found without them only shows the closest content, and says so."""
+    corpus = compact_knowledge_text(db_path)
+    if not corpus:
+        return []
+
+    def used(text: str) -> bool:
+        return text in corpus or any(variant in corpus for variant in traditional_variants(text))
+
+    absent: list[str] = []
+    for run in cjk_runs(query_content_units(question)):
+        span = run[0][1] + "".join(term[1] for _, term, _ in run[1:])
+        # Characters no used two-character term covers, split at particles: in 洗衣费能报销 only
+        # 报销 is used, which leaves 洗衣费 (能 joins the words).
+        covered = {position for index, (_, term, _) in enumerate(run) if used(term) for position in (index, index + 1)}
+        pieces = re.split(f"[{''.join(PARTICLE_CHARACTERS)}]+", "".join(" " if position in covered else char for position, char in enumerate(span)))
+        absent += [piece for part in pieces for piece in part.split() if len(piece) >= 2 and not used(piece)]
+    return absent
+
+
 def row_covers_question(
     row: dict[str, Any],
     units: list[tuple[str, str, float]],

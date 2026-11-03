@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from project_runtime import import_optional
+
 from kb_ingest import progress
 from kb_ingest.files import PROJECT_ROOT, portable_error_message
 
@@ -67,11 +69,7 @@ def pdf_page_renderer() -> str | None:
     otherwise pypdfium2, which pdfplumber installs, so no separate download is needed."""
     if shutil.which("pdftoppm"):
         return "pdftoppm"
-    try:
-        import pypdfium2  # noqa: F401
-    except ImportError:
-        return None
-    return "pypdfium2"
+    return "pypdfium2" if import_optional("pypdfium2") is not None else None
 
 
 def render_pdf_pages_for_ocr(path: Path, temp_dir: Path, pages: list[int] | None = None) -> list[Path]:
@@ -99,8 +97,9 @@ def render_pdf_pages_for_ocr(path: Path, temp_dir: Path, pages: list[int] | None
             )
         return sorted(temp_dir.glob("page-*.png"))
     if renderer == "pypdfium2":
-        import pypdfium2
-
+        pypdfium2 = import_optional("pypdfium2")
+        if pypdfium2 is None:
+            return []
         images: list[Path] = []
         document = pypdfium2.PdfDocument(str(path))
         try:

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Project-local runtime directories for downloads and caches."""
+"""Project-local runtime directories for downloads and caches, and loading optional packages."""
 
 from __future__ import annotations
 
+import importlib
 import os
+import sys
+import time
 from pathlib import Path
+from types import ModuleType
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,3 +71,21 @@ def reuse_local_stanza_resources() -> None:
 
 PROJECT_ENV = apply_project_runtime_env()
 
+
+def import_optional(module_name: str, attempts: int = 3) -> ModuleType | None:
+    """The package, or None when it is not installed. Loading it can also fail for a moment with
+    PermissionError, when another program reads the same package files at the same time and
+    Windows (or a virus scanner) holds one of them: such a failure is tried again, after dropping
+    whatever was half loaded, instead of passing for a missing package or breaking the caller."""
+    for attempt in range(attempts):
+        try:
+            return importlib.import_module(module_name)
+        except ImportError:
+            return None
+        except Exception:  # noqa: BLE001
+            for name in [name for name in sys.modules if name == module_name or name.startswith((f"{module_name}.", f"{module_name}_"))]:
+                sys.modules.pop(name, None)
+            if attempt == attempts - 1:
+                return None
+            time.sleep(0.3)
+    return None

@@ -56,6 +56,7 @@ echo   4. Configure the answer API (optional)
 echo  Daily use
 echo   5. Start the Web UI (upload documents, ask questions)
 echo   6. Check the installation and documents
+echo  15. Share on the local network (set an access password in Settings first)
 echo  Without uploading in the Web UI
 echo   7. Open the documents folder
 echo   8. Process new and changed documents
@@ -85,6 +86,7 @@ if "%CHOICE%"=="11" goto sources
 if "%CHOICE%"=="12" goto translation_setup
 if "%CHOICE%"=="13" goto ocr_eval
 if "%CHOICE%"=="14" goto ocr_generate
+if "%CHOICE%"=="15" goto web_lan
 if "%CHOICE%"=="0" goto end
 
 echo.
@@ -103,6 +105,15 @@ echo.
 call :say web
 echo.
 call "%RUNNER%" web --open
+echo.
+pause
+goto menu
+
+:web_lan
+echo.
+call :say web_lan
+echo.
+call "%RUNNER%" web --host 0.0.0.0 --open
 echo.
 pause
 goto menu

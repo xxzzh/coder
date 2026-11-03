@@ -893,6 +893,17 @@ def check_local_focus() -> None:
     units = query_module.query_content_units("叉车刹车怎么检查")
     pieces = [{"file_name": "点检表.xlsx", "text": "叉车 刹车 每班"}, {"file_name": "价格表.xlsx", "text": "AP-500 4599 元"}, {"file_name": "点检表.xlsx", "text": "冷却塔 水位"}]
     assert [piece["text"] for piece in local_focus.supplements(pieces, units)] == ["叉车 刹车 每班", "冷却塔 水位"]
+    # Words the documents never use are found down to the word, not the whole span: in 洗衣费能报销
+    # only 报销 is used. Such a question gets the closest content, labelled, even past the wording check.
+    from kb import relevance
+
+    original_compact = relevance.compact_knowledge_text
+    relevance.compact_knowledge_text = lambda db_path: "出差期间每天补贴100元，用于餐饮和市内交通。出差结束后30天内提交差旅报销。"
+    try:
+        assert relevance.absent_words("出差的洗衣费能报销吗", Path("k.db")) == ["洗衣费"]
+        assert relevance.absent_words("出差补贴用于什么", Path("k.db")) == []
+    finally:
+        relevance.compact_knowledge_text = original_compact
     # A section of a document named after the asked model is about that model.
     rows = [{"text": "滤网每 6 个月更换一次", "file_name": "AP-300说明书.docx"}, {"text": "AP-500 零售价 4599", "file_name": "价格表.xlsx"}]
     named = query_module.rows_about_named_subject(rows, "AP-300滤网多久换", {"AP-300说明书.docx": "AP-300 说明书"})
@@ -1145,6 +1156,28 @@ def check_ocr_pipeline() -> None:
     assert not secrets_module.is_credential_label("Username")
     pages = pdf_module.text_by_page("[page 1]\nfirst\n\n[page 1 table 1]\na | b\n\n[page 2]\nsecond")
     assert {number: text.split() for number, text in pages.items()} == {1: ["first", "a", "|", "b"], 2: ["second"]}, pages
+    # A package file held for a moment by another process fails the import with PermissionError:
+    # it is tried again rather than passing for a missing package (which would skip OCR).
+    import sys
+
+    import project_runtime
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        package = Path(temp_dir) / "flaky_optional_package"
+        package.mkdir()
+        flag = Path(temp_dir) / "locked"
+        flag.write_text("1", encoding="utf-8")
+        (package / "__init__.py").write_text(
+            f"from pathlib import Path\nflag = Path({str(flag)!r})\nif flag.exists():\n    flag.unlink()\n    raise PermissionError('held by another process')\n",
+            encoding="utf-8",
+        )
+        sys.path.insert(0, temp_dir)
+        try:
+            assert project_runtime.import_optional("flaky_optional_package") is not None
+            assert project_runtime.import_optional("no_such_optional_package") is None
+        finally:
+            sys.path.remove(temp_dir)
+            sys.modules.pop("flaky_optional_package", None)
     # Pages read side by side come back in page order, each Tesseract told to use one thread.
     import time as time_module
 

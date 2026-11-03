@@ -346,6 +346,43 @@ def wait_for(job: web_documents.IndexJob, timeout: float = 10.0) -> dict:
     return job.snapshot()
 
 
+def test_access_password() -> None:
+    """The settings page sets the network access password: written into .env, in force at once
+    while shared (others sign in again, the one who changed it stays), else at the next shared start."""
+    import web_agent
+
+    access = web_access.Access("old-pass")
+    mine = access.sign_in("10.0.0.2", "old-pass")
+    theirs = access.sign_in("10.0.0.3", "old-pass")
+    access.change_password("new-pass1", f"lka_session={mine}")
+    assert access.signed_in(f"lka_session={mine}") and not access.signed_in(f"lka_session={theirs}")
+    assert access.sign_in("10.0.0.3", "new-pass1") and access.password == "new-pass1"
+
+    saved_access, saved_local = web_agent.ACCESS, web_agent.LOCAL_ONLY
+    with tempfile.TemporaryDirectory() as temp:
+        env = Path(temp) / ".env"
+        env.write_text("# 设置\nLKA_USE_API=false\n", encoding="utf-8")
+        try:
+            for bad in ("12345", " spaced-out ", "line\nbreak"):
+                try:
+                    web_agent.save_access_password({"password": bad}, None, env)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(bad)
+            web_agent.LOCAL_ONLY = True
+            web_agent.ACCESS = web_access.Access("")
+            result = web_agent.save_access_password({"password": "team-pass"}, None, env)
+            assert "开始菜单" in result["message"] and web_agent.ACCESS.password == ""  # not shared now: next start
+            assert env.read_text(encoding="utf-8") == "# 设置\nLKA_USE_API=false\nLKA_WEB_PASSWORD=team-pass\n"
+            web_agent.LOCAL_ONLY = False
+            web_agent.ACCESS = web_access.Access("team-pass")
+            result = web_agent.save_access_password({"password": "team-pass-2"}, None, env)
+            assert "立即生效" in result["message"] and web_agent.ACCESS.password == "team-pass-2"
+        finally:
+            web_agent.ACCESS, web_agent.LOCAL_ONLY = saved_access, saved_local
+
+
 def test_job_time_left() -> None:
     """Pages read by OCR and chunks embedded get the time left from the pace so far."""
     job = web_documents.IndexJob(Path("raw"), Path("k.db"), Path("p"))
@@ -659,6 +696,7 @@ def main() -> None:
     test_set_env_value()
     test_save_api_config()
     test_job_time_left()
+    test_access_password()
     test_index_job()
     test_http_server()
     test_install_messages()

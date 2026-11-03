@@ -438,6 +438,13 @@
               </div>
               <div class="muted small" style="margin-top:8px">检索诊断使用问答页输入框里的问题；结果写在下面的运行日志里。</div>
             </details>
+            <h2 style="margin-top:18px">局域网共享</h2>
+            <div id="lanState" class="muted small" style="margin-bottom:8px"></div>
+            <div class="stack">
+              <input id="lanPassword" type="password" placeholder="访问密码（至少 6 位）" autocomplete="new-password">
+              <button id="saveLanBtn">保存访问密码</button>
+              <div id="lanMeta" class="muted small"></div>
+            </div>
           </div>
         </div>
         <details class="panel">
@@ -497,7 +504,7 @@
       document.querySelectorAll('.view').forEach((view) => view.classList.toggle('active', view.id === id));
       document.querySelectorAll('#tabs button').forEach((button) => button.classList.toggle('active', button.dataset.view === id));
       if (id === 'docsView') loadDocuments();
-      if (id === 'settingsView') { loadHealth(); loadApiConfig(); }
+      if (id === 'settingsView') { loadHealth(); loadApiConfig(); loadAccess(); }
       if (id === 'statsView') loadStats();
       if (id === 'chatView') $('question').focus();
     }
@@ -1333,6 +1340,30 @@
         $('apiConfigMeta').textContent = `保存失败：${error.message}`;
       }
     }
+    function renderAccess(data) {
+      $('lanState').textContent = data.lan_open
+        ? `正在局域网共享：同事打开 ${(data.addresses || []).join(' 或 ') || '这台电脑的地址'}，输入访问密码即可提问；资料和设置只能在这台电脑上管理。`
+        : (data.password_set
+          ? '已设好访问密码。要让同事使用，关掉当前窗口，在开始菜单选“15. 局域网共享启动”。'
+          : '现在只在这台电脑上使用。要让同事在自己的电脑上提问：先在下面设一个访问密码，再在开始菜单选“15. 局域网共享启动”。');
+    }
+    async function loadAccess() {
+      try {
+        renderAccess(await api('/api/access'));
+      } catch (error) {
+        $('lanState').textContent = `读取失败：${error.message}`;
+      }
+    }
+    async function saveLanPassword() {
+      try {
+        const data = await api('/api/access-password', {method: 'POST', body: JSON.stringify({password: $('lanPassword').value})});
+        $('lanPassword').value = '';
+        $('lanMeta').textContent = data.message;
+        renderAccess(data);
+      } catch (error) {
+        $('lanMeta').textContent = `保存失败：${error.message}`;
+      }
+    }
     async function runAction(path, name, body = '{}') {
       log(`${name}开始`);
       try {
@@ -1382,6 +1413,7 @@
         loadStats();
       });
       $('saveApiBtn').onclick = saveApiConfig;
+      $('saveLanBtn').onclick = saveLanPassword;
       document.querySelectorAll('[data-job]').forEach((button) => {
         button.onclick = () => {
           if (button.dataset.job === 'rebuild' && !confirm('全部重新处理会重新读取所有资料，资料多时需要较长时间。继续？')) return;

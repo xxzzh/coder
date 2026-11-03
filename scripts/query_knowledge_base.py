@@ -132,6 +132,7 @@ from kb.relevance import (  # noqa: F401  (re-exported for callers of this modul
     LOCAL_CONTENT_COVERAGE_THRESHOLD,
     LOCAL_SCORE_THRESHOLD,
     VERSIONED_NAME_PATTERN,
+    absent_words,
     ascii_term_pattern,
     content_coverage,
     covering_row_index,
@@ -236,7 +237,7 @@ NEGATIVE_CACHE_TTL_SECONDS = 120
 CACHE_VARIANT_VERSION = "retrieval-v61:no-corpus-specific-rules"
 # Answers built without a model (layout, gate, cited evidence). Raising it refreshes cached local
 # answers only; cached API answers stay valid and are not paid for again.
-LOCAL_ANSWER_VERSION = "local-v6"
+LOCAL_ANSWER_VERSION = "local-v7"
 
 
 def source_fingerprint(raw_dir: Path = RAW_DIR) -> str:
@@ -1146,6 +1147,10 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
     }
     if focus is not None:
         result["local_match"] = "related" if focus.related else "focused"
+    if local_answer and covering is not None and result.get("local_match") != "related" and absent_words(question, db_path):
+        # The wording check passed on the other words, but the documents never use one of the
+        # question's (洗衣费 in «出差的洗衣费能报销吗»): what was found is related, not the answer.
+        result["local_match"] = "related"
     result = finalize_answer(question, result, config, allow_api)
     result["answer_quality"] = model_capabilities.evaluate_answer(question, str(result.get("answer", "")), result.get("sources") or [])
     if agent_error:
