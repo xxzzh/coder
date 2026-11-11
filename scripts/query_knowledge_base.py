@@ -234,6 +234,8 @@ project_runtime.apply_project_runtime_env()
 HOT_QUERY_THRESHOLD = 2
 CACHE_TTL_SECONDS = 3600
 NEGATIVE_CACHE_TTL_SECONDS = 120
+# How long a question waits to write its answer-cache entry while the index is being written.
+CACHE_WRITE_WAIT_SECONDS = 1.0
 CACHE_VARIANT_VERSION = "retrieval-v61:no-corpus-specific-rules"
 # Answers built without a model (layout, gate, cited evidence). Raising it refreshes cached local
 # answers only; cached API answers stay valid and are not paid for again.
@@ -373,11 +375,16 @@ def cache_get(
         return None
 
     hit_count = int(row["hit_count"] or 0) + 1
-    conn.execute(
-        "UPDATE query_cache SET hit_count = ?, updated_at = ? WHERE cache_key = ?",
-        (hit_count, datetime.now(timezone.utc).isoformat(timespec="seconds"), key),
-    )
-    conn.commit()
+    try:
+        conn.execute(
+            "UPDATE query_cache SET hit_count = ?, updated_at = ? WHERE cache_key = ?",
+            (hit_count, datetime.now(timezone.utc).isoformat(timespec="seconds"), key),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        # The index is being written (an update's final step): the hit is not counted this time,
+        # and the cached answer is still good. It must not look like a broken index.
+        conn.rollback()
     if hit_count < HOT_QUERY_THRESHOLD:
         return None
 
@@ -426,6 +433,7 @@ def cache_put(
         )
         conn.commit()
     except sqlite3.OperationalError:
+        conn.rollback()
         return
 
 
@@ -946,7 +954,9 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
     cache_conn: sqlite3.Connection | None = None
     metadata: dict[str, str] = {}
     try:
-        cache_conn = sqlite3.connect(db_path)
+        # The answer cache is the only thing a question writes. While an update writes the index,
+        # wait briefly and then go on without the cache rather than hold the answer back.
+        cache_conn = sqlite3.connect(db_path, timeout=CACHE_WRITE_WAIT_SECONDS)
         cache_conn.row_factory = sqlite3.Row
         metadata = get_metadata(cache_conn)
         index_version = metadata.get("indexed_at", "")

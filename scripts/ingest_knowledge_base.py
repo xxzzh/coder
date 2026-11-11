@@ -159,6 +159,7 @@ from kb_ingest.reports import (  # noqa: F401  (re-exported for callers of this 
 )
 from kb_ingest.vectors import (  # noqa: F401  (re-exported for callers of this module)
     build_optional_vector_index,
+    embed_before_indexing,
     embed_records_with_cache,
     seed_embedding_cache_from_index,
 )
@@ -192,11 +193,28 @@ def _ingest_unlocked(
     processed_dir.mkdir(parents=True, exist_ok=True)
     conn = init_db(db_path, reset=reset)
     conn.row_factory = sqlite3.Row
+    try:
+        return _ingest_with_connection(conn, raw_dir, processed_dir, reset, strict_extraction)
+    finally:
+        conn.close()  # an ingest that failed half-way leaves nothing written and no lock held
+
+
+def _ingest_with_connection(
+    conn: sqlite3.Connection,
+    raw_dir: Path,
+    processed_dir: Path,
+    reset: bool,
+    strict_extraction: bool,
+) -> dict[str, Any]:
+    """One ingest run in two parts, so questions can be asked while it runs.
+
+    Reading the files (OCR included), chunking and embedding take minutes and write nothing to the
+    index: questions asked meanwhile read the previous index, complete. Only then is everything
+    written, in one short transaction. A write transaction open from the first file on would make
+    every question wait for the lock on its answer-cache entry and then fail.
+    """
     indexed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     previous_indexed_at = conn.execute("SELECT value FROM metadata WHERE key = ?", ("indexed_at",)).fetchone()
-    metadata_set(conn, "embedding_model", f"local-hash-ngram-{EMBEDDING_DIMS}d")
-    metadata_set(conn, "chunk_strategy", "semantic-boundary-local-embedding")
-    metadata_set(conn, "semantic_candidate_strategy", "exact-scan-small-lsh-large")
 
     doc_count = 0
     changed_doc_count = 0
@@ -209,6 +227,8 @@ def _ingest_unlocked(
     current_paths: set[str] = set()
     approvals = load_review_approvals(processed_dir)
     approved_review_count = 0
+    # Changed documents, read and chunked, waiting to be written.
+    prepared: list[dict[str, Any]] = []
     seen_hashes = {
         row["content_hash"]: row["file_path"]
         for row in conn.execute("SELECT content_hash, file_path FROM documents WHERE duplicate_of IS NULL").fetchall()
@@ -273,6 +293,45 @@ def _ingest_unlocked(
         else:
             seen_hashes[hash_value] = rel_path
 
+        chunks: list[tuple[str, list[list[float]]]] = []
+        if not duplicate_of:
+            chunk_source = normalize_text(structured_chunk_text) if structured_chunk_text else text
+            chunks = [(chunk, local_embedding(chunk)) for chunk in chunk_text(chunk_source)]
+            chunk_count += len(chunks)
+        prepared.append(
+            {
+                "doc_id": doc_id,
+                "file_name": path.name,
+                "file_path": rel_path,
+                "file_type": file_type,
+                "file_size": stat.st_size,
+                "modified_at": modified_at,
+                "source_fingerprint": file_source_fingerprint,
+                "content_hash": hash_value,
+                "duplicate_of": duplicate_of,
+                "text": text,
+                "chunks": chunks,
+            }
+        )
+
+    # Still nothing written: the vectors of the new chunks, and what the write will need.
+    indexed_documents = {str(row["file_path"]): str(row["doc_id"]) for row in conn.execute("SELECT doc_id, file_path FROM documents")}
+    removed_doc_ids = {doc_id for file_path, doc_id in indexed_documents.items() if file_path not in current_paths}
+    source_hash = source_fingerprint(raw_dir)
+    early_embedding = embed_before_indexing(
+        conn,
+        {document["doc_id"] for document in prepared} | removed_doc_ids,
+        [chunk for document in prepared for chunk, _ in document["chunks"]],
+        force=bool(prepared or removed_doc_ids or reset),
+    )
+
+    # From here on the index is written, in one transaction that ends with the commit below.
+    progress.report("indexing")
+    metadata_set(conn, "embedding_model", f"local-hash-ngram-{EMBEDDING_DIMS}d")
+    metadata_set(conn, "chunk_strategy", "semantic-boundary-local-embedding")
+    metadata_set(conn, "semantic_candidate_strategy", "exact-scan-small-lsh-large")
+    for document in prepared:
+        doc_id = document["doc_id"]
         clear_document(conn, doc_id)
         conn.execute(
             """
@@ -284,39 +343,30 @@ def _ingest_unlocked(
             """,
             (
                 doc_id,
-                path.name,
-                rel_path,
-                file_type,
-                stat.st_size,
-                modified_at,
+                document["file_name"],
+                document["file_path"],
+                document["file_type"],
+                document["file_size"],
+                document["modified_at"],
                 indexed_at,
-                file_source_fingerprint,
-                hash_value,
-                duplicate_of,
-                text,
+                document["source_fingerprint"],
+                document["content_hash"],
+                document["duplicate_of"],
+                document["text"],
             ),
         )
-
-        if duplicate_of:
-            continue
-
-        chunk_source = normalize_text(structured_chunk_text) if structured_chunk_text else text
-        for index, chunk in enumerate(chunk_text(chunk_source), start=1):
-            chunk_count += 1
+        for index, (chunk, embedding_values) in enumerate(document["chunks"], start=1):
             chunk_id = f"{doc_id}_{index:04d}"
-            embedding_values = local_embedding(chunk)
-            embedding = json.dumps(embedding_values, separators=(",", ":"))
             conn.execute(
                 "INSERT INTO chunks(chunk_id, doc_id, chunk_index, text, embedding, indexed_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (chunk_id, doc_id, index, chunk, embedding, indexed_at),
+                (chunk_id, doc_id, index, chunk, json.dumps(embedding_values, separators=(",", ":")), indexed_at),
             )
             insert_embedding_lsh(conn, chunk_id, doc_id, embedding_values, indexed_at)
             conn.execute(
                 "INSERT INTO chunks_fts VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (chunk_id, doc_id, path.name, rel_path, file_type, chunk, searchable_text(chunk)),
+                (chunk_id, doc_id, document["file_name"], document["file_path"], document["file_type"], chunk, searchable_text(chunk)),
             )
 
-    progress.report("indexing")
     removed_count = remove_deleted_documents(conn, current_paths)
     lsh_backfilled = backfill_embedding_lsh(conn)
     if changed_doc_count or removed_count:
@@ -325,13 +375,13 @@ def _ingest_unlocked(
         metadata_set(conn, "indexed_at", indexed_at)
     else:
         indexed_at = previous_indexed_at["value"]
-    source_hash = source_fingerprint(raw_dir)
     metadata_set(conn, "source_fingerprint", source_hash)
     vector_index = build_optional_vector_index(
         conn,
         indexed_at,
         source_hash,
         force=bool(changed_doc_count or removed_count or reset),
+        prepared=early_embedding,
     )
     metadata_set(conn, "vector_backend", str(vector_index.get("backend", "faiss")))
     metadata_set(conn, "vector_index_status", "ready" if vector_index.get("ready") else "degraded")
@@ -340,6 +390,9 @@ def _ingest_unlocked(
         metadata_set(conn, "vector_embedding_model", str(vector_index.get("model")))
     if vector_index.get("dimension"):
         metadata_set(conn, "vector_embedding_dimension", str(vector_index.get("dimension")))
+    conn.commit()
+
+    # The reports only read the index, so they are written after the commit, outside the transaction.
     write_extraction_report(processed_dir, extraction_reports, current_paths)
     faq_count = write_processed_files(conn, processed_dir)
     quality_summary = write_retrieval_quality_report(conn, processed_dir)
@@ -353,8 +406,6 @@ def _ingest_unlocked(
     ).fetchone()
     total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
 
-    conn.commit()
-    conn.close()
     warning_reports = [report for report in extraction_reports if report.get("warnings")]
     review_reports = [report for report in extraction_reports if report.get("requires_review")]
     return {

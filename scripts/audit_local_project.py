@@ -28,6 +28,7 @@ REQUIRED_FILES = [
     "scripts/web_agent.py",
     "scripts/web_page.html",
     "scripts/test_web_ui.py",
+    "scripts/test_ingest_while_asking.py",
 ]
 
 
@@ -163,6 +164,11 @@ def main() -> int:
     web_ui = run_step([sys.executable, "scripts/test_web_ui.py"])
     web_ui.pop("stdout", None)
     checks.append({"id": "web-ui", "ok": web_ui["exitCode"] == 0, "details": web_ui})
+
+    # Questions asked while documents are processed are answered at once, from the previous index.
+    asking = run_step([sys.executable, "scripts/test_ingest_while_asking.py"])
+    asking.pop("stdout", None)
+    checks.append({"id": "ingest-while-asking", "ok": asking["exitCode"] == 0, "details": asking})
 
     sources = run_step([sys.executable, "scripts/manage_knowledge_base.py", "sources"])
     sources_payload = parse_json_from_tail(sources)

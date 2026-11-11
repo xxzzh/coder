@@ -72,6 +72,26 @@ class EmbeddingCache:
                     found[digest] = values.tolist()
         return found
 
+    def missing(self, hashes: Iterable[str]) -> list[str]:
+        """The hashes this model has no vector for, in the order given, each once."""
+        wanted = list(dict.fromkeys(hashes))
+        found: set[str] = set()
+        for start in range(0, len(wanted), SQLITE_BATCH):
+            batch = wanted[start : start + SQLITE_BATCH]
+            placeholders = ",".join("?" for _ in batch)
+            found.update(
+                digest
+                for (digest,) in self.conn.execute(
+                    f"SELECT text_hash FROM vectors WHERE model_key = ? AND text_hash IN ({placeholders})",
+                    (self.model_key, *batch),
+                )
+            )
+        return [digest for digest in wanted if digest not in found]
+
+    def dimensions(self) -> set[int]:
+        """The vector sizes cached for this model (more than one after an API changed its output size)."""
+        return {int(size) for (size,) in self.conn.execute("SELECT DISTINCT dimension FROM vectors WHERE model_key = ?", (self.model_key,))}
+
     def put_many(self, items: Iterable[tuple[str, list[float]]]) -> int:
         rows = [(self.model_key, digest, len(vector), array("f", vector).tobytes()) for digest, vector in items]
         self.conn.executemany("INSERT OR REPLACE INTO vectors VALUES (?, ?, ?, ?)", rows)
