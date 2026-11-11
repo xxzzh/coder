@@ -237,6 +237,107 @@ def check_identical_requests_are_sent_once() -> None:
     assert running["max"] == 2  # the three identical questions ran one at a time, the other alongside
 
 
+def check_daily_budget() -> None:
+    """LKA_API_DAILY_BUDGET_USD: once today's estimated cost reaches it, calls are refused before they
+    are sent and questions are answered on this computer; the next day it starts again."""
+    from datetime import timedelta
+
+    from test_ingest_while_asking import NOT_ASKED_BEFORE, temporary_knowledge_base
+    import web_agent
+
+    moment = datetime(2026, 11, 2, 3, 0, tzinfo=timezone.utc)  # a Monday, 11:00 in Beijing
+    usage = {"prompt_tokens": 1_000_000, "prompt_cache_hit_tokens": 0, "completion_tokens": 0}
+
+    def forget() -> None:
+        llm_budget._SPENT.update(key=None, usd=0.0)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        log = Path(temp_dir) / "usage.jsonl"
+        config = {"LKA_API_USAGE_LOG": str(log), "LKA_API_DAILY_BUDGET_USD": "0.5"}
+        forget()
+        assert llm_budget.daily_budget_message(config, moment) == ""
+        cost = llm_budget.record_call("agent", "deepseek", "deepseek-flash", usage, 10, moment, config)["cost_usd"]
+        assert cost == 0.3  # 0.15 per million, doubled in peak hours
+        assert llm_budget.spent_today_usd(config, moment) == cost and llm_budget.daily_budget_message(config, moment) == ""
+        llm_budget.record_call("agent", "deepseek", "no-price-model", usage, 10, moment, config)  # cannot be counted
+        llm_budget.record_call("agent", "deepseek", "deepseek-flash", usage, 10, moment, config)
+        message = llm_budget.daily_budget_message(config, moment)
+        assert message.startswith(llm_budget.BUDGET_REACHED) and "$0.6000 of $0.50" in message, message
+        try:
+            llm_budget.check_daily_budget(config, moment)
+        except llm_budget.BudgetExceeded as exc:
+            assert str(exc) == message
+        else:
+            raise AssertionError("the budget was not enforced")
+        forget()  # after a restart today's total comes from the usage log
+        assert round(llm_budget.spent_today_usd(config, moment), 6) == 0.6
+        assert llm_budget.daily_budget_message(config, moment + timedelta(days=1)) == ""  # a new day
+        for unlimited in ("", "0", "abc"):
+            assert llm_budget.daily_budget_message({**config, "LKA_API_DAILY_BUDGET_USD": unlimited}, moment) == ""
+
+        # A chat call over budget is not sent; the connection test of the settings page still is.
+        sent: list[str] = []
+
+        def fake_request(method: str, url: str, provider: str, api_key: str, payload: dict | None = None, timeout: int = 20) -> dict:
+            sent.append(url)
+            return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+        original_request = api_providers.api_request
+        saved_env = {key: os.environ.get(key) for key in ("LKA_API_USAGE_LOG", "LKA_API_DAILY_BUDGET_USD")}
+        try:
+            api_providers.api_request = fake_request
+            os.environ.update(LKA_API_USAGE_LOG=str(log), LKA_API_DAILY_BUDGET_USD="0.1")
+            forget()
+            llm_budget.record_call("agent", "deepseek", "deepseek-flash", usage, 10)  # now: at least $0.15
+            messages = [{"role": "user", "content": "hello"}]
+            try:
+                api_providers.chat_completion("deepseek", "https://api.deepseek.com", "k", "deepseek-flash", messages, task="agent")
+            except llm_budget.BudgetExceeded:
+                assert sent == []
+            else:
+                raise AssertionError("a call over budget was sent")
+            assert api_providers.chat_completion("deepseek", "https://api.deepseek.com", "k", "deepseek-flash", messages, task="connection_test") == "ok"
+            assert len(sent) == 1
+        finally:
+            api_providers.api_request = original_request
+            for key, value in saved_env.items():
+                os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
+            forget()
+
+    # A question over budget: answered on this computer without the agent, and the reason shown.
+    original_message, original_run_agent = llm_budget.daily_budget_message, agent.run_agent
+    with temporary_knowledge_base() as (_, db_path, _):
+        try:
+            query_module.runtime_config = lambda: {"LKA_USE_API": "true", "LKA_API_KEY": "k", "LKA_API_MODEL": "deepseek-flash", "LKA_API_BASE_URL": "https://api.deepseek.com"}
+            llm_budget.daily_budget_message = lambda *args, **kwargs: f"{llm_budget.BUDGET_REACHED}: $0.6000 of $0.50 spent today"
+
+            def no_agent(*args: object, **kwargs: object) -> None:
+                raise AssertionError("the agent ran over budget")
+
+            agent.run_agent = no_agent
+            result = query_module.query(db_path, NOT_ASKED_BEFORE, limit=10_000)
+            assert result["source_type"] == "knowledge_base" and result.get("api_used") is False, result
+            assert str(result.get("agent_error", "")).startswith(llm_budget.BUDGET_REACHED), result
+            assert web_agent.api_failure(result)["kind"] == "budget"
+            again = query_module.query(db_path, NOT_ASKED_BEFORE)
+            assert not again.get("cache_hit")  # not cached: tomorrow the API answers it again
+        finally:
+            llm_budget.daily_budget_message, agent.run_agent = original_message, original_run_agent
+
+
+def check_limit_is_bounded() -> None:
+    """The number of sources a caller asks for is kept between 1 and QUERY_LIMIT_MAX."""
+    seen: list[int] = []
+    original = query_module.query_unshared
+    try:
+        query_module.query_unshared = lambda db_path, question, limit, use_web, allow_api: seen.append(limit) or {}
+        for asked in (5, 0, -3, 100_000, "7"):
+            query_module.query(Path("unused.db"), "问题", limit=asked)
+        assert seen == [5, 1, 1, query_module.QUERY_LIMIT_MAX, 7], seen
+    finally:
+        query_module.query_unshared = original
+
+
 def main() -> None:
     check_prefix_is_byte_identical()
     check_agent_rounds_only_append()
@@ -245,6 +346,8 @@ def main() -> None:
     check_task_budgets_and_model_tier()
     check_summary_request()
     check_identical_requests_are_sent_once()
+    check_daily_budget()
+    check_limit_is_bounded()
     print("llm budget: ok")
 
 

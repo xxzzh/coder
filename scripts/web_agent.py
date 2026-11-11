@@ -184,6 +184,7 @@ def health_payload() -> dict[str, Any]:
 # An answer API call that failed falls back to answering on this computer. Users see why, in
 # words they can act on, instead of silently getting the less accurate local answer.
 API_FAILURE_KINDS = (
+    (r"daily API budget reached", "budget", "今天的大模型 API 花费已到设定的上限，改用本机方式回答，明天自动恢复（上限是 .env 里的 LKA_API_DAILY_BUDGET_USD）"),
     (r"HTTP 402|Insufficient Balance|insufficient_balance", "balance", "大模型 API 余额不足，需要到服务商平台充值"),
     (r"HTTP 40[13]|Authentication|Unauthorized|invalid.{0,12}key", "key", "大模型 API Key 无效或没有权限，需要在设置页重新配置"),
     (r"HTTP 429|rate.?limit|Too Many Requests", "rate", "大模型 API 调用太频繁被限流，稍后会自动恢复"),

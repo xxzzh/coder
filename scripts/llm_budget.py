@@ -193,6 +193,61 @@ def usage_log_path(config: dict[str, str]) -> Path | None:
     return path if path.is_absolute() else ROOT / path
 
 
+# The most the answer API may cost in one day (Beijing time, like the usage log), in USD by the
+# price table: LKA_API_DAILY_BUDGET_USD. Unset or 0: no limit. Once reached, calls are refused
+# before they are sent and questions are answered on this computer until the next day. Calls of a
+# model without a price (LKA_PRICE_<MODEL>) cannot be counted.
+DAILY_BUDGET_SETTING = "LKA_API_DAILY_BUDGET_USD"
+BUDGET_REACHED = "daily API budget reached"
+_SPENT: dict[str, Any] = {"key": None, "usd": 0.0}
+_SPENT_LOCK = threading.Lock()
+
+
+class BudgetExceeded(RuntimeError):
+    """Today's API spending reached the configured limit; the call was not sent."""
+
+
+def daily_budget_usd(config: dict[str, str]) -> float | None:
+    try:
+        value = float(str(config.get(DAILY_BUDGET_SETTING, "")).strip() or 0)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def spent_today_usd(config: dict[str, str] | None = None, moment: datetime | None = None) -> float:
+    """Estimated cost of today's calls: read from the usage log once a day (so a restart keeps
+    counting), then kept up to date by record_call. With the usage log off, this process's calls only."""
+    config = settings() if config is None else config
+    day = (moment or datetime.now(timezone.utc)).astimezone(BEIJING).date().isoformat()
+    path = usage_log_path(config)
+    key = (day, str(path))
+    with _SPENT_LOCK:
+        if _SPENT["key"] != key:
+            records = read_log(path, day) if path is not None else []
+            costs = [record["cost_usd"] for record in records if str(record.get("time", "")).startswith(day) and isinstance(record.get("cost_usd"), (int, float))]
+            _SPENT.update(key=key, usd=float(sum(costs)))
+        return float(_SPENT["usd"])
+
+
+def daily_budget_message(config: dict[str, str] | None = None, moment: datetime | None = None) -> str:
+    """Why no API call may be made now, or "" while today's spending is within the limit."""
+    config = settings() if config is None else config
+    budget = daily_budget_usd(config)
+    if budget is None:
+        return ""
+    spent = spent_today_usd(config, moment)
+    if spent < budget:
+        return ""
+    return f"{BUDGET_REACHED}: ${spent:.4f} of ${budget:.2f} spent today ({DAILY_BUDGET_SETTING})"
+
+
+def check_daily_budget(config: dict[str, str] | None = None, moment: datetime | None = None) -> None:
+    message = daily_budget_message(config, moment)
+    if message:
+        raise BudgetExceeded(message)
+
+
 def record_call(
     task: str,
     provider: str,
@@ -216,6 +271,10 @@ def record_call(
         "cost_usd": estimate_cost_usd(model, metrics, moment, config),
         "elapsed_ms": elapsed_ms,
     }
+    spent_today_usd(config, moment)  # today's total is loaded before this call joins the log
+    if isinstance(record["cost_usd"], (int, float)):
+        with _SPENT_LOCK:
+            _SPENT["usd"] = float(_SPENT["usd"]) + record["cost_usd"]
     path = usage_log_path(config)
     if path is not None:
         try:

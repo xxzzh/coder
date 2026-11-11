@@ -37,6 +37,8 @@ from kb_ingest.store import init_db  # noqa: E402
 PROMPT_SECONDS = 2.0
 ASKED_BEFORE = "出差报销需要几个工作日内提交发票"
 NOT_ASKED_BEFORE = "审批完成后几个工作日内付款"
+# The tests replace it with a stand-in; one of them checks the real one.
+REAL_TRIGGER_ASYNC_UPDATE = query_module.trigger_async_update
 
 
 @contextmanager
@@ -180,6 +182,39 @@ def test_a_failed_update_writes_nothing() -> None:
             writer.close()
 
 
+def test_a_question_does_not_index_unconfirmed_documents() -> None:
+    """The background update a question starts skips a file waiting for confirmation (content that
+    could not be read), as the Web UI's processing does; only the update without that rule indexes it."""
+    with temporary_knowledge_base() as (raw_dir, db_path, processed_dir):
+        original_read = ingest_module.read_document_with_report
+
+        def read_with_unreadable_part(path: Path) -> tuple[str, dict[str, Any]]:
+            text, report = original_read(path)
+            if path.name == "扫描件.md":
+                report = {**report, "requires_review": True, "warnings": ["PDF appears to contain images; OCR text was not available"]}
+            return text, report
+
+        (raw_dir / "扫描件.md").write_text("# 扫描件\n\n只读出了这一行。\n", encoding="utf-8")
+        started: list[list[str]] = []
+        original_popen = query_module.subprocess.Popen
+        ingest_module.read_document_with_report = read_with_unreadable_part
+        query_module.subprocess.Popen = lambda command, **kwargs: started.append(list(command))
+        try:
+            assert REAL_TRIGGER_ASYNC_UPDATE(db_path, raw_dir, processed_dir) is True
+            assert len(started) == 1 and "--strict-extraction" in started[0], started
+            # What that command does, run here: the file is left out and listed for confirmation.
+            result = ingest_module.ingest(raw_dir, db_path, processed_dir, strict_extraction=True)
+            assert result["skipped"] == 1 and indexed_files(db_path) == ["报销制度.md"], result
+            assert [item["file_path"] for item in ingest_module.pending_review_reports(raw_dir, processed_dir)] == ["扫描件.md"]
+            assert REAL_TRIGGER_ASYNC_UPDATE(db_path, raw_dir, processed_dir) is False  # not started over and over
+            # Without the rule (the command line's plain update) the same file is indexed.
+            ingest_module.ingest(raw_dir, db_path, processed_dir)
+            assert indexed_files(db_path) == ["扫描件.md", "报销制度.md"]
+        finally:
+            ingest_module.read_document_with_report = original_read
+            query_module.subprocess.Popen = original_popen
+
+
 def test_chunks_are_embedded_before_the_write() -> None:
     """embed_before_indexing embeds what the vector index will hold while no write transaction is
     open, the write then reuses those vectors, and a failure is not tried a second time."""
@@ -273,6 +308,7 @@ def main() -> None:
     test_questions_while_a_document_is_read()
     test_questions_while_the_index_is_written()
     test_a_failed_update_writes_nothing()
+    test_a_question_does_not_index_unconfirmed_documents()
     test_chunks_are_embedded_before_the_write()
     print("ingest while asking: ok")
 

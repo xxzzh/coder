@@ -326,6 +326,8 @@ def chat_completion_detailed(
     if token_plan_rejected(base_url, api_key):
         raise RuntimeError("MiMo Token Plan 的 tp- key 仅限编程工具使用，不能作为本应用后端。")
     validate_chat_request(api_key, model, messages, temperature, max_tokens)
+    if task != "connection_test":  # checking a key stays possible; it costs next to nothing
+        llm_budget.check_daily_budget()
     payload: dict[str, Any] = {"model": model, "temperature": temperature, "messages": messages}
     if json_output:
         payload["response_format"] = {"type": "json_object"}

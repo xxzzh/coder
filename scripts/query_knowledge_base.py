@@ -236,6 +236,8 @@ CACHE_TTL_SECONDS = 3600
 NEGATIVE_CACHE_TTL_SECONDS = 120
 # How long a question waits to write its answer-cache entry while the index is being written.
 CACHE_WRITE_WAIT_SECONDS = 1.0
+# Most sources an answer may be asked to cite.
+QUERY_LIMIT_MAX = 20
 CACHE_VARIANT_VERSION = "retrieval-v61:no-corpus-specific-rules"
 # Answers built without a model (layout, gate, cited evidence). Raising it refreshes cached local
 # answers only; cached API answers stay valid and are not paid for again.
@@ -283,6 +285,9 @@ def trigger_async_update(db_path: Path = DB_PATH, raw_dir: Path = RAW_DIR, proce
         str(db_path),
         "--processed",
         str(processed_dir),
+        # As the Web UI's own processing does: a file with content that could not be read waits for
+        # its confirmation and is not indexed just because someone asked a question.
+        "--strict-extraction",
     ]
     subprocess.Popen(
         command,
@@ -906,6 +911,8 @@ def single_flight(key: tuple[Any, ...]):
 
 
 def query(db_path: Path, question: str, limit: int = 5, use_web: bool = False, allow_api: bool = True) -> dict[str, Any]:
+    # Whoever can ask (a colleague on the network too) chooses the limit: kept to a sensible range.
+    limit = max(1, min(QUERY_LIMIT_MAX, int(limit)))
     with single_flight((str(Path(db_path).resolve()), question.strip(), limit, use_web, allow_api)):
         return query_unshared(db_path, question, limit, use_web, allow_api)
 
@@ -976,6 +983,11 @@ def query_unshared(db_path: Path, question: str, limit: int = 5, use_web: bool =
         return finalize_answer(question, result, config, allow_api)
 
     agent_error = ""
+    if allow_api and api_enabled(config):
+        # Today's API spending has reached LKA_API_DAILY_BUDGET_USD: answered on this computer, and
+        # said so like any other API failure. Answers already cached (above) cost nothing.
+        agent_error = llm_budget.daily_budget_message()
+        allow_api = not agent_error
     if allow_api and agent_enabled(config) and not unknown_names(question, db_path):
         try:
             outcome = agentic_retrieval.run_agent(
